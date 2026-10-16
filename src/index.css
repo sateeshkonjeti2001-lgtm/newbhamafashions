@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-heading: 'Manrope', 'Inter', system-ui, sans-serif;
+
+  --color-bg-primary: #F5F2EC;
+  --color-bg-surface: #FFFFFF;
+  --color-bg-surface-secondary: #FAF8F4;
+
+  --color-brand-charcoal: #171513;
+  --color-brand-charcoal-hover: #25211D;
+
+  --color-accent-brown: #A67C52;
+  --color-accent-brown-hover: #8F6843;
+
+  --color-border-warm: #E3DED5;
+  --color-border-warm-strong: #D4CDC2;
+
+  --color-text-primary: #1C1917;
+  --color-text-secondary: #6F6962;
+  --color-text-muted: #9A938B;
+  --color-text-on-dark: #F5F2EC;
+
+  --color-status-success: #3F6B50;
+  --color-status-warning: #9A7438;
+  --color-status-error: #A34F4F;
+  --color-status-info: #526B7A;
+}
+
+:root {
+  --bg-primary: #F5F2EC;
+  --bg-surface: #FFFFFF;
+  --bg-surface-secondary: #FAF8F4;
+
+  --primary: #171513;
+  --primary-hover: #25211D;
+
+  --accent: #A67C52;
+  --accent-hover: #8F6843;
+
+  --border: #E3DED5;
+  --border-strong: #D4CDC2;
+
+  --text-primary: #1C1917;
+  --text-secondary: #6F6962;
+  --text-muted: #9A938B;
+  --text-on-dark: #F5F2EC;
+
+  --success: #3F6B50;
+  --warning: #9A7438;
+  --error: #A34F4F;
+  --info: #526B7A;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Manrope', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  letter-spacing: -0.015em;
+}
+
+/* Custom Scrollbar for Warm Light Luxury Theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F5F2EC;
+}
+::-webkit-scrollbar-thumb {
+  background: #D4CDC2;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A67C52;
+}
+
+/* Premium Button and Card utilities */
+.btn-primary {
+  background-color: #171513;
+  color: #F5F2EC;
+  transition: all 0.15s ease-in-out;
+}
+.btn-primary:hover {
+  background-color: #25211D;
+}
+
+.btn-accent {
+  background-color: #A67C52;
+  color: #FFFFFF;
+  transition: all 0.15s ease-in-out;
+}
+.btn-accent:hover {
+  background-color: #8F6843;
+}
+
+.btn-secondary {
+  background-color: #FFFFFF;
+  color: #1C1917;
+  border: 1px solid #D4CDC2;
+  transition: all 0.15s ease-in-out;
+}
+.btn-secondary:hover {
+  background-color: #FAF8F4;
+  border-color: #A67C52;
+}
+
+.erp-card {
+  background-color: #FFFFFF;
+  border: 1px solid #E3DED5;
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(23, 21, 19, 0.04);
+}
+
+.erp-input {
+  background-color: #FFFFFF;
+  border: 1px solid #D4CDC2;
+  color: #1C1917;
+  border-radius: 8px;
+  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+.erp-input:focus {
+  outline: none;
+  border-color: #A67C52;
+  box-shadow: 0 0 0 3px rgba(166, 124, 82, 0.12);
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #thermal-receipt, #thermal-receipt * {
+    visibility: visible;
+  }
+  #thermal-receipt {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 80mm;
+    margin: 0;
+    padding: 2mm;
+    background: white !important;
+    color: black !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

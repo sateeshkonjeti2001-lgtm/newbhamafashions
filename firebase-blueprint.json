@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "cloudBackup": {
+      "title": "Cloud Backup Record",
+      "description": "Metadata for cloud backups and synchronization logs",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "filename": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "fileSize": { "type": "number" },
+        "sha256": { "type": "string" },
+        "status": { "type": "string" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["id", "filename", "createdAt", "status"]
+    },
+    "googleSyncLog": {
+      "title": "Google Sync Log",
+      "description": "Log entry of data sync with Google Sheets or Google Calendar",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string", "enum": ["sheets_export", "sheets_import", "calendar_event"] },
+        "timestamp": { "type": "string" },
+        "details": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "status": { "type": "string" }
+      },
+      "required": ["id", "type", "timestamp", "status"]
+    }
+  },
+  "firestore": {
+    "/cloud_backups/{backupId}": {
+      "schema": "cloudBackup",
+      "description": "Backup archive records and cloud storage synchronization status"
+    },
+    "/google_sync_logs/{logId}": {
+      "schema": "googleSyncLog",
+      "description": "Audit records of Google Sheets exports and Google Calendar event schedules"
+    }
+  }
+}

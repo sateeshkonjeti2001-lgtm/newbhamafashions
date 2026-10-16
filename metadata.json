@@ -1,0 +1,6 @@
+{
+  "name": "New Bhama Fashions - ERP",
+  "description": "Offline Business Management and ERP system for New Bhama Fashions ladies retail store in Chilakaluripet, Andhra Pradesh.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

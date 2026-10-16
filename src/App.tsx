@@ -1,0 +1,209 @@
+import React, { useState, useEffect } from 'react';
+import { api, getStoredToken, removeStoredToken } from './services/api.ts';
+import { User } from './types.ts';
+import { SetupScreen } from './components/SetupScreen.tsx';
+import { LoginScreen } from './components/LoginScreen.tsx';
+import { Navbar } from './components/Navbar.tsx';
+import { Sidebar } from './components/Sidebar.tsx';
+import { DashboardView } from './components/DashboardView.tsx';
+import { POSView } from './components/POSView.tsx';
+import { BillHistoryView } from './components/BillHistoryView.tsx';
+import { ProductsView } from './components/ProductsView.tsx';
+import { InventoryView } from './components/InventoryView.tsx';
+import { PurchasesView } from './components/PurchasesView.tsx';
+import { MoneyView } from './components/MoneyView.tsx';
+import { CustomerDuesView } from './components/CustomerDuesView.tsx';
+import { StaffView } from './components/StaffView.tsx';
+import { ClosingView } from './components/ClosingView.tsx';
+import { AssetsLoansView } from './components/AssetsLoansView.tsx';
+import { ReportsView } from './components/ReportsView.tsx';
+import { AuditView } from './components/AuditView.tsx';
+import { GoogleWorkspaceView } from './components/GoogleWorkspaceView.tsx';
+
+export default function App() {
+  const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [dayClosed, setDayClosed] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  const initAuth = async () => {
+    setLoading(true);
+    try {
+      // 1. Check if owner setup is required
+      const statusRes = await api.getSetupStatus();
+      if (statusRes.setup_required) {
+        setSetupRequired(true);
+        setLoading(false);
+        return;
+      }
+      setSetupRequired(false);
+
+      // 2. Check if logged in
+      const token = getStoredToken();
+      if (token) {
+        try {
+          const meRes = await api.getMe();
+          if (meRes.user) {
+            setCurrentUser(meRes.user);
+
+            // Fetch day closed status
+            try {
+              const todayStr = new Date().toISOString().split('T')[0];
+              const closingRes = await api.getDayClosingSummary(todayStr);
+              setDayClosed(Boolean(closingRes.isClosed));
+            } catch (e) {
+              // Non-blocking
+            }
+          } else {
+            removeStoredToken();
+          }
+        } catch (err) {
+          removeStoredToken();
+        }
+      }
+    } catch (err) {
+      console.error('App init error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    initAuth();
+  }, []);
+
+  const handleLogout = () => {
+    removeStoredToken();
+    setCurrentUser(null);
+    setActiveTab('dashboard');
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[#F5F2EC] text-[#1C1917] flex items-center justify-center p-4">
+        <div className="text-center space-y-3">
+          <div className="w-10 h-10 border-4 border-[#A67C52] border-t-transparent rounded-full animate-spin mx-auto"></div>
+          <p className="text-xs text-[#6F6962] font-medium tracking-wide">
+            Initializing New Bhama Fashions ERP...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // 1. First-time Owner Setup Screen
+  if (setupRequired) {
+    return (
+      <SetupScreen
+        onSetupSuccess={(user) => {
+          setSetupRequired(false);
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
+
+  // 2. Login Screen
+  if (!currentUser) {
+    return (
+      <LoginScreen
+        onLoginSuccess={(user) => {
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
+
+  // 3. Main Business ERP System
+  return (
+    <div className="h-screen bg-[#F5F2EC] text-[#1C1917] flex flex-col font-sans overflow-hidden">
+      <Navbar
+        user={currentUser}
+        onLogout={handleLogout}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        dayClosed={dayClosed}
+      />
+
+      <div className="flex-1 flex overflow-hidden min-h-0">
+        <Sidebar
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          role={currentUser.role}
+        />
+
+        <main
+          className={`flex-1 min-h-0 bg-[#F5F2EC] ${
+            activeTab === 'pos'
+              ? 'p-2 sm:p-3 lg:p-3.5 flex flex-col overflow-y-auto lg:overflow-hidden'
+              : 'overflow-y-auto p-4 sm:p-6 lg:p-8'
+          }`}
+        >
+          <div
+            className={
+              activeTab === 'pos'
+                ? 'flex-1 min-h-0 w-full h-full flex flex-col'
+                : 'max-w-7xl mx-auto'
+            }
+          >
+            {activeTab === 'dashboard' && (
+              <DashboardView
+                role={currentUser.role}
+                setActiveTab={setActiveTab}
+              />
+            )}
+
+            {activeTab === 'pos' && (
+              <POSView
+                role={currentUser.role}
+                currentUser={currentUser}
+                onNavigateToBills={() => setActiveTab('bills')}
+              />
+            )}
+
+            {activeTab === 'bills' && (
+              <BillHistoryView
+                role={currentUser.role}
+                onNavigateToPOS={() => setActiveTab('pos')}
+              />
+            )}
+
+            {activeTab === 'products' && (
+              <ProductsView role={currentUser.role} />
+            )}
+
+            {activeTab === 'inventory' && (
+              <InventoryView role={currentUser.role} />
+            )}
+
+            {activeTab === 'purchases' && <PurchasesView />}
+
+            {activeTab === 'money' && <MoneyView />}
+
+            {activeTab === 'dues' && <CustomerDuesView />}
+
+            {activeTab === 'staff' && <StaffView role={currentUser.role} />}
+
+            {activeTab === 'closing' && (
+              <ClosingView role={currentUser.role} />
+            )}
+
+            {activeTab === 'assets_loans' && <AssetsLoansView />}
+
+            {activeTab === 'reports' && (
+              <ReportsView
+                role={currentUser.role}
+                setActiveTab={setActiveTab}
+              />
+            )}
+
+            {activeTab === 'google_workspace' && <GoogleWorkspaceView />}
+
+            {activeTab === 'audit' && <AuditView />}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
