@@ -489,7 +489,7 @@ export const MoneyView: React.FC = () => {
                   <option value="OPERATING_EXPENSE">Operating Expense (Tea, cleaning, bills, repairs)</option>
                   <option value="OWNER_CAPITAL">Owner Capital In (Personal money introduced)</option>
                   <option value="OWNER_DRAWINGS">Owner Drawings / Withdrawal (Taken for personal use)</option>
-                  <option value="TRANSFER">Internal Transfer (e.g. Cash deposited into Bank)</option>
+                  <option value="TRANSFER">Internal Transfer (Cash deposited into Bank)</option>
                 </select>
               </div>
 

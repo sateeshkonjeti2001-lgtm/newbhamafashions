@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
+import { dbQueryAll, dbQueryOne, dbRun, dbTransaction, saveDb } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
@@ -53,6 +53,7 @@ router.post('/suppliers', (req: AuthenticatedRequest, res: Response) => {
       notes?.trim() || null,
       now
     ]);
+    saveDb(true);
 
     logAudit(req.user?.id || 'OWNER', 'CREATE_SUPPLIER', 'SUPPLIER', id, { name });
     res.json({ success: true, id });
@@ -300,6 +301,7 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
           payment_method, // CASH | UPI | BANK
           supplier.name,
           `Purchase Invoice #${invoice_number}`,
+          payment_method,
           invoice_number,
           req.user?.id || 'OWNER',
           now,
@@ -307,6 +309,7 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
         ]);
       }
     });
+    saveDb(true);
 
     logAudit(req.user?.id || 'OWNER', 'CREATE_PURCHASE', 'PURCHASE', purchaseId, {
       invoice_number,
@@ -382,12 +385,14 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
         payment_method,
         purchase.supplier_name,
         `Supplier Due Payment: Inv #${purchase.invoice_number} (${notes || 'Settlement'})`,
+        payment_method,
         purchase.invoice_number,
         req.user?.id || 'OWNER',
         now,
         now
       ]);
     });
+    saveDb(true);
 
     logAudit(req.user?.id || 'OWNER', 'PAY_SUPPLIER_DUE', 'PURCHASE', id, {
       supplier: purchase.supplier_name,

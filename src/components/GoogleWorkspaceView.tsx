@@ -63,11 +63,11 @@ export const GoogleWorkspaceView: React.FC = () => {
   const [loadingEvents, setLoadingEvents] = useState<boolean>(false);
   const [showEventModal, setShowEventModal] = useState<boolean>(false);
   const [customEvent, setCustomEvent] = useState({
-    title: 'Festival Sale & Special Discount Launch',
+    title: '',
     date: new Date().toISOString().split('T')[0],
     startTime: '10:00',
     endTime: '11:00',
-    description: 'New Bhama Fashions festival collection launch and customer promotions.',
+    description: '',
   });
 
   // Listen to Firebase Auth state
@@ -914,7 +914,7 @@ export const GoogleWorkspaceView: React.FC = () => {
                   value={customEvent.title}
                   onChange={(e) => setCustomEvent({ ...customEvent, title: e.target.value })}
                   className="w-full px-3 py-2 border border-[#E3DED5] rounded-lg focus:outline-none focus:border-[#8C6D53]"
-                  placeholder="e.g. Sankranti Mega Sale Launch"
+                  placeholder="Event title"
                 />
               </div>
 

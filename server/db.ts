@@ -29,8 +29,10 @@ export async function getDb(): Promise<Database> {
 
   // Initialize schema if not exists
   initSchema(dbInstance);
+  cleanupMockDataIfPresent(dbInstance);
   migrateDualOwnerIfPresent(dbInstance);
-  saveDb();
+  syncManualSalesFinancialTransactions(dbInstance);
+  saveDb(true);
 
   return dbInstance;
 }
@@ -247,9 +249,10 @@ function initSchema(db: Database) {
       amount_paid REAL NOT NULL,
       balance_due REAL NOT NULL DEFAULT 0,
       payment_status TEXT NOT NULL CHECK(payment_status IN ('PAID', 'PARTIAL', 'UNPAID')),
-      payment_method TEXT NOT NULL, -- CASH, UPI, SPLIT, CREDIT
+      payment_method TEXT NOT NULL, -- CASH, UPI, CARD, SPLIT, CREDIT
       cash_paid REAL DEFAULT 0,
       upi_paid REAL DEFAULT 0,
+      card_paid REAL DEFAULT 0,
       channel TEXT NOT NULL DEFAULT 'OFFLINE',
       notes TEXT,
       cashier_id TEXT,
@@ -575,6 +578,7 @@ function initSchema(db: Database) {
     'ALTER TABLE sales ADD COLUMN cancelled_by TEXT;',
     'ALTER TABLE sales ADD COLUMN cancelled_by_name TEXT;',
     'ALTER TABLE sales ADD COLUMN cancelled_reason TEXT;',
+    'ALTER TABLE sales ADD COLUMN card_paid REAL DEFAULT 0;',
   ];
 
   for (const m of migrations) {
@@ -583,6 +587,90 @@ function initSchema(db: Database) {
     } catch {
       // Column already added or not needed
     }
+  }
+}
+
+function cleanupMockDataIfPresent(db: Database) {
+  try {
+    db.run('PRAGMA foreign_keys = OFF;');
+    // 1. Delete mock / test sales and their dependent rows
+    db.run(`
+      DELETE FROM sale_return_items WHERE sale_id IN (
+        SELECT id FROM sales WHERE id LIKE 'sale_hist_%' OR bill_number LIKE 'HW-TEST%' OR id LIKE '%test%' OR bill_number LIKE '%TEST%' OR bill_number LIKE 'HW-%'
+      );
+    `);
+    db.run(`
+      DELETE FROM sale_items WHERE sale_id IN (
+        SELECT id FROM sales WHERE id LIKE 'sale_hist_%' OR bill_number LIKE 'HW-TEST%' OR id LIKE '%test%' OR bill_number LIKE '%TEST%' OR bill_number LIKE 'HW-%'
+      );
+    `);
+    db.run(`
+      DELETE FROM customer_due_payments WHERE customer_due_id IN (
+        SELECT id FROM customer_dues WHERE sale_id IN (
+          SELECT id FROM sales WHERE id LIKE 'sale_hist_%' OR bill_number LIKE 'HW-TEST%' OR id LIKE '%test%' OR bill_number LIKE '%TEST%' OR bill_number LIKE 'HW-%'
+        )
+      );
+    `);
+    db.run(`
+      DELETE FROM customer_dues WHERE sale_id IN (
+        SELECT id FROM sales WHERE id LIKE 'sale_hist_%' OR bill_number LIKE 'HW-TEST%' OR id LIKE '%test%' OR bill_number LIKE '%TEST%' OR bill_number LIKE 'HW-%'
+      );
+    `);
+    db.run(`
+      DELETE FROM financial_transactions WHERE reference_no IN (
+        SELECT bill_number FROM sales WHERE id LIKE 'sale_hist_%' OR bill_number LIKE 'HW-TEST%' OR id LIKE '%test%' OR bill_number LIKE '%TEST%' OR bill_number LIKE 'HW-%'
+      ) OR id LIKE 'ftx_manual_%test%' OR reference_no LIKE 'INV-VERIF-%';
+    `);
+    db.run(`
+      DELETE FROM sales WHERE id LIKE 'sale_hist_%' OR bill_number LIKE 'HW-TEST%' OR id LIKE '%test%' OR bill_number LIKE '%TEST%' OR bill_number LIKE 'HW-%';
+    `);
+
+    // 2. Delete test purchases and batches
+    db.run(`
+      DELETE FROM purchase_items WHERE purchase_id IN (
+        SELECT id FROM purchases WHERE invoice_number LIKE 'INV-VERIF-%' OR notes LIKE '%test%'
+      );
+    `);
+    db.run(`
+      DELETE FROM purchase_batches WHERE purchase_item_id IN (
+        SELECT id FROM purchase_items WHERE purchase_id IN (
+          SELECT id FROM purchases WHERE invoice_number LIKE 'INV-VERIF-%' OR notes LIKE '%test%'
+        )
+      );
+    `);
+    db.run(`
+      DELETE FROM purchases WHERE invoice_number LIKE 'INV-VERIF-%' OR notes LIKE '%test%';
+    `);
+
+    // 3. Delete test products
+    db.run(`
+      DELETE FROM stock_ledger WHERE product_id IN (
+        SELECT id FROM products WHERE barcode LIKE 'VERIF-%' OR name LIKE 'Verification Silk Saree%' OR sku LIKE 'SKU-IDEM%' OR sku LIKE 'SKU-T1-%'
+      );
+    `);
+    db.run(`
+      DELETE FROM purchase_batches WHERE product_id IN (
+        SELECT id FROM products WHERE barcode LIKE 'VERIF-%' OR name LIKE 'Verification Silk Saree%' OR sku LIKE 'SKU-IDEM%' OR sku LIKE 'SKU-T1-%'
+      );
+    `);
+    db.run(`
+      DELETE FROM product_variants WHERE product_id IN (
+        SELECT id FROM products WHERE barcode LIKE 'VERIF-%' OR name LIKE 'Verification Silk Saree%' OR sku LIKE 'SKU-IDEM%' OR sku LIKE 'SKU-T1-%'
+      );
+    `);
+    db.run(`
+      DELETE FROM products WHERE barcode LIKE 'VERIF-%' OR name LIKE 'Verification Silk Saree%' OR sku LIKE 'SKU-IDEM%' OR sku LIKE 'SKU-T1-%';
+    `);
+
+    // 4. Remove test customers created by verification suites
+    db.run(`
+      DELETE FROM customers WHERE name LIKE 'K. Ramesh Rao 1792%' OR (notes = 'Added via manual bill entry' AND total_purchases = 0 AND total_dues = 0);
+    `);
+
+    db.run('PRAGMA foreign_keys = ON;');
+  } catch (err) {
+    console.error('[Mock Cleanup] Error:', err);
+    try { db.run('PRAGMA foreign_keys = ON;'); } catch {}
   }
 }
 
@@ -608,6 +696,86 @@ function migrateDualOwnerIfPresent(db: Database) {
     }
   } catch (err) {
     console.error('[Data Migration] Error checking dual owner configuration:', err);
+  }
+}
+
+function syncManualSalesFinancialTransactions(db: Database) {
+  try {
+    const stmt = db.prepare(`
+      SELECT s.id, s.bill_number, s.customer_name, s.cash_paid, s.upi_paid, s.created_at, s.cashier_id
+      FROM sales s
+      WHERE s.channel = 'MANUAL' 
+        AND (s.status IS NULL OR s.status = 'COMPLETED')
+        AND (s.cash_paid > 0 OR s.upi_paid > 0)
+    `);
+    const manualSales: any[] = [];
+    while (stmt.step()) {
+      manualSales.push(stmt.getAsObject());
+    }
+    stmt.free();
+
+    for (const sale of manualSales) {
+      const dateStr = (sale.created_at || '').split('T')[0] || new Date().toISOString().split('T')[0];
+      const customerName = sale.customer_name || 'Walk-in Customer';
+
+      if (sale.cash_paid > 0) {
+        const checkStmt = db.prepare("SELECT id FROM financial_transactions WHERE reference_no = ? AND destination_account = 'CASH' LIMIT 1");
+        checkStmt.bind([sale.bill_number]);
+        const exists = checkStmt.step();
+        checkStmt.free();
+
+        if (!exists) {
+          const txId = 'ftx_manual_cash_' + sale.id;
+          db.run(`
+            INSERT INTO financial_transactions (
+              id, date, amount, source_account, destination_account, transaction_type,
+              person_entity, category, purpose, payment_method, reference_no,
+              is_system_generated, user_id, created_at, updated_at
+            ) VALUES (?, ?, ?, 'EXTERNAL', 'CASH', 'INCOME', ?, 'SALES', ?, 'CASH', ?, 1, ?, ?, ?)
+          `, [
+            txId,
+            dateStr,
+            sale.cash_paid,
+            customerName,
+            `Manual Bill #${sale.bill_number}`,
+            sale.bill_number,
+            sale.cashier_id || 'CASHIER',
+            sale.created_at,
+            sale.created_at
+          ]);
+        }
+      }
+
+      if (sale.upi_paid > 0) {
+        const checkStmt = db.prepare("SELECT id FROM financial_transactions WHERE reference_no = ? AND destination_account = 'UPI' LIMIT 1");
+        checkStmt.bind([sale.bill_number]);
+        const exists = checkStmt.step();
+        checkStmt.free();
+
+        if (!exists) {
+          const txId = 'ftx_manual_upi_' + sale.id;
+          db.run(`
+            INSERT INTO financial_transactions (
+              id, date, amount, source_account, destination_account, transaction_type,
+              person_entity, category, purpose, payment_method, reference_no,
+              is_system_generated, user_id, created_at, updated_at
+            ) VALUES (?, ?, ?, 'EXTERNAL', 'UPI', 'INCOME', ?, 'SALES', ?, 'UPI', ?, 1, ?, ?, ?)
+          `, [
+            txId,
+            dateStr,
+            sale.upi_paid,
+            customerName,
+            `Manual Bill #${sale.bill_number}`,
+            sale.bill_number,
+            sale.cashier_id || 'CASHIER',
+            sale.created_at,
+            sale.created_at
+          ]);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Data Migration] Error syncing manual sales financial transactions:', err);
   }
 }
 

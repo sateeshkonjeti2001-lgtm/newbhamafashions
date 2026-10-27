@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -22,7 +23,7 @@ import { startBackupScheduler } from './server/backupScheduler.ts';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // Initialize SQLite database
   await getDb();
@@ -54,6 +55,17 @@ async function startServer() {
   app.use('/api/audit', auditRoutes);
   app.use('/api/backup', backupRoutes);
   app.use('/api/reports', reportRoutes);
+
+  // Catch-all 404 for unhandled API routes so they NEVER fall through to Vite SPA HTML fallback
+  app.all('/api/*', (req, res) => {
+    res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl || req.path}` });
+  });
+
+  // Global error handler for API routes ensuring JSON responses
+  app.use('/api', (err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('Unhandled API Error:', err);
+    res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+  });
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {

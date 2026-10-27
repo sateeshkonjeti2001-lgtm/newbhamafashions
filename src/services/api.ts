@@ -16,9 +16,10 @@ export function clearStoredToken(): void {
 
 export const removeStoredToken = clearStoredToken;
 
-async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(endpoint: string, options: RequestInit = {}, retries = 1): Promise<T> {
   const token = getStoredToken();
   const headers: Record<string, string> = {
+    'Accept': 'application/json',
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string>),
   };
@@ -27,23 +28,62 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${BASE_URL}${endpoint}`, {
-    ...options,
-    headers,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}${endpoint}`, {
+      ...options,
+      headers,
+    });
+  } catch (netErr: any) {
+    if (retries > 0) {
+      await new Promise((r) => setTimeout(r, 600));
+      return request<T>(endpoint, options, retries - 1);
+    }
+    throw new Error(netErr.message || 'Network connection failed. Please check your connection.');
+  }
+
+  const contentType = res.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
 
   if (!res.ok) {
-    let errorMsg = 'An error occurred';
-    try {
-      const errorJson = await res.json();
-      errorMsg = errorJson.error || errorMsg;
-    } catch {
-      errorMsg = res.statusText || errorMsg;
+    let errorMsg = `Server error (${res.status})`;
+    if (isJson) {
+      try {
+        const errorJson = await res.json();
+        errorMsg = errorJson.error || errorMsg;
+      } catch {
+        errorMsg = res.statusText || errorMsg;
+      }
+    } else {
+      if (res.status === 401) {
+        clearStoredToken();
+        errorMsg = 'Session expired. Please log in again.';
+      } else {
+        errorMsg = res.statusText ? `Server returned ${res.status}: ${res.statusText}` : `Server returned error (${res.status})`;
+      }
     }
+
+    if (res.status === 401) {
+      clearStoredToken();
+    }
+
     throw new Error(errorMsg);
   }
 
-  return res.json();
+  if (!isJson) {
+    // If the server returned an HTML page (e.g. during server reload or proxy gateway sync), retry once
+    if (retries > 0) {
+      await new Promise((r) => setTimeout(r, 600));
+      return request<T>(endpoint, options, retries - 1);
+    }
+    throw new Error('Server returned an unexpected non-JSON response. Please retry.');
+  }
+
+  try {
+    return await res.json();
+  } catch {
+    throw new Error('Failed to parse server JSON response.');
+  }
 }
 
 export const api = {
@@ -100,7 +140,8 @@ export const api = {
   }),
 
   // Dashboard
-  getDashboard: () => request<any>('/dashboard'),
+  getDashboard: (date?: string) =>
+    request<any>(`/dashboard${date ? `?date=${encodeURIComponent(date)}` : ''}`),
 
   // Products & Categories
   getCategories: () => request<{ categories: any[] }>('/products/categories'),
@@ -161,16 +202,20 @@ export const api = {
     body: JSON.stringify(data),
   }),
   getRecentSales: () => request<{ sales: any[] }>('/pos/recent'),
-  getBills: (params?: { search?: string; date?: string; start_date?: string; end_date?: string; status?: string; limit?: number; offset?: number }) => {
+  getBills: (params?: { search?: string; date?: string; start_date?: string; end_date?: string; status?: string; channel?: string; limit?: number; offset?: number }) => {
     const query = new URLSearchParams();
     if (params?.search) query.set('search', params.search);
     if (params?.date) query.set('date', params.date);
     if (params?.start_date) query.set('start_date', params.start_date);
     if (params?.end_date) query.set('end_date', params.end_date);
     if (params?.status) query.set('status', params.status);
+    if (params?.channel) query.set('channel', params.channel);
     if (params?.limit) query.set('limit', String(params.limit));
     if (params?.offset) query.set('offset', String(params.offset));
     return request<{ bills: any[] }>(`/pos/bills?${query.toString()}`);
+  },
+  getDailyBills: (params?: { search?: string; date?: string; start_date?: string; end_date?: string; status?: string; limit?: number; offset?: number }) => {
+    return api.getBills({ ...params, channel: 'MANUAL' });
   },
   getBillDetail: (id: string) => request<{ sale: any; items: any[]; returns: any[]; customerDue?: any }>(`/pos/bills/${id}`),
   cancelBill: (id: string, data: { reason: string; notes?: string }) => request<{ success: boolean; message: string; sale: any }>(`/pos/bills/${id}/cancel`, {
@@ -181,6 +226,16 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  createManualBill: (data: any) => request<{ success: boolean; message: string; sale: any }>('/pos/manual-bill', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  checkBillNumber: (params: { billNumber: string; date?: string }) => {
+    const query = new URLSearchParams();
+    if (params.billNumber) query.set('billNumber', params.billNumber);
+    if (params.date) query.set('date', params.date);
+    return request<{ exists: boolean; bill: any | null; message: string }>(`/pos/check-bill-number?${query.toString()}`);
+  },
 
   // Purchases & Suppliers
   getSuppliers: () => request<{ suppliers: any[] }>('/purchases/suppliers'),
@@ -255,6 +310,13 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  getCustomerLedger: (id: string) => request<{
+    customer: any;
+    dues: any[];
+    payments: any[];
+    timeline: any[];
+    total_pending: number;
+  }>(`/dues/customers/${id}/ledger`),
 
   // Staff & Attendance
   getStaff: () => request<{ staff: any[] }>('/staff'),
@@ -539,9 +601,4 @@ export const api = {
       insights: string[];
     }>(`/reports/sales-trends?${query.toString()}`);
   },
-
-  seedSampleSales: () =>
-    request<{ success: boolean; count: number; message: string }>('/reports/seed-sales-history', {
-      method: 'POST',
-    }),
 };

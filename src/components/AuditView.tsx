@@ -350,7 +350,7 @@ export const AuditView: React.FC = () => {
                         type="tel"
                         value={contactPhone1}
                         onChange={(e) => setContactPhone1(e.target.value)}
-                        placeholder="e.g. 9848012345 (Counter Phone)"
+                        placeholder="Counter phone number"
                         className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52]"
                       />
                     </div>
@@ -364,7 +364,7 @@ export const AuditView: React.FC = () => {
                         type="tel"
                         value={contactPhone2}
                         onChange={(e) => setContactPhone2(e.target.value)}
-                        placeholder="e.g. 9440112345 (Owner Mobile)"
+                        placeholder="Store owner mobile number"
                         className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52]"
                       />
                     </div>
@@ -378,7 +378,7 @@ export const AuditView: React.FC = () => {
                         type="tel"
                         value={contactPhone3}
                         onChange={(e) => setContactPhone3(e.target.value)}
-                        placeholder="e.g. 9848598765 (WhatsApp Support)"
+                        placeholder="Shop WhatsApp number"
                         className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52]"
                       />
                     </div>

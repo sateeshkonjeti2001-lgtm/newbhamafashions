@@ -6,6 +6,8 @@ import {
   Minus,
   Trash2,
   Receipt,
+  ShoppingCart,
+  ArrowRight,
   User as UserIcon,
   CreditCard,
   Banknote,
@@ -53,6 +55,7 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
   const [cashPaid, setCashPaid] = useState<number>(0);
   const [upiPaid, setUpiPaid] = useState<number>(0);
   const [amountReceived, setAmountReceived] = useState<number>(0); // for quick change calculation in CASH mode
+  const [mobileTab, setMobileTab] = useState<'CATALOG' | 'CART'>('CATALOG');
 
   // Completed sale for receipt
   const [completedSale, setCompletedSale] = useState<any | null>(null);
@@ -273,6 +276,13 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
     } else if (paymentMethod === 'CREDIT') {
       setCashPaid(0);
       setUpiPaid(0);
+    } else if (paymentMethod === 'SPLIT') {
+      // Default half-half split on first switch if both are zero
+      if (cashPaid === 0 && upiPaid === 0 && grandTotal > 0) {
+        const half = Math.floor(grandTotal / 2);
+        setCashPaid(half);
+        setUpiPaid(grandTotal - half);
+      }
     }
   }, [grandTotal, paymentMethod]);
 
@@ -281,39 +291,44 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
       setError('Cart is empty. Please add items to bill.');
       return;
     }
+    if (loading) return;
 
     setError(null);
     setLoading(true);
 
     try {
-      // Validate customer for credit
-      if (paymentMethod === 'CREDIT' && (!selectedCustomer.name || selectedCustomer.name === 'Walk-in Customer')) {
-        setError('Credit / customer due requires a named customer profile with phone or address.');
-        setLoading(false);
-        return;
-      }
-
       let cPaid = 0;
       let uPaid = 0;
 
       if (paymentMethod === 'CASH') {
         cPaid = grandTotal;
+        uPaid = 0;
       } else if (paymentMethod === 'UPI') {
         uPaid = grandTotal;
+        cPaid = 0;
       } else if (paymentMethod === 'SPLIT') {
-        cPaid = Number(cashPaid) || 0;
-        uPaid = Number(upiPaid) || 0;
-        if (cPaid + uPaid !== grandTotal) {
-          setError(`Split payment total (₹${cPaid + uPaid}) must match Grand Total (₹${grandTotal}).`);
+        cPaid = Math.max(0, Number(cashPaid) || 0);
+        uPaid = Math.max(0, Number(upiPaid) || 0);
+        const totalPaid = cPaid + uPaid;
+        const due = Math.max(0, grandTotal - totalPaid);
+        if (due > 0 && (!selectedCustomer.id && (!selectedCustomer.name || selectedCustomer.name.trim() === 'Walk-in Customer'))) {
+          setError(`Split payment has an unpaid due of ₹${due}. Please select or add a named customer to record outstanding dues.`);
           setLoading(false);
           return;
         }
       } else if (paymentMethod === 'CREDIT') {
-        cPaid = Number(cashPaid) || 0;
-        uPaid = Number(upiPaid) || 0;
+        cPaid = Math.max(0, Number(cashPaid) || 0);
+        uPaid = Math.max(0, Number(upiPaid) || 0);
+        if (!selectedCustomer.id && (!selectedCustomer.name || selectedCustomer.name.trim() === 'Walk-in Customer')) {
+          setError('Customer name or profile is required to issue goods on credit / due.');
+          setLoading(false);
+          return;
+        }
       }
 
+      const clientKey = 'pos_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
       const payload = {
+        idempotency_key: clientKey,
         customer_id: selectedCustomer.id || null,
         customer_name: selectedCustomer.name,
         customer_phone: selectedCustomer.phone || null,
@@ -366,18 +381,53 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
       setIsCreditMode(false);
       setPaymentMethod('CASH');
     } catch (err: any) {
-      setError(err.message || 'Checkout failed');
+      // Preserve cart on failure so cashier can retry safely
+      setError(err.message || 'Checkout failed to save bill. Please check values and retry.');
     } finally {
       setLoading(false);
     }
   };
 
   const changeDue = Math.max(0, amountReceived - grandTotal);
+  const totalCartItems = cart.reduce((s, i) => s + i.quantity, 0);
 
   return (
-    <div className="flex-1 min-h-0 w-full h-full flex flex-col lg:flex-row gap-3 sm:gap-3.5">
+    <div className="flex-1 min-h-0 w-full h-full flex flex-col lg:flex-row gap-2.5 sm:gap-3.5">
+      {/* Mobile / Tablet View Switcher (< lg) */}
+      <div className="lg:hidden flex items-center bg-white border border-[#E3DED5] rounded-xl p-1 shadow-2xs shrink-0">
+        <button
+          type="button"
+          onClick={() => setMobileTab('CATALOG')}
+          className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 min-h-[40px] cursor-pointer ${
+            mobileTab === 'CATALOG'
+              ? 'bg-[#1C1917] text-white shadow-xs'
+              : 'text-[#6F6962] hover:text-[#1C1917]'
+          }`}
+        >
+          <Search className="w-3.5 h-3.5" />
+          <span>Product Catalog</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setMobileTab('CART')}
+          className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 min-h-[40px] cursor-pointer ${
+            mobileTab === 'CART'
+              ? 'bg-[#1C1917] text-white shadow-xs'
+              : 'text-[#6F6962] hover:text-[#1C1917]'
+          }`}
+        >
+          <ShoppingCart className="w-3.5 h-3.5 text-[#A67C52]" />
+          <span>Cart ({totalCartItems})</span>
+          {totalCartItems > 0 && (
+            <span className="font-mono text-emerald-400 font-bold ml-1">₹{grandTotal}</span>
+          )}
+        </button>
+      </div>
+
       {/* Left Column: Product Search & Quick Catalog */}
-      <div className="flex-1 min-h-0 h-full flex flex-col bg-white border border-[#E3DED5] rounded-2xl overflow-hidden shadow-[0_2px_12px_rgba(23,21,19,0.03)]">
+      <div className={`flex-1 min-h-0 h-full flex flex-col bg-white border border-[#E3DED5] rounded-2xl overflow-hidden shadow-[0_2px_12px_rgba(23,21,19,0.03)] ${
+        mobileTab === 'CART' ? 'hidden lg:flex' : 'flex'
+      }`}>
         {/* Top Scan / Search Bar */}
         <div className="p-3 sm:p-3.5 bg-[#FAF8F4] border-b border-[#E3DED5] space-y-1.5 shrink-0">
           <div className="flex gap-2">
@@ -424,7 +474,7 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
         {/* Search Results / Item List */}
         <div className="flex-1 min-h-0 overflow-y-auto p-3 sm:p-3.5 space-y-2.5">
           {searchResults.length > 0 ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 items-stretch">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3 items-stretch">
               {searchResults.map((p) => {
                 const hasVariants = p.variants && p.variants.length > 0;
                 const isOutOfStock = p.current_stock <= 0;
@@ -433,57 +483,67 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
                 return (
                   <div
                     key={p.id}
-                    className="p-3 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl flex flex-col justify-between hover:border-[#A67C52] hover:bg-white transition shadow-2xs min-h-[148px]"
+                    className="p-3 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl flex flex-col justify-between hover:border-[#A67C52] hover:bg-white transition shadow-2xs h-full"
                   >
                     <div>
                       <div className="flex items-start justify-between gap-2">
-                        <div className="font-semibold text-xs text-[#1C1917] leading-snug break-words flex-1 min-w-0 pr-1.5">
-                          {p.name}
+                        <div className="flex-1 min-w-0 pr-1">
+                          <h4
+                            className="font-semibold text-xs text-[#1C1917] leading-snug line-clamp-2 min-h-[2.5em] break-words"
+                            title={p.name}
+                          >
+                            {p.name}
+                          </h4>
                         </div>
                         <span
                           className={`text-[10px] px-2 py-0.5 rounded-md font-bold border shrink-0 ${
                             p.current_stock > 3
-                              ? 'bg-white border-[#E3DED5] text-[#3F6B50]'
+                              ? 'bg-[#EBF5EE] border-[#C6E7D0] text-[#276738]'
                               : p.current_stock > 0
-                              ? 'bg-white border-[#E3DED5] text-[#A67C52]'
-                              : 'bg-white border-[#F0CCCC] text-[#A34F4F]'
+                              ? 'bg-amber-50 border-amber-200 text-amber-800'
+                              : 'bg-[#FDF5F5] border-[#F0CCCC] text-[#A34F4F]'
                           }`}
                         >
                           {p.current_stock > 0 ? `Stock: ${p.current_stock}` : 'Out of Stock'}
                         </span>
                       </div>
+
                       <div className="text-[11px] text-[#6F6962] mt-1.5 flex flex-wrap items-center gap-1.5">
                         {p.code && (
-                          <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-[#E3DED5] text-[10px] break-all">
+                          <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-[#E3DED5] text-[10px] shrink-0">
                             {p.code}
                           </span>
                         )}
                         {p.barcode && p.barcode !== p.code && (
-                          <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-[#E3DED5] text-[10px] text-[#A67C52] break-all" title="Barcode">
+                          <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-[#E3DED5] text-[10px] text-[#A67C52] shrink-0" title="Barcode">
                             🏷 {p.barcode}
                           </span>
                         )}
                         {p.category_name && (
-                          <span className="text-[10px]">&bull; {p.category_name}</span>
-                        )}
-                        {p.brand_name && (
-                          <span className="text-[10px]">&bull; {p.brand_name}</span>
+                          <span className="text-[10px] text-[#6F6962] truncate max-w-[110px]" title={p.category_name}>
+                            &bull; {p.category_name}
+                          </span>
                         )}
                       </div>
 
-                      {/* Explicit Stock Warning Messages */}
-                      {isOutOfStock && (
-                        <div className="mt-1.5 text-[10px] text-[#A34F4F] font-semibold flex items-center gap-1">
-                          <AlertCircle className="w-3 h-3 shrink-0" />
-                          <span>Out of stock &mdash; Cannot add to bill</span>
-                        </div>
-                      )}
-                      {isLowStock && (
-                        <div className="mt-1.5 text-[10px] text-[#A67C52] font-semibold flex items-center gap-1">
-                          <AlertCircle className="w-3 h-3 shrink-0" />
-                          <span>Low stock: only {p.current_stock} item{p.current_stock > 1 ? 's' : ''} left</span>
-                        </div>
-                      )}
+                      {/* Explicit Stock Status - Stable row height prevents layout jumps */}
+                      <div className="min-h-[20px] flex items-center mt-1">
+                        {isOutOfStock ? (
+                          <div className="text-[10px] text-[#A34F4F] font-semibold flex items-center gap-1">
+                            <AlertCircle className="w-3 h-3 shrink-0" />
+                            <span>Out of stock &mdash; Cannot add</span>
+                          </div>
+                        ) : isLowStock ? (
+                          <div className="text-[10px] text-[#A67C52] font-semibold flex items-center gap-1">
+                            <AlertCircle className="w-3 h-3 shrink-0" />
+                            <span>Low stock: only {p.current_stock} item{p.current_stock > 1 ? 's' : ''} left</span>
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-[#3F6B50] font-medium">
+                            In stock ({p.current_stock} available)
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     {/* Pricing and Action */}
@@ -547,10 +607,32 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
             </div>
           )}
         </div>
+
+        {/* Mobile Sticky Quick Jump to Cart */}
+        {cart.length > 0 && (
+          <div className="lg:hidden p-3 bg-[#FAF8F4] border-t border-[#E3DED5] flex items-center justify-between shrink-0">
+            <div>
+              <span className="text-[10px] uppercase font-bold text-[#9A938B] block">Current Bill</span>
+              <span className="text-xs font-bold font-mono text-[#1C1917]">
+                {totalCartItems} item{totalCartItems === 1 ? '' : 's'} &bull; ₹{grandTotal}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setMobileTab('CART')}
+              className="px-4 py-2 bg-[#A67C52] hover:bg-[#8F6843] text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition min-h-[40px] cursor-pointer"
+            >
+              <span>View Cart &amp; Checkout</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Right Column: Active Bill Cart & Checkout */}
-      <div className="w-full lg:w-[390px] xl:w-[420px] bg-white border border-[#E3DED5] rounded-2xl flex flex-col overflow-hidden shadow-[0_2px_12px_rgba(23,21,19,0.03)] shrink-0 min-h-0 h-full">
+      <div className={`w-full lg:w-[390px] xl:w-[420px] bg-white border border-[#E3DED5] rounded-2xl flex flex-col overflow-hidden shadow-[0_2px_12px_rgba(23,21,19,0.03)] shrink-0 min-h-0 h-full ${
+        mobileTab === 'CATALOG' ? 'hidden lg:flex' : 'flex'
+      }`}>
         {/* Cart Header */}
         <div className="p-3 sm:p-3.5 bg-[#FAF8F4] border-b border-[#E3DED5] flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
@@ -905,45 +987,134 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
           )}
 
           {/* Split Mode Breakdown */}
-          {paymentMethod === 'SPLIT' && (
-            <div className="bg-white p-2 rounded-xl border border-[#D4CDC2] space-y-1 text-[11px]">
-              <div className="flex justify-between items-center">
-                <span className="text-[#6F6962] font-medium">Cash Part:</span>
-                <input
-                  type="number"
-                  value={cashPaid || ''}
-                  onChange={(e) => {
-                    const c = Number(e.target.value) || 0;
-                    setCashPaid(c);
-                    setUpiPaid(Math.max(0, grandTotal - c));
-                  }}
-                  className="w-20 px-2 py-0.5 bg-[#FAF8F4] border border-[#D4CDC2] rounded text-right text-xs text-[#1C1917] font-semibold"
-                />
+          {paymentMethod === 'SPLIT' && (() => {
+            const cVal = Number(cashPaid) || 0;
+            const uVal = Number(upiPaid) || 0;
+            const totalEntered = cVal + uVal;
+            const remainingDue = Math.max(0, grandTotal - totalEntered);
+            const extraChange = Math.max(0, totalEntered - grandTotal);
+
+            return (
+              <div className="bg-white p-2.5 rounded-xl border border-[#D4CDC2] space-y-2 text-[11px]">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[#6F6962] font-semibold block mb-0.5">Cash (₹):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={cashPaid || ''}
+                      onChange={(e) => setCashPaid(Math.max(0, Number(e.target.value) || 0))}
+                      placeholder="0"
+                      className="w-full px-2 py-1 bg-[#FAF8F4] border border-[#D4CDC2] rounded text-xs text-[#1C1917] font-bold focus:outline-none focus:border-[#A67C52]"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[#6F6962] font-semibold block mb-0.5">UPI (₹):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={upiPaid || ''}
+                      onChange={(e) => setUpiPaid(Math.max(0, Number(e.target.value) || 0))}
+                      placeholder="0"
+                      className="w-full px-2 py-1 bg-[#FAF8F4] border border-[#D4CDC2] rounded text-xs text-[#1C1917] font-bold focus:outline-none focus:border-[#A67C52]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-1 border-t border-[#E3DED5] text-[11px]">
+                  <span className="text-[#6F6962]">Total Received:</span>
+                  <span className="font-bold text-[#1C1917]">₹{totalEntered}</span>
+                </div>
+
+                {remainingDue > 0 && (
+                  <div className="flex items-center justify-between text-amber-900 bg-amber-50 border border-amber-200 p-1.5 rounded-lg text-[10px]">
+                    <span className="font-semibold">Remaining Due: ₹{remainingDue}</span>
+                    <button
+                      type="button"
+                      onClick={() => setUpiPaid(Math.max(0, grandTotal - cVal))}
+                      className="text-[#A67C52] hover:underline font-bold text-[10px]"
+                    >
+                      Fill via UPI
+                    </button>
+                  </div>
+                )}
+
+                {extraChange > 0 && (
+                  <div className="flex items-center justify-between text-[#276738] bg-[#EBF5EE] border border-[#C6E7D0] p-1.5 rounded-lg text-[10px] font-bold">
+                    <span>Cash Change Return:</span>
+                    <span>₹{extraChange}</span>
+                  </div>
+                )}
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-[#6F6962] font-medium">UPI Part:</span>
-                <input
-                  type="number"
-                  value={upiPaid || ''}
-                  onChange={(e) => {
-                    const u = Number(e.target.value) || 0;
-                    setUpiPaid(u);
-                    setCashPaid(Math.max(0, grandTotal - u));
-                  }}
-                  className="w-20 px-2 py-0.5 bg-[#FAF8F4] border border-[#D4CDC2] rounded text-right text-xs text-[#1C1917] font-semibold"
-                />
+            );
+          })()}
+
+          {/* Credit / Due Mode Breakdown */}
+          {paymentMethod === 'CREDIT' && (() => {
+            const advCash = Number(cashPaid) || 0;
+            const advUpi = Number(upiPaid) || 0;
+            const totalAdv = advCash + advUpi;
+            const netDue = Math.max(0, grandTotal - totalAdv);
+
+            return (
+              <div className="bg-white p-2.5 rounded-xl border border-[#D4CDC2] space-y-2 text-[11px]">
+                <div className="text-[10px] text-[#A67C52] font-semibold flex items-center justify-between">
+                  <span>Customer Credit (Due Sale)</span>
+                  <span>Bill: ₹{grandTotal}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[#6F6962] text-[10px] font-semibold block mb-0.5">Advance Cash (₹):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={cashPaid || ''}
+                      onChange={(e) => setCashPaid(Math.max(0, Number(e.target.value) || 0))}
+                      placeholder="0"
+                      className="w-full px-2 py-1 bg-[#FAF8F4] border border-[#D4CDC2] rounded text-xs text-[#1C1917] font-bold focus:outline-none focus:border-[#A67C52]"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[#6F6962] text-[10px] font-semibold block mb-0.5">Advance UPI (₹):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={upiPaid || ''}
+                      onChange={(e) => setUpiPaid(Math.max(0, Number(e.target.value) || 0))}
+                      placeholder="0"
+                      className="w-full px-2 py-1 bg-[#FAF8F4] border border-[#D4CDC2] rounded text-xs text-[#1C1917] font-bold focus:outline-none focus:border-[#A67C52]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-1 border-t border-[#E3DED5] text-[11px]">
+                  <span className="text-[#6F6962]">Advance Paid:</span>
+                  <span className="font-bold text-[#1C1917]">₹{totalAdv}</span>
+                </div>
+
+                <div className="flex items-center justify-between bg-rose-50 border border-rose-200 text-rose-800 p-1.5 rounded-lg text-[10px] font-bold">
+                  <span>Outstanding Due Added:</span>
+                  <span>₹{netDue}</span>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Checkout Button */}
           <button
             type="button"
             onClick={handleCheckout}
             disabled={loading || cart.length === 0}
-            className="w-full py-2.5 sm:py-3 bg-[#171513] hover:bg-[#25211D] disabled:opacity-50 text-[#F5F2EC] font-bold rounded-xl shadow-xs text-xs sm:text-sm transition flex items-center justify-center gap-2"
+            className="w-full py-2.5 sm:py-3 bg-[#171513] hover:bg-[#25211D] disabled:opacity-50 text-[#F5F2EC] font-bold rounded-xl shadow-xs text-xs sm:text-sm transition flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
           >
-            {loading ? 'Processing Bill...' : `Complete Bill & Print (₹${grandTotal})`}
+            {loading ? (
+              <span className="flex items-center gap-2">
+                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                Processing Bill...
+              </span>
+            ) : (
+              `Complete Bill & Print (₹${grandTotal})`
+            )}
           </button>
         </div>
       </div>
@@ -982,23 +1153,45 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
               </div>
 
               {allCustomers.length > 0 && (
-                <div className="pt-2 border-t border-[#E3DED5]">
-                  <div className="text-[11px] font-medium text-[#6F6962] mb-1.5">Or pick from existing customers:</div>
+                <div className="pt-2 border-t border-[#E3DED5] space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-[#6F6962]">Or pick registered customer:</span>
+                  </div>
+                  <input
+                    type="text"
+                    value={customerSearch}
+                    onChange={(e) => setCustomerSearch(e.target.value)}
+                    placeholder="Search by name or phone..."
+                    className="w-full px-2.5 py-1.5 bg-[#FAF8F4] border border-[#D4CDC2] rounded-lg text-xs text-[#1C1917] placeholder:text-[#9A938B]"
+                  />
                   <div className="max-h-36 overflow-y-auto space-y-1">
-                    {allCustomers.map((c) => (
-                      <button
-                        key={c.id}
-                        type="button"
-                        onClick={() => {
-                          setSelectedCustomer({ id: c.id, name: c.name, phone: c.phone || '' });
-                          setShowCustomerModal(false);
-                        }}
-                        className="w-full text-left p-2 hover:bg-[#FAF8F4] rounded-lg text-xs flex justify-between border border-transparent hover:border-[#E3DED5] transition"
-                      >
-                        <span className="font-semibold text-[#1C1917]">{c.name}</span>
-                        <span className="text-[#6F6962]">{c.phone}</span>
-                      </button>
-                    ))}
+                    {allCustomers
+                      .filter((c) =>
+                        !customerSearch.trim() ||
+                        c.name?.toLowerCase().includes(customerSearch.toLowerCase()) ||
+                        (c.phone && c.phone.includes(customerSearch))
+                      )
+                      .map((c) => (
+                        <button
+                          key={c.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedCustomer({ id: c.id, name: c.name, phone: c.phone || '' });
+                            setShowCustomerModal(false);
+                          }}
+                          className="w-full text-left p-2 hover:bg-[#FAF8F4] rounded-lg text-xs flex justify-between items-center border border-transparent hover:border-[#E3DED5] transition"
+                        >
+                          <div>
+                            <span className="font-semibold text-[#1C1917] block">{c.name}</span>
+                            <span className="text-[10px] text-[#6F6962]">{c.phone || 'No phone'}</span>
+                          </div>
+                          {c.total_dues > 0 && (
+                            <span className="text-rose-700 font-bold text-[10px] bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded">
+                              Due: ₹{c.total_dues}
+                            </span>
+                          )}
+                        </button>
+                      ))}
                   </div>
                 </div>
               )}
@@ -1008,7 +1201,7 @@ export const POSView: React.FC<POSViewProps> = ({ role, currentUser, onNavigateT
                 onClick={() => setShowCustomerModal(false)}
                 className="w-full py-2.5 bg-[#171513] hover:bg-[#25211D] text-[#F5F2EC] rounded-xl text-xs font-semibold shadow-sm transition"
               >
-                Set Customer
+                Confirm Customer
               </button>
             </div>
           </div>

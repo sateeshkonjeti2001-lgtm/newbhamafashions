@@ -78,8 +78,6 @@ export const SalesTrendsChart: React.FC<SalesTrendsChartProps> = ({
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
-  const [seeding, setSeeding] = useState<boolean>(false);
-
   const fetchTrends = async () => {
     setLoading(true);
     setError(null);
@@ -96,18 +94,6 @@ export const SalesTrendsChart: React.FC<SalesTrendsChartProps> = ({
   useEffect(() => {
     fetchTrends();
   }, [startDate, endDate]);
-
-  const handleSeedHistory = async () => {
-    setSeeding(true);
-    try {
-      await api.seedSampleSales();
-      await fetchTrends();
-    } catch (err: any) {
-      alert(`Could not load history: ${err.message}`);
-    } finally {
-      setSeeding(false);
-    }
-  };
 
   const chartData = data ? data[granularity] || [] : [];
   const summary = data?.summary || {
@@ -322,21 +308,11 @@ export const SalesTrendsChart: React.FC<SalesTrendsChartProps> = ({
           <div className="h-72 flex flex-col items-center justify-center text-center p-6 bg-[#FAF8F4] border border-dashed border-[#D4CDC2] rounded-xl space-y-3">
             <Calendar className="w-8 h-8 text-[#A67C52]" />
             <div>
-              <p className="text-sm font-bold text-[#1C1917]">No sales transactions in this period</p>
+              <p className="text-sm font-bold text-[#1C1917]">No sales recorded in this period</p>
               <p className="text-xs text-[#6F6962] mt-0.5 max-w-sm">
-                Complete bills at the POS counter or load authentic boutique demo records to evaluate multi-week performance insights.
+                Sales transactions and daily bills entered for this date range will appear here.
               </p>
             </div>
-            {isOwner && (
-              <button
-                onClick={handleSeedHistory}
-                disabled={seeding}
-                className="px-4 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>{seeding ? 'Generating 45-Day Data...' : 'Load 45-Day Boutique History'}</span>
-              </button>
-            )}
           </div>
         ) : (
           <div className="space-y-4">
@@ -508,22 +484,6 @@ export const SalesTrendsChart: React.FC<SalesTrendsChartProps> = ({
                 )}
               </ResponsiveContainer>
             </div>
-
-            {/* Quick Demo Seed helper button if fewer than 5 data points */}
-            {chartData.length < 5 && isOwner && (
-              <div className="flex items-center justify-between p-3 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl text-xs">
-                <span className="text-[#6F6962]">
-                  Currently showing {chartData.length} data point{chartData.length === 1 ? '' : 's'}. You can load 45 days of authentic historical retail sales records for full trend analysis.
-                </span>
-                <button
-                  onClick={handleSeedHistory}
-                  disabled={seeding}
-                  className="px-3 py-1.5 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-lg text-xs font-semibold shrink-0 transition"
-                >
-                  {seeding ? 'Loading...' : 'Load 45-Day History'}
-                </button>
-              </div>
-            )}
           </div>
         )}
 

@@ -279,6 +279,24 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
                   <span>Paid:</span>
                   <span>₹{sale.amount_paid}</span>
                 </div>
+                {sale.cash_paid > 0 && sale.payment_method === 'SPLIT' && (
+                  <div className="flex justify-between text-slate-600 text-[10px] pl-2">
+                    <span>• Cash Paid:</span>
+                    <span>₹{sale.cash_paid}</span>
+                  </div>
+                )}
+                {sale.upi_paid > 0 && sale.payment_method === 'SPLIT' && (
+                  <div className="flex justify-between text-slate-600 text-[10px] pl-2">
+                    <span>• UPI Paid:</span>
+                    <span>₹{sale.upi_paid}</span>
+                  </div>
+                )}
+                {sale.card_paid > 0 && (
+                  <div className="flex justify-between text-slate-600 text-[10px] pl-2">
+                    <span>• Card Paid:</span>
+                    <span>₹{sale.card_paid}</span>
+                  </div>
+                )}
                 {sale.balance_due > 0 && (
                   <div className="flex justify-between text-red-600 font-bold">
                     <span>Balance Due (Credit):</span>

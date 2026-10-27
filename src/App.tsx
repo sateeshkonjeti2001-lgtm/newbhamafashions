@@ -1,4 +1,11 @@
 import React, { useState, useEffect } from 'react';
+import {
+  LayoutDashboard,
+  Receipt,
+  ShoppingCart,
+  ReceiptText,
+  Menu,
+} from 'lucide-react';
 import { api, getStoredToken, removeStoredToken } from './services/api.ts';
 import { User } from './types.ts';
 import { SetupScreen } from './components/SetupScreen.tsx';
@@ -6,6 +13,7 @@ import { LoginScreen } from './components/LoginScreen.tsx';
 import { Navbar } from './components/Navbar.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
+import { DailyBillsView } from './components/DailyBillsView.tsx';
 import { POSView } from './components/POSView.tsx';
 import { BillHistoryView } from './components/BillHistoryView.tsx';
 import { ProductsView } from './components/ProductsView.tsx';
@@ -25,6 +33,11 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [dayClosed, setDayClosed] = useState<boolean>(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
+  const [billsFilter, setBillsFilter] = useState<{ date?: string; channel?: 'ALL' | 'POS' | 'MANUAL' }>({
+    channel: 'ALL',
+  });
   const [loading, setLoading] = useState<boolean>(true);
 
   const initAuth = async () => {
@@ -77,6 +90,7 @@ export default function App() {
     removeStoredToken();
     setCurrentUser(null);
     setActiveTab('dashboard');
+    setMobileMenuOpen(false);
   };
 
   if (loading) {
@@ -124,20 +138,25 @@ export default function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         dayClosed={dayClosed}
+        onToggleMobileMenu={() => setMobileMenuOpen((prev) => !prev)}
       />
 
-      <div className="flex-1 flex overflow-hidden min-h-0">
+      <div className="flex-1 flex overflow-hidden min-h-0 relative">
         <Sidebar
           activeTab={activeTab}
           setActiveTab={setActiveTab}
           role={currentUser.role}
+          isMobileOpen={mobileMenuOpen}
+          onCloseMobile={() => setMobileMenuOpen(false)}
+          isCollapsed={sidebarCollapsed}
+          onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
         />
 
         <main
-          className={`flex-1 min-h-0 bg-[#F5F2EC] ${
+          className={`flex-1 min-h-0 bg-[#F5F2EC] pb-16 md:pb-0 ${
             activeTab === 'pos'
               ? 'p-2 sm:p-3 lg:p-3.5 flex flex-col overflow-y-auto lg:overflow-hidden'
-              : 'overflow-y-auto p-4 sm:p-6 lg:p-8'
+              : 'overflow-y-auto p-3 sm:p-5 lg:p-8'
           }`}
         >
           <div
@@ -151,6 +170,24 @@ export default function App() {
               <DashboardView
                 role={currentUser.role}
                 setActiveTab={setActiveTab}
+                onNavigateToBills={(filter) => {
+                  if (filter) {
+                    setBillsFilter(filter);
+                    if (filter.channel === 'MANUAL') {
+                      setActiveTab('daily-bills');
+                      return;
+                    }
+                  }
+                  setActiveTab('bills');
+                }}
+              />
+            )}
+
+            {activeTab === 'daily-bills' && (
+              <DailyBillsView
+                role={currentUser.role}
+                onNavigateToDashboard={() => setActiveTab('dashboard')}
+                initialDate={billsFilter.date}
               />
             )}
 
@@ -166,6 +203,8 @@ export default function App() {
               <BillHistoryView
                 role={currentUser.role}
                 onNavigateToPOS={() => setActiveTab('pos')}
+                initialDateFilter={billsFilter.date}
+                initialChannelFilter={billsFilter.channel}
               />
             )}
 
@@ -204,6 +243,73 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {/* 4. Bottom Mobile Quick Navigation Bar (< md screens) */}
+      <nav
+        className="md:hidden fixed bottom-0 inset-x-0 bg-[#171513] text-[#9A938B] border-t border-[#25211D] z-30 flex items-center justify-around px-2 py-1 shadow-lg"
+        aria-label="Mobile quick actions"
+      >
+        <button
+          type="button"
+          onClick={() => setActiveTab('dashboard')}
+          className={`flex flex-col items-center justify-center py-1.5 px-3 rounded-xl min-h-[48px] text-[10px] font-medium transition cursor-pointer ${
+            activeTab === 'dashboard'
+              ? 'text-[#F5F2EC] font-bold bg-[#2A221B]'
+              : 'hover:text-[#F5F2EC]'
+          }`}
+        >
+          <LayoutDashboard className={`w-4 h-4 mb-1 ${activeTab === 'dashboard' ? 'text-[#A67C52]' : ''}`} />
+          <span>Dashboard</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('daily-bills')}
+          className={`flex flex-col items-center justify-center py-1.5 px-3 rounded-xl min-h-[48px] text-[10px] font-medium transition cursor-pointer ${
+            activeTab === 'daily-bills'
+              ? 'text-[#F5F2EC] font-bold bg-[#2A221B]'
+              : 'hover:text-[#F5F2EC]'
+          }`}
+        >
+          <Receipt className={`w-4 h-4 mb-1 ${activeTab === 'daily-bills' ? 'text-[#A67C52]' : ''}`} />
+          <span>Daily Bills</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('pos')}
+          className={`flex flex-col items-center justify-center py-1.5 px-3 rounded-xl min-h-[48px] text-[10px] font-medium transition cursor-pointer ${
+            activeTab === 'pos'
+              ? 'text-[#F5F2EC] font-bold bg-[#2A221B]'
+              : 'hover:text-[#F5F2EC]'
+          }`}
+        >
+          <ShoppingCart className={`w-4 h-4 mb-1 ${activeTab === 'pos' ? 'text-[#A67C52]' : ''}`} />
+          <span>POS</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('bills')}
+          className={`flex flex-col items-center justify-center py-1.5 px-3 rounded-xl min-h-[48px] text-[10px] font-medium transition cursor-pointer ${
+            activeTab === 'bills'
+              ? 'text-[#F5F2EC] font-bold bg-[#2A221B]'
+              : 'hover:text-[#F5F2EC]'
+          }`}
+        >
+          <ReceiptText className={`w-4 h-4 mb-1 ${activeTab === 'bills' ? 'text-[#A67C52]' : ''}`} />
+          <span>Bills</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setMobileMenuOpen(true)}
+          className="flex flex-col items-center justify-center py-1.5 px-3 rounded-xl min-h-[48px] text-[10px] font-medium hover:text-[#F5F2EC] transition cursor-pointer"
+        >
+          <Menu className="w-4 h-4 mb-1 text-[#A67C52]" />
+          <span>More</span>
+        </button>
+      </nav>
     </div>
   );
 }

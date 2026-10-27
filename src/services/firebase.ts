@@ -157,3 +157,68 @@ export async function fetchSyncLogsFromFirestore(
     return [];
   }
 }
+
+// Manual Handwritten Bills Firestore Integration
+export interface FirestoreManualBill {
+  id?: string;
+  billNumber: string;
+  billDate: string;
+  totalAmount: number;
+  paymentMethod: 'CASH' | 'UPI' | 'SPLIT' | 'CREDIT';
+  cashAmount: number;
+  upiAmount: number;
+  dueAmount: number;
+  itemCount: number;
+  items: Array<{
+    itemName: string;
+    quantity: number;
+    rate: number;
+    itemTotal: number;
+  }>;
+  customerName?: string;
+  customerPhone?: string;
+  notes?: string;
+  createdAt: string;
+  createdBy?: string;
+}
+
+export async function saveManualBillToFirestore(
+  billData: Omit<FirestoreManualBill, 'createdAt'>
+): Promise<{ ok: boolean; id?: string; error?: string }> {
+  try {
+    const col = collection(db, 'manual_bills');
+    // Strip undefined properties to ensure Firestore SDK compatibility
+    const cleanPayload: Record<string, any> = {};
+    for (const [key, value] of Object.entries(billData)) {
+      if (value !== undefined) {
+        cleanPayload[key] = value;
+      }
+    }
+    const docRef = await addDoc(col, {
+      ...cleanPayload,
+      createdAt: new Date().toISOString(),
+    });
+    return { ok: true, id: docRef.id };
+  } catch (err: any) {
+    console.warn('Could not write manual bill to Firestore (may be offline):', err);
+    return { ok: false, error: err?.message || 'Firestore offline or inaccessible' };
+  }
+}
+
+export async function fetchManualBillsFromFirestore(
+  maxEntries = 50
+): Promise<FirestoreManualBill[]> {
+  try {
+    const col = collection(db, 'manual_bills');
+    const q = query(col, orderBy('createdAt', 'desc'), limit(maxEntries));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Omit<FirestoreManualBill, 'id'>),
+    }));
+  } catch (err) {
+    console.warn('Could not fetch manual bills from Firestore:', err);
+    return [];
+  }
+}
+

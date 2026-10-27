@@ -5,8 +5,8 @@ import { logAudit } from '../audit.ts';
 
 const router = Router();
 
-// Check if store is initialized
-router.get('/status', async (req, res) => {
+// Check if store is initialized (supports both /status and /setup-status)
+router.get(['/status', '/setup-status'], async (req, res) => {
   try {
     const userCountRow = dbQueryOne<{ count: number }>('SELECT COUNT(*) as count FROM users');
     const isInitialized = (userCountRow?.count || 0) > 0;

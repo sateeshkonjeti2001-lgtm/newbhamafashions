@@ -7,67 +7,196 @@ const router = Router();
 router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
-    // Today's date in YYYY-MM-DD local format
-    const today = new Date().toISOString().split('T')[0];
+    const todayStr = new Date().toISOString().split('T')[0];
+    const targetDate = (req.query.date as string) || todayStr;
+    const isToday = targetDate === todayStr;
 
-    // Today's Sales metrics (only active COMPLETED sales)
+    // 1. Store Details
+    const storeNameRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_name']);
+    const storeLocationRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_location']);
+    const storeTaglineRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_tagline']);
+    const phone1Row = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['contact_phone_1']);
+
+    const storeInfo = {
+      name: storeNameRow?.value || 'New Bhama Fashions',
+      location: storeLocationRow?.value || 'Chilakaluripet, Andhra Pradesh',
+      tagline: storeTaglineRow?.value || 'Ladies Fashion Retail',
+      phone: phone1Row?.value || '6305782832',
+    };
+
+    // 2. Sales Metrics for targetDate (only completed sales, exactly counted once)
     const salesSummary = dbQueryOne<any>(`
       SELECT 
         COUNT(*) as total_bills,
-        COALESCE(SUM(total_amount), 0) as total_sales,
+        COALESCE(SUM(total_amount), 0) as gross_sales,
         COALESCE(SUM(cash_paid), 0) as cash_sales,
         COALESCE(SUM(upi_paid), 0) as upi_sales,
-        COALESCE(SUM(balance_due), 0) as credit_sales
+        COALESCE(SUM(balance_due), 0) as credit_sales,
+        COALESCE(SUM(CASE WHEN channel = 'MANUAL' THEN 1 ELSE 0 END), 0) as manual_bills_count,
+        COALESCE(SUM(CASE WHEN channel = 'MANUAL' THEN total_amount ELSE 0 END), 0) as manual_bills_total,
+        COALESCE(SUM(CASE WHEN channel = 'MANUAL' THEN cash_paid ELSE 0 END), 0) as manual_cash_sales,
+        COALESCE(SUM(CASE WHEN channel = 'MANUAL' THEN upi_paid ELSE 0 END), 0) as manual_upi_sales,
+        COALESCE(SUM(CASE WHEN channel = 'MANUAL' THEN balance_due ELSE 0 END), 0) as manual_credit_sales,
+        COALESCE(SUM(CASE WHEN channel != 'MANUAL' OR channel IS NULL THEN 1 ELSE 0 END), 0) as pos_bills_count,
+        COALESCE(SUM(CASE WHEN channel != 'MANUAL' OR channel IS NULL THEN total_amount ELSE 0 END), 0) as pos_bills_total
       FROM sales 
       WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
-    `, [today]) || { total_bills: 0, total_sales: 0, cash_sales: 0, upi_sales: 0, credit_sales: 0 };
+    `, [targetDate]) || {
+      total_bills: 0,
+      gross_sales: 0,
+      cash_sales: 0,
+      upi_sales: 0,
+      credit_sales: 0,
+      manual_bills_count: 0,
+      manual_bills_total: 0,
+      manual_cash_sales: 0,
+      manual_upi_sales: 0,
+      manual_credit_sales: 0,
+      pos_bills_count: 0,
+      pos_bills_total: 0,
+    };
 
-    // Today's Returns
-    const returnsToday = dbQueryOne<any>(`
+    // 3. Returns and Refunds for targetDate
+    const returnsSummary = dbQueryOne<any>(`
       SELECT 
         COUNT(*) as return_count,
-        COALESCE(SUM(refund_amount), 0) as total_refunds
+        COALESCE(SUM(refund_amount), 0) as total_refunds,
+        COALESCE(SUM(CASE WHEN refund_method = 'CASH' THEN refund_amount ELSE 0 END), 0) as cash_refunds,
+        COALESCE(SUM(CASE WHEN refund_method = 'UPI' THEN refund_amount ELSE 0 END), 0) as upi_refunds
       FROM sale_returns
       WHERE DATE(created_at) = ?
-    `, [today]) || { return_count: 0, total_refunds: 0 };
+    `, [targetDate]) || { return_count: 0, total_refunds: 0, cash_refunds: 0, upi_refunds: 0 };
 
-    // Net sales after refunds
-    salesSummary.total_sales = Math.max(0, salesSummary.total_sales - returnsToday.total_refunds);
+    const netSales = Math.max(0, salesSummary.gross_sales - returnsSummary.total_refunds);
+    const netSalesCash = Math.max(0, salesSummary.cash_sales - returnsSummary.cash_refunds);
+    const netSalesUpi = Math.max(0, salesSummary.upi_sales - returnsSummary.upi_refunds);
 
-    // Today's Expenses
-    const expenseSummary = dbQueryOne<any>(`
+    // 4. Customer Due Collections on targetDate (Credit settlements received)
+    const dueCollections = dbQueryOne<any>(`
       SELECT 
-        COUNT(*) as expense_count,
+        COUNT(*) as count,
+        COALESCE(SUM(amount), 0) as total_collected,
+        COALESCE(SUM(CASE WHEN destination_account = 'CASH' OR payment_method = 'CASH' THEN amount ELSE 0 END), 0) as cash_collected,
+        COALESCE(SUM(CASE WHEN destination_account = 'UPI' OR payment_method = 'UPI' THEN amount ELSE 0 END), 0) as upi_collected
+      FROM financial_transactions
+      WHERE date = ? 
+        AND transaction_type = 'CUSTOMER_DUE_COLLECTION'
+        AND is_reversed = 0
+    `, [targetDate]) || { count: 0, total_collected: 0, cash_collected: 0, upi_collected: 0 };
+
+    // Actual Collections Today
+    const cashReceivedToday = netSalesCash + dueCollections.cash_collected;
+    const upiReceivedToday = netSalesUpi + dueCollections.upi_collected;
+
+    // 5. Customer Dues Outstanding (unpaid customer balances across the business)
+    const customerDuesSummary = dbQueryOne<any>(`
+      SELECT 
+        COUNT(*) as pending_count,
+        COALESCE(SUM(balance_due), 0) as total_pending_dues,
+        COUNT(DISTINCT customer_id) as customer_count
+      FROM customer_dues 
+      WHERE status = 'PENDING' AND balance_due > 0
+    `) || { pending_count: 0, total_pending_dues: 0, customer_count: 0 };
+
+    // 6. Current Cash Drawer Balance per Cash Ledger
+    // All cash in minus all cash out in financial_transactions
+    const cashInRow = dbQueryOne<any>(`
+      SELECT COALESCE(SUM(amount), 0) as total 
+      FROM financial_transactions 
+      WHERE destination_account = 'CASH' AND is_reversed = 0
+    `);
+    const cashOutRow = dbQueryOne<any>(`
+      SELECT COALESCE(SUM(amount), 0) as total 
+      FROM financial_transactions 
+      WHERE source_account = 'CASH' AND is_reversed = 0
+    `);
+    const currentCashBalance = Math.round(((cashInRow?.total || 0) - (cashOutRow?.total || 0)) * 100) / 100;
+
+    // Target date cash movements
+    const dateCashInRow = dbQueryOne<any>(`
+      SELECT COALESCE(SUM(amount), 0) as total 
+      FROM financial_transactions 
+      WHERE destination_account = 'CASH' AND date = ? AND is_reversed = 0
+    `, [targetDate]);
+    const dateCashOutRow = dbQueryOne<any>(`
+      SELECT COALESCE(SUM(amount), 0) as total 
+      FROM financial_transactions 
+      WHERE source_account = 'CASH' AND date = ? AND is_reversed = 0
+    `, [targetDate]);
+
+    // 7. Today's Operating Expenses for targetDate
+    // Query expenses table
+    const expenseTable = dbQueryOne<any>(`
+      SELECT 
+        COUNT(*) as count,
         COALESCE(SUM(amount), 0) as total_expenses,
         COALESCE(SUM(CASE WHEN payment_method = 'CASH' THEN amount ELSE 0 END), 0) as cash_expenses,
         COALESCE(SUM(CASE WHEN payment_method = 'UPI' THEN amount ELSE 0 END), 0) as upi_expenses
       FROM expenses 
       WHERE date = ?
-    `, [today]) || { expense_count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
+    `, [targetDate]) || { count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
 
-    // Pending Customer Dues Total
-    const duesSummary = dbQueryOne<any>(`
+    // Also check financial_transactions for OPERATING_EXPENSE
+    const ftExpenses = dbQueryOne<any>(`
+      SELECT 
+        COUNT(*) as count,
+        COALESCE(SUM(amount), 0) as total_expenses,
+        COALESCE(SUM(CASE WHEN destination_account = 'CASH' OR source_account = 'CASH' OR payment_method = 'CASH' THEN amount ELSE 0 END), 0) as cash_expenses,
+        COALESCE(SUM(CASE WHEN destination_account = 'UPI' OR source_account = 'UPI' OR payment_method = 'UPI' THEN amount ELSE 0 END), 0) as upi_expenses
+      FROM financial_transactions
+      WHERE date = ? AND transaction_type = 'OPERATING_EXPENSE' AND is_reversed = 0
+    `, [targetDate]) || { count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
+
+    const totalExpenses = Math.max(expenseTable.total_expenses, ftExpenses.total_expenses);
+    const cashExpenses = Math.max(expenseTable.cash_expenses, ftExpenses.cash_expenses);
+    const upiExpenses = Math.max(expenseTable.upi_expenses, ftExpenses.upi_expenses);
+    const expenseCount = Math.max(expenseTable.count, ftExpenses.count);
+
+    // 8. Supplier Outstanding (Unpaid supplier balances)
+    const supplierDuesSummary = dbQueryOne<any>(`
       SELECT 
         COUNT(*) as pending_count,
-        COALESCE(SUM(balance_due), 0) as total_pending_dues
-      FROM customer_dues 
-      WHERE status = 'PENDING' AND balance_due > 0
-    `) || { pending_count: 0, total_pending_dues: 0 };
+        COALESCE(SUM(balance_due), 0) as total_supplier_dues
+      FROM purchases 
+      WHERE balance_due > 0
+    `) || { pending_count: 0, total_supplier_dues: 0 };
 
-    // Supplier Dues Total (Owner only)
-    let supplierDuesSummary = { pending_count: 0, total_supplier_dues: 0 };
-    if (isOwner) {
-      supplierDuesSummary = dbQueryOne<any>(`
-        SELECT 
-          COUNT(*) as pending_count,
-          COALESCE(SUM(balance_due), 0) as total_supplier_dues
-        FROM purchases 
-        WHERE balance_due > 0
-      `) || { pending_count: 0, total_supplier_dues: 0 };
+    // 9. Day Closing / Reconciliation Status for targetDate
+    const dailyClosing = dbQueryOne<any>(`
+      SELECT 
+        dc.id, 
+        dc.closing_date, 
+        dc.opening_cash, 
+        dc.expected_closing_cash, 
+        dc.actual_counted_cash, 
+        dc.difference_cash, 
+        dc.status,
+        dc.closed_at,
+        dc.closing_notes,
+        u.full_name as closed_by_name
+      FROM daily_closings dc
+      LEFT JOIN users u ON dc.closed_by_user_id = u.id
+      WHERE dc.closing_date = ?
+    `, [targetDate]);
+
+    const isDayClosed = dailyClosing?.status === 'CLOSED';
+
+    // Opening cash lookup (from daily closing record or previous closed date)
+    let openingCash = dailyClosing?.opening_cash || 0;
+    if (!dailyClosing || dailyClosing.opening_cash === undefined) {
+      const prevClosing = dbQueryOne<any>(
+        'SELECT actual_counted_cash FROM daily_closings WHERE closing_date < ? ORDER BY closing_date DESC LIMIT 1',
+        [targetDate]
+      );
+      openingCash = prevClosing ? prevClosing.actual_counted_cash : 0;
     }
 
-    // Low stock alerts (products where total remaining quantity across batches is <= 3 or 0)
-    // We compute actual stock from stock_ledger
+    // Expected closing cash for target date
+    const expectedClosingCash = Math.round(
+      (openingCash + (dateCashInRow?.total || 0) - (dateCashOutRow?.total || 0)) * 100
+    ) / 100;
+
+    // 10. Low Stock Alerts (quantity <= 3)
     const stockAlerts = dbQueryAll(`
       SELECT 
         p.id,
@@ -86,44 +215,148 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       LIMIT 10
     `);
 
-    // Today's active daily closing status
-    const dailyClosing = dbQueryOne<any>(`
-      SELECT id, closing_date, opening_cash, expected_closing_cash, actual_counted_cash, difference_cash, status
-      FROM daily_closings
-      WHERE closing_date = ?
-    `, [today]);
-
-    // Recent 5 sales today
+    // 11. Recent Sales for targetDate
     const recentSales = dbQueryAll(`
-      SELECT id, bill_number, customer_name, total_amount, payment_method, payment_status, created_at
+      SELECT 
+        id, 
+        bill_number, 
+        customer_name, 
+        total_amount, 
+        payment_method, 
+        payment_status, 
+        cash_paid, 
+        upi_paid, 
+        balance_due,
+        channel, 
+        created_at
       FROM sales
-      WHERE DATE(created_at) = ?
+      WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
       ORDER BY created_at DESC
-      LIMIT 5
-    `, [today]);
+      LIMIT 6
+    `, [targetDate]);
 
-    // Total counts in real database
-    const counts = {
-      total_products: dbQueryOne<any>('SELECT COUNT(*) as c FROM products WHERE is_active = 1')?.c || 0,
-      total_customers: dbQueryOne<any>('SELECT COUNT(*) as c FROM customers')?.c || 0,
-      total_suppliers: isOwner ? (dbQueryOne<any>('SELECT COUNT(*) as c FROM suppliers WHERE is_active = 1')?.c || 0) : null,
-      active_staff: isOwner ? (dbQueryOne<any>('SELECT COUNT(*) as c FROM staff WHERE is_active = 1')?.c || 0) : null
-    };
+    // 12. Available business dates with recorded sales (for date browsing)
+    const availableDates = dbQueryAll<{ sale_date: string; count: number; total: number }>(`
+      SELECT 
+        DATE(created_at) as sale_date, 
+        COUNT(*) as count,
+        COALESCE(SUM(total_amount), 0) as total
+      FROM sales 
+      WHERE status IS NULL OR status = 'COMPLETED'
+      GROUP BY sale_date 
+      ORDER BY sale_date DESC 
+      LIMIT 15
+    `);
+
+    // Total products count
+    const totalProducts = dbQueryOne<any>('SELECT COUNT(*) as c FROM products WHERE is_active = 1')?.c || 0;
+    const lowStockCount = stockAlerts.filter((s: any) => s.current_stock > 0).length;
+    const outOfStockCount = stockAlerts.filter((s: any) => s.current_stock <= 0).length;
 
     res.json({
-      today,
+      selectedDate: targetDate,
+      isToday,
       isOwner,
-      sales: salesSummary,
-      expenses: expenseSummary,
-      customerDues: duesSummary,
-      supplierDues: isOwner ? supplierDuesSummary : null,
-      stockAlerts,
-      dailyClosing,
+      store: storeInfo,
+
+      // Summary Row 1: Sales & Collections
+      sales: {
+        total_sales: netSales,
+        gross_sales: salesSummary.gross_sales,
+        total_bills: salesSummary.total_bills,
+        cash_sales: netSalesCash,
+        upi_sales: netSalesUpi,
+        credit_sales: salesSummary.credit_sales,
+        manual_bills_count: salesSummary.manual_bills_count,
+        manual_bills_total: salesSummary.manual_bills_total,
+        manual_cash_sales: salesSummary.manual_cash_sales,
+        manual_upi_sales: salesSummary.manual_upi_sales,
+        manual_credit_sales: salesSummary.manual_credit_sales,
+        pos_bills_count: salesSummary.pos_bills_count,
+        pos_bills_total: salesSummary.pos_bills_total,
+      },
+      collections: {
+        cash_received: cashReceivedToday,
+        sales_cash: netSalesCash,
+        due_cash: dueCollections.cash_collected,
+        upi_received: upiReceivedToday,
+        sales_upi: netSalesUpi,
+        due_upi: dueCollections.upi_collected,
+      },
+
+      // Summary Row 2: Outstanding & Expenses
+      customerDues: {
+        total_pending: customerDuesSummary.total_pending_dues,
+        pending_count: customerDuesSummary.pending_count,
+        customer_count: customerDuesSummary.customer_count,
+        credit_sales_today: salesSummary.credit_sales,
+      },
+      cashDrawer: {
+        current_balance: currentCashBalance,
+        opening_cash: openingCash,
+        today_cash_in: dateCashInRow?.total || 0,
+        today_cash_out: dateCashOutRow?.total || 0,
+        expected_closing_cash: expectedClosingCash,
+      },
+      expenses: {
+        total_expenses: totalExpenses,
+        cash_expenses: cashExpenses,
+        upi_expenses: upiExpenses,
+        count: expenseCount,
+      },
+
+      // Bottom Section: Supplier Outstanding & Day Closing & Manual Bills Count
+      supplierOutstanding: {
+        total_pending: supplierDuesSummary.total_supplier_dues,
+        pending_count: supplierDuesSummary.pending_count,
+      },
+      closing: {
+        is_closed: isDayClosed,
+        status: isDayClosed ? 'CLOSED' : 'ACTIVE',
+        opening_cash: openingCash,
+        expected_closing_cash: dailyClosing?.expected_closing_cash ?? expectedClosingCash,
+        actual_counted_cash: dailyClosing?.actual_counted_cash ?? null,
+        closed_at: dailyClosing?.closed_at ?? null,
+        closed_by_name: dailyClosing?.closed_by_name ?? null,
+        notes: dailyClosing?.closing_notes ?? null,
+      },
+      manualBills: {
+        count: salesSummary.manual_bills_count,
+        total_amount: salesSummary.manual_bills_total,
+        cash_amount: salesSummary.manual_cash_sales,
+        upi_amount: salesSummary.manual_upi_sales,
+        credit_amount: salesSummary.manual_credit_sales,
+      },
+
+      // Navigation & Auxiliary Details
       recentSales,
-      counts
+      stockAlerts,
+      availableDates,
+      stockCount: {
+        total_products: totalProducts,
+        low_stock: lowStockCount,
+        out_of_stock: outOfStockCount,
+      },
+
+      // Legacy field aliases for backwards compatibility
+      todaySales: {
+        total: netSales,
+        bills_count: salesSummary.total_bills,
+        cash_collected: cashReceivedToday,
+        upi_collected: upiReceivedToday,
+      },
+      todayExpenses: totalExpenses,
+      pendingCustomerDues: customerDuesSummary.total_pending_dues,
+      pendingSupplierDues: supplierDuesSummary.total_supplier_dues,
+      accounts: {
+        cash: currentCashBalance,
+        upi: upiReceivedToday,
+      },
+      dailyClosing,
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    console.error('Error fetching dashboard metrics:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch dashboard metrics' });
   }
 });
 

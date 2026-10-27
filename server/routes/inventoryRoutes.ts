@@ -13,7 +13,9 @@ router.get('/stock', authMiddleware, (req: AuthenticatedRequest, res: Response) 
 
     let sql = `
       SELECT 
+        p.id,
         p.id as product_id,
+        p.name,
         p.name as product_name,
         p.code,
         p.sku,
@@ -113,8 +115,11 @@ router.get('/batches', authMiddleware, (req: AuthenticatedRequest, res: Response
         pb.product_id,
         pb.variant_id,
         pb.batch_number,
+        pb.batch_number as invoice_number,
         pb.initial_qty,
+        pb.initial_qty as original_quantity,
         pb.remaining_qty,
+        pb.remaining_qty as remaining_quantity,
         pb.received_date,
         pb.is_active,
         pb.created_at,

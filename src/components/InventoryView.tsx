@@ -64,7 +64,12 @@ export const InventoryView: React.FC<InventoryViewProps> = ({ role }) => {
   }, [activeTab, search]);
 
   const openAdjustmentModal = (item: any) => {
-    setSelectedProduct(item);
+    setSelectedProduct({
+      ...item,
+      id: item.id || item.product_id,
+      name: item.name || item.product_name || 'Item',
+      current_stock: item.current_stock ?? 0,
+    });
     setAdjType('ADJUSTMENT');
     setAdjQty(0);
     setAdjReason('');
@@ -192,10 +197,13 @@ export const InventoryView: React.FC<InventoryViewProps> = ({ role }) => {
                       </td>
                     </tr>
                   ) : (
-                    stockList.map((item) => (
-                      <tr key={item.id} className="hover:bg-[#FAF8F4] transition">
+                    stockList.map((item, idx) => {
+                      const itemKey = item.id || item.product_id || `stock-item-${idx}-${item.code || item.barcode || ''}`;
+                      const itemName = item.name || item.product_name || 'Item';
+                      return (
+                      <tr key={itemKey} className="hover:bg-[#FAF8F4] transition">
                         <td className="px-4 py-3.5 font-semibold text-[#1C1917]">
-                          {item.name}
+                          {itemName}
                         </td>
                         <td className="px-4 py-3.5 text-[#6F6962]">
                           {item.category_name || '-'}
@@ -233,7 +241,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({ role }) => {
                           </button>
                         </td>
                       </tr>
-                    ))
+                    );
+                  })
                   )}
                 </tbody>
               </table>
@@ -280,10 +289,11 @@ export const InventoryView: React.FC<InventoryViewProps> = ({ role }) => {
                     </td>
                   </tr>
                 ) : (
-                  ledger.map((row) => {
+                  ledger.map((row, idx) => {
+                    const rowKey = row.id || `ledger-${idx}-${row.product_id || ''}-${row.created_at || ''}`;
                     const isPositive = row.quantity > 0;
                     return (
-                      <tr key={row.id} className="hover:bg-[#FAF8F4] transition">
+                      <tr key={rowKey} className="hover:bg-[#FAF8F4] transition">
                         <td className="px-4 py-3.5 text-[#6F6962] text-[11px]">
                           {new Date(row.created_at).toLocaleString('en-IN', {
                             dateStyle: 'short',
@@ -361,29 +371,35 @@ export const InventoryView: React.FC<InventoryViewProps> = ({ role }) => {
                     </td>
                   </tr>
                 ) : (
-                  batches.map((b) => (
-                    <tr key={b.id} className="hover:bg-[#FAF8F4] transition">
+                  batches.map((b, idx) => {
+                    const batchKey = b.id || `batch-row-${idx}-${b.batch_number || b.invoice_number || ''}`;
+                    const origQty = b.original_quantity ?? b.initial_qty ?? 0;
+                    const remQty = b.remaining_quantity ?? b.remaining_qty ?? 0;
+                    const unitCost = Number(b.unit_cost) || 0;
+                    return (
+                    <tr key={batchKey} className="hover:bg-[#FAF8F4] transition">
                       <td className="px-4 py-3.5 text-[#6F6962]">
-                        {new Date(b.created_at).toLocaleDateString('en-IN')}
+                        {b.created_at ? new Date(b.created_at).toLocaleDateString('en-IN') : '-'}
                       </td>
                       <td className="px-4 py-3.5 font-semibold text-[#1C1917]">
                         {b.product_name}
                       </td>
                       <td className="px-4 py-3.5 font-mono text-[#A67C52] font-semibold">
-                        {b.invoice_number || '-'}
+                        {b.invoice_number || b.batch_number || '-'}
                       </td>
-                      <td className="px-4 py-3.5 text-center">{b.original_quantity}</td>
+                      <td className="px-4 py-3.5 text-center">{origQty}</td>
                       <td className="px-4 py-3.5 text-center font-bold text-[#A67C52]">
-                        {b.remaining_quantity}
+                        {remQty}
                       </td>
                       <td className="px-4 py-3.5 text-right text-[#1C1917]">
-                        ₹{b.unit_cost}
+                        ₹{unitCost}
                       </td>
                       <td className="px-4 py-3.5 text-right font-bold text-[#1C1917]">
-                        ₹{(b.remaining_quantity * b.unit_cost).toLocaleString('en-IN')}
+                        ₹{(remQty * unitCost).toLocaleString('en-IN')}
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>

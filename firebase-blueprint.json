@@ -28,6 +28,27 @@
         "status": { "type": "string" }
       },
       "required": ["id", "type", "timestamp", "status"]
+    },
+    "manualBill": {
+      "title": "Manual Handwritten Bill",
+      "description": "Customer handwritten bill record entered without POS inventory deduction",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "billNumber": { "type": "string" },
+        "billDate": { "type": "string" },
+        "totalAmount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["CASH", "UPI", "SPLIT", "CREDIT"] },
+        "cashAmount": { "type": "number" },
+        "upiAmount": { "type": "number" },
+        "dueAmount": { "type": "number" },
+        "itemCount": { "type": "number" },
+        "items": { "type": "array" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["id", "billNumber", "billDate", "totalAmount", "paymentMethod", "items"]
     }
   },
   "firestore": {
@@ -38,6 +59,10 @@
     "/google_sync_logs/{logId}": {
       "schema": "googleSyncLog",
       "description": "Audit records of Google Sheets exports and Google Calendar event schedules"
+    },
+    "/manual_bills/{billId}": {
+      "schema": "manualBill",
+      "description": "Manual handwritten customer bills entered without inventory deduction"
     }
   }
 }

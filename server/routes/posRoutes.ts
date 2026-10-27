@@ -1,9 +1,27 @@
 import { Router, Response } from 'express';
-import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
+import { dbQueryAll, dbQueryOne, dbRun, dbTransaction, saveDb } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
+import { syncCustomerBalance } from './dueRoutes.ts';
 
 const router = Router();
+
+// In-memory idempotency cache for POS Checkout to prevent duplicate submissions on double-click / network retry
+interface RecentCheckout {
+  saleId: string;
+  response: any;
+  timestamp: number;
+}
+const recentCheckouts = new Map<string, RecentCheckout>();
+
+function pruneRecentCheckouts() {
+  const expiry = Date.now() - 60 * 1000;
+  for (const [key, val] of recentCheckouts.entries()) {
+    if (val.timestamp < expiry) {
+      recentCheckouts.delete(key);
+    }
+  }
+}
 
 // Fast product search for POS
 router.get('/search', authMiddleware, (req, res) => {
@@ -198,14 +216,28 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
     const {
       items,
       customer, // optional { id, name, phone, address }
+      customer_id,
+      customer_name,
+      customer_phone,
+      customer_address,
       special_discount: billSpecialDiscountInput = 0,
       discount_amount = 0,
       discount_type = 'AMOUNT', // 'AMOUNT' or 'PERCENT'
       payment_method, // 'CASH' | 'UPI' | 'SPLIT' | 'CREDIT'
       cash_paid = 0,
       upi_paid = 0,
-      notes
+      notes,
+      idempotency_key,
     } = req.body;
+
+    // 0. Idempotency check to prevent duplicate bills & duplicate stock deductions on network retries
+    pruneRecentCheckouts();
+    const clientKey = (req.headers['x-idempotency-key'] as string) || (typeof idempotency_key === 'string' ? idempotency_key.trim() : null);
+    if (clientKey && recentCheckouts.has(clientKey)) {
+      const cached = recentCheckouts.get(clientKey)!;
+      res.json(cached.response);
+      return;
+    }
 
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400).json({ error: 'Cannot checkout an empty bill. Please add items.' });
@@ -299,7 +331,11 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
     }
 
     // Bill-level manual special discount or legacy discount amount
-    const billSpecialDiscount = Math.max(0, Number(billSpecialDiscountInput) || 0);
+    const rawBillSpecialDiscount = Math.max(0, Number(billSpecialDiscountInput) || 0);
+    // If the client sent the combined special discount (>= item special discount sum), extract only the bill-level portion to avoid double counting
+    const billSpecialDiscount = rawBillSpecialDiscount >= totalItemSpecialDiscount 
+      ? rawBillSpecialDiscount - totalItemSpecialDiscount 
+      : rawBillSpecialDiscount;
     const totalSpecialDiscount = totalItemSpecialDiscount + billSpecialDiscount;
 
     let totalDiscount = totalFestivalDiscount + totalSpecialDiscount;
@@ -323,6 +359,14 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
     const calculatedTotal = Math.max(0, Math.round(calculatedSellingSubtotal - totalDiscount));
     const totalSavings = Math.max(0, totalMrp - calculatedTotal);
 
+    // Resolve customer flexibly from either object or flat properties
+    const effectiveCustomer = customer || (customer_name ? {
+      id: customer_id || null,
+      name: customer_name,
+      phone: customer_phone || null,
+      address: customer_address || null,
+    } : null);
+
     // Validate payment breakdown
     const cashNum = Math.max(0, Number(cash_paid) || 0);
     const upiNum = Math.max(0, Number(upi_paid) || 0);
@@ -336,13 +380,18 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
       totalPaid = calculatedTotal;
       balanceDue = 0;
     } else if (payment_method === 'SPLIT') {
-      totalPaid = cashNum + upiNum;
+      totalPaid = Math.min(calculatedTotal, cashNum + upiNum);
       balanceDue = Math.max(0, calculatedTotal - totalPaid);
+      if (balanceDue > 0 && (!effectiveCustomer || !effectiveCustomer.name || !effectiveCustomer.name.trim() || effectiveCustomer.name.trim() === 'Walk-in Customer')) {
+        res.status(400).json({
+          error: 'Customer name or profile is required for Split payment with remaining outstanding balance due.'
+        });
+        return;
+      }
     } else if (payment_method === 'CREDIT') {
-      // Physical store gives to known customer with payment later
-      totalPaid = cashNum + upiNum; // partial advance paid, if any
+      totalPaid = Math.min(calculatedTotal, cashNum + upiNum); // partial advance paid in cash/upi, if any
       balanceDue = Math.max(0, calculatedTotal - totalPaid);
-      if (!customer || !customer.name || !customer.name.trim()) {
+      if (!effectiveCustomer || !effectiveCustomer.name || !effectiveCustomer.name.trim() || effectiveCustomer.name.trim() === 'Walk-in Customer') {
         res.status(400).json({
           error: 'Customer name or profile is required to issue goods on credit/due.'
         });
@@ -360,34 +409,61 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
     const now = new Date().toISOString();
 
     let customerId: string | null = null;
+    let customerNameStr: string = 'Walk-in Customer';
+    let customerPhoneStr: string | null = null;
 
     dbTransaction(() => {
-      // Handle customer record if provided
-      if (customer && customer.name && customer.name.trim()) {
-        if (customer.id) {
-          customerId = customer.id;
+      // Handle customer record if named customer is provided
+      if (effectiveCustomer && effectiveCustomer.name && effectiveCustomer.name.trim() && effectiveCustomer.name.trim() !== 'Walk-in Customer') {
+        const cleanName = effectiveCustomer.name.trim();
+        const cleanPhone = effectiveCustomer.phone?.trim() || null;
+        customerNameStr = cleanName;
+        customerPhoneStr = cleanPhone;
+
+        if (effectiveCustomer.id) {
+          customerId = effectiveCustomer.id;
           dbRun('UPDATE customers SET total_purchases = total_purchases + ?, total_dues = total_dues + ? WHERE id = ?', [
             calculatedTotal,
             balanceDue,
             customerId
           ]);
         } else {
-          customerId = 'cust_' + Date.now();
-          dbRun(
-            'INSERT INTO customers (id, name, phone, address, notes, total_purchases, total_dues, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [
-              customerId,
-              customer.name.trim(),
-              customer.phone?.trim() || null,
-              customer.address?.trim() || null,
-              customer.notes?.trim() || null,
+          // Look up existing customer by phone or by name to prevent duplicate customer rows
+          const existingCust = cleanPhone
+            ? dbQueryOne<any>('SELECT id FROM customers WHERE phone = ?', [cleanPhone])
+            : dbQueryOne<any>('SELECT id FROM customers WHERE LOWER(name) = LOWER(?)', [cleanName]);
+
+          if (existingCust) {
+            customerId = existingCust.id;
+            dbRun('UPDATE customers SET total_purchases = total_purchases + ?, total_dues = total_dues + ? WHERE id = ?', [
               calculatedTotal,
               balanceDue,
-              now
-            ]
-          );
+              customerId
+            ]);
+          } else {
+            customerId = 'cust_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+            dbRun(
+              'INSERT INTO customers (id, name, phone, address, notes, total_purchases, total_dues, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [
+                customerId,
+                cleanName,
+                cleanPhone,
+                effectiveCustomer.address?.trim() || null,
+                effectiveCustomer.notes?.trim() || null,
+                calculatedTotal,
+                balanceDue,
+                now
+              ]
+            );
+          }
         }
+      } else if (effectiveCustomer && effectiveCustomer.name) {
+        customerNameStr = effectiveCustomer.name.trim();
+        customerPhoneStr = effectiveCustomer.phone?.trim() || null;
       }
+
+      const actualCashCollected = payment_method === 'CASH' ? calculatedTotal : (payment_method === 'SPLIT' || payment_method === 'CREDIT') ? Math.min(calculatedTotal, cashNum) : 0;
+      const actualUpiCollected = payment_method === 'UPI' ? calculatedTotal : (payment_method === 'SPLIT' || payment_method === 'CREDIT') ? Math.min(Math.max(0, calculatedTotal - actualCashCollected), upiNum) : 0;
 
       // 1. Insert sale record
       dbRun(`
@@ -401,8 +477,8 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
         saleId,
         billNumber,
         customerId,
-        customer?.name?.trim() || null,
-        customer?.phone?.trim() || null,
+        customerNameStr,
+        customerPhoneStr,
         totalMrp,
         calculatedSellingSubtotal,
         totalFestivalDiscount,
@@ -414,8 +490,8 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
         balanceDue,
         paymentStatus,
         payment_method,
-        payment_method === 'CASH' ? calculatedTotal : payment_method === 'SPLIT' ? cashNum : 0,
-        payment_method === 'UPI' ? calculatedTotal : payment_method === 'SPLIT' ? upiNum : 0,
+        actualCashCollected,
+        actualUpiCollected,
         notes?.trim() || null,
         req.user?.id || 'CASHIER',
         now
@@ -495,7 +571,7 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
 
       // 3. If credit balance due > 0, record in customer_dues
       if (balanceDue > 0 && customerId) {
-        const dueId = 'due_' + Date.now();
+        const dueId = 'due_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
         dbRun(`
           INSERT INTO customer_dues (
             id, customer_id, sale_id, original_due, amount_paid, balance_due, status, notes, created_at, updated_at
@@ -506,16 +582,16 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
           saleId,
           balanceDue,
           balanceDue,
-          `Credit from bill #${billNumber}`,
+          `Credit from bill #${billNumber}${totalPaid > 0 ? ` (Advance paid: ₹${totalPaid})` : ''}`,
           now,
           now
         ]);
       }
+      if (customerId) {
+        syncCustomerBalance(customerId);
+      }
 
       // 4. Financial Transactions for collected cash / upi (Unpaid credit is strictly NOT recorded as collected cash)
-      const actualCashCollected = payment_method === 'CASH' ? calculatedTotal : payment_method === 'SPLIT' ? cashNum : 0;
-      const actualUpiCollected = payment_method === 'UPI' ? calculatedTotal : payment_method === 'SPLIT' ? upiNum : 0;
-
       if (actualCashCollected > 0) {
         const txId = 'ftx_cash_' + Date.now();
         dbRun(`
@@ -580,14 +656,16 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
       });
     }
 
-    // Return complete receipt data ready for thermal printer rendering
-    res.json({
+    saveDb(true);
+
+    const checkoutResponse = {
       success: true,
       sale: {
         id: saleId,
         bill_number: billNumber,
-        customer_name: customer?.name || 'Walk-in Customer',
-        customer_phone: customer?.phone || null,
+        customer_id: customerId,
+        customer_name: customerNameStr,
+        customer_phone: customerPhoneStr,
         total_mrp: totalMrp,
         subtotal: calculatedSellingSubtotal,
         festival_discount: totalFestivalDiscount,
@@ -603,9 +681,423 @@ router.post('/checkout', authMiddleware, (req: AuthenticatedRequest, res: Respon
         cashier_name: req.user?.full_name || 'Cashier',
         created_at: now
       }
+    };
+
+    if (clientKey) {
+      recentCheckouts.set(clientKey, {
+        saleId,
+        response: checkoutResponse,
+        timestamp: Date.now()
+      });
+    }
+
+    res.json(checkoutResponse);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Check for existing bill number on given date to prevent duplicates
+router.get('/check-bill-number', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const billNumber = ((req.query.billNumber as string) || '').trim();
+    const date = ((req.query.date as string) || '').trim();
+    if (!billNumber) {
+      res.json({ exists: false });
+      return;
+    }
+    let query = 'SELECT id, bill_number, created_at, total_amount, channel FROM sales WHERE bill_number = ?';
+    const params: any[] = [billNumber];
+    if (date) {
+      query += ' AND DATE(created_at) = ?';
+      params.push(date);
+    }
+    const match = dbQueryOne<any>(query, params);
+    res.json({
+      exists: !!match,
+      bill: match || null,
+      message: match
+        ? `Warning: Bill #${billNumber} already exists in records for ${date || 'in system'}.`
+        : 'Bill number is available.'
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Manual Bill Entry for handwritten customer bills (without POS stock deduction)
+router.post('/manual-bill', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const {
+      bill_number,
+      bill_date,
+      items,
+      payment_method, // 'CASH' | 'UPI' | 'SPLIT' | 'CREDIT'
+      cash_amount = 0,
+      upi_amount = 0,
+      customer_name,
+      customer_phone,
+      notes
+    } = req.body;
+
+    // 1. Validate Bill Number
+    if (!bill_number || typeof bill_number !== 'string' || !bill_number.trim()) {
+      res.status(400).json({ error: 'Handwritten bill number is required.' });
+      return;
+    }
+    const cleanBillNumber = bill_number.trim();
+
+    // 2. Validate Bill Date
+    const todayStr = new Date().toISOString().split('T')[0];
+    const targetDate =
+      bill_date && typeof bill_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(bill_date.trim())
+        ? bill_date.trim()
+        : todayStr;
+
+    // Check duplicate bill number for the same date
+    const existingBill = dbQueryOne<any>(
+      'SELECT id, bill_number FROM sales WHERE bill_number = ? AND DATE(created_at) = ?',
+      [cleanBillNumber, targetDate]
+    );
+    if (existingBill) {
+      res.status(409).json({
+        error: `Duplicate bill number: Bill #${cleanBillNumber} has already been recorded for ${targetDate}. Please verify the handwritten bill number.`
+      });
+      return;
+    }
+
+    // 3. Validate Items
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ error: 'Please add at least one item row to the handwritten bill.' });
+      return;
+    }
+
+    const validatedItems: Array<{
+      item_name: string;
+      quantity: number;
+      rate: number;
+      item_total: number;
+    }> = [];
+
+    let calculatedTotal = 0;
+
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const name = (it.item_name || it.name || '').trim();
+      if (!name) {
+        res.status(400).json({ error: `Item #${i + 1} must have an item name.` });
+        return;
+      }
+      const qty = parseInt(it.quantity, 10);
+      if (isNaN(qty) || qty < 1) {
+        res.status(400).json({ error: `Item "${name}" has invalid quantity. Must be at least 1.` });
+        return;
+      }
+      const rate = Number(it.rate !== undefined ? it.rate : it.unit_price);
+      if (isNaN(rate) || rate < 0) {
+        res.status(400).json({ error: `Item "${name}" has invalid rate. Rate cannot be negative.` });
+        return;
+      }
+      const itemTotal = Math.round(qty * rate);
+      calculatedTotal += itemTotal;
+      validatedItems.push({
+        item_name: name,
+        quantity: qty,
+        rate,
+        item_total: itemTotal,
+      });
+    }
+
+    if (calculatedTotal <= 0) {
+      res.status(400).json({ error: 'Total bill amount must be greater than ₹0.' });
+      return;
+    }
+
+    // 4. Validate Payment Method
+    const validMethods = ['CASH', 'UPI', 'CARD', 'SPLIT', 'CREDIT'];
+    if (!validMethods.includes(payment_method)) {
+      res.status(400).json({ error: `Invalid payment method. Must be one of: ${validMethods.join(', ')}` });
+      return;
+    }
+
+    let cashPaid = 0;
+    let upiPaid = 0;
+    let cardPaid = 0;
+    let balanceDue = 0;
+
+    if (payment_method === 'CASH') {
+      cashPaid = calculatedTotal;
+      upiPaid = 0;
+      cardPaid = 0;
+      balanceDue = 0;
+    } else if (payment_method === 'UPI') {
+      cashPaid = 0;
+      upiPaid = calculatedTotal;
+      cardPaid = 0;
+      balanceDue = 0;
+    } else if (payment_method === 'CARD') {
+      cashPaid = 0;
+      upiPaid = 0;
+      cardPaid = calculatedTotal;
+      balanceDue = 0;
+    } else if (payment_method === 'SPLIT') {
+      const cashNum = Math.max(0, Number(cash_amount) || 0);
+      const upiNum = Math.max(0, Number(upi_amount) || 0);
+      const splitSum = cashNum + upiNum;
+      if (Math.abs(splitSum - calculatedTotal) > 0.01) {
+        res.status(400).json({
+          error: `Split amounts (Cash ₹${cashNum} + UPI ₹${upiNum} = ₹${splitSum}) must equal the total bill amount ₹${calculatedTotal}.`
+        });
+        return;
+      }
+      cashPaid = cashNum;
+      upiPaid = upiNum;
+      cardPaid = 0;
+      balanceDue = 0;
+    } else if (payment_method === 'CREDIT') {
+      cashPaid = 0;
+      upiPaid = 0;
+      cardPaid = 0;
+      balanceDue = calculatedTotal;
+      if (!customer_name || !customer_name.trim()) {
+        res.status(400).json({
+          error: 'Customer Name is required when recording a handwritten bill on Credit/Due.'
+        });
+        return;
+      }
+    }
+
+    const paymentStatus = balanceDue === 0 ? 'PAID' : 'UNPAID';
+    const saleId = 'sale_manual_' + Date.now();
+    const timePortion = new Date().toTimeString().split(' ')[0] || '12:00:00';
+    const createdAt = `${targetDate}T${timePortion}.000Z`;
+
+    // Ensure fallback system product exists so foreign key references in sale_items succeed
+    dbRun(`
+      INSERT OR IGNORE INTO products (
+        id, name, code, sku, barcode, category_id, mrp, selling_price, is_active, created_at, updated_at
+      ) VALUES (
+        'prod_manual_billing', 'Handwritten Bill Item', 'MANUAL-HW', 'SKU-MANUAL-HW', '000000000000', NULL, 0, 0, 0, ?, ?
+      )
+    `, [createdAt, createdAt]);
+
+    let customerId: string | null = null;
+
+    dbTransaction(() => {
+      // If customer info is provided or credit
+      if (customer_name && customer_name.trim()) {
+        const cleanName = customer_name.trim();
+        const cleanPhone = (customer_phone || '').trim();
+        const existingCust = cleanPhone
+          ? dbQueryOne<any>('SELECT id FROM customers WHERE phone = ?', [cleanPhone])
+          : dbQueryOne<any>('SELECT id FROM customers WHERE name = ?', [cleanName]);
+
+        if (existingCust) {
+          customerId = existingCust.id;
+          dbRun(
+            'UPDATE customers SET total_purchases = total_purchases + ?, total_dues = total_dues + ? WHERE id = ?',
+            [calculatedTotal, balanceDue, customerId]
+          );
+        } else {
+          customerId = 'cust_' + Date.now();
+          dbRun(
+            'INSERT INTO customers (id, name, phone, address, notes, total_purchases, total_dues, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [customerId, cleanName, cleanPhone || null, null, 'Added via manual bill entry', calculatedTotal, balanceDue, createdAt]
+          );
+        }
+      }
+
+      // Record in sales table with channel = 'MANUAL'
+      dbRun(`
+        INSERT INTO sales (
+          id, bill_number, customer_id, customer_name, customer_phone,
+          total_mrp, subtotal, festival_discount, special_discount, discount_amount,
+          discount_type, total_amount, amount_paid, balance_due, payment_status,
+          payment_method, cash_paid, upi_paid, card_paid, channel, notes, cashier_id,
+          day_closed, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        saleId,
+        cleanBillNumber,
+        customerId,
+        customer_name ? customer_name.trim() : null,
+        customer_phone ? customer_phone.trim() : null,
+        calculatedTotal,
+        calculatedTotal,
+        0,
+        0,
+        0,
+        'AMOUNT',
+        calculatedTotal,
+        calculatedTotal - balanceDue,
+        balanceDue,
+        paymentStatus,
+        payment_method,
+        cashPaid,
+        upiPaid,
+        cardPaid,
+        'MANUAL',
+        notes ? `Handwritten Bill: ${notes.trim()}` : 'Handwritten Bill Entry',
+        req.user?.id || 'usr_cashier',
+        0,
+        'COMPLETED',
+        createdAt
+      ]);
+
+      // Record items in sale_items (CRITICAL: NO stock_ledger insertion = zero inventory deduction!)
+      validatedItems.forEach((it, idx) => {
+        const itemId = `si_manual_${Date.now()}_${idx}`;
+        dbRun(`
+          INSERT INTO sale_items (
+            id, sale_id, product_id, product_name, quantity, mrp,
+            unit_price, festival_discount, special_discount, discount,
+            total_price, cogs, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          itemId,
+          saleId,
+          'prod_manual_billing',
+          it.item_name,
+          it.quantity,
+          it.rate,
+          it.rate,
+          0,
+          0,
+          0,
+          it.item_total,
+          0,
+          createdAt
+        ]);
+      });
+
+      // Record customer due if credit
+      if (balanceDue > 0 && customerId) {
+        const dueId = 'due_' + Date.now();
+        dbRun(`
+          INSERT INTO customer_dues (
+            id, customer_id, sale_id, original_due, amount_paid, balance_due, due_date, status, notes, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          dueId,
+          customerId,
+          saleId,
+          balanceDue,
+          0,
+          balanceDue,
+          new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+          'PENDING',
+          `Outstanding balance on handwritten bill #${cleanBillNumber}`,
+          createdAt,
+          createdAt
+        ]);
+      }
+
+      // Record financial transactions for collected cash / upi
+      if (cashPaid > 0) {
+        const txId = 'ftx_manual_cash_' + Date.now();
+        dbRun(`
+          INSERT INTO financial_transactions (
+            id, date, amount, source_account, destination_account, transaction_type,
+            person_entity, category, purpose, payment_method, reference_no,
+            is_system_generated, user_id, created_at, updated_at
+          ) VALUES (?, ?, ?, 'EXTERNAL', 'CASH', 'INCOME', ?, 'SALES', ?, 'CASH', ?, 1, ?, ?, ?)
+        `, [
+          txId,
+          targetDate,
+          cashPaid,
+          customer_name ? customer_name.trim() : 'Walk-in Customer',
+          `Manual Bill #${cleanBillNumber}`,
+          cleanBillNumber,
+          req.user?.id || 'CASHIER',
+          createdAt,
+          createdAt
+        ]);
+      }
+
+      if (upiPaid > 0) {
+        const txId = 'ftx_manual_upi_' + Date.now();
+        dbRun(`
+          INSERT INTO financial_transactions (
+            id, date, amount, source_account, destination_account, transaction_type,
+            person_entity, category, purpose, payment_method, reference_no,
+            is_system_generated, user_id, created_at, updated_at
+          ) VALUES (?, ?, ?, 'EXTERNAL', 'UPI', 'INCOME', ?, 'SALES', ?, 'UPI', ?, 1, ?, ?, ?)
+        `, [
+          txId,
+          targetDate,
+          upiPaid,
+          customer_name ? customer_name.trim() : 'Walk-in Customer',
+          `Manual Bill #${cleanBillNumber}`,
+          cleanBillNumber,
+          req.user?.id || 'CASHIER',
+          createdAt,
+          createdAt
+        ]);
+      }
+
+      if (cardPaid > 0) {
+        const txId = 'ftx_manual_card_' + Date.now();
+        dbRun(`
+          INSERT INTO financial_transactions (
+            id, date, amount, source_account, destination_account, transaction_type,
+            person_entity, category, purpose, payment_method, reference_no,
+            is_system_generated, user_id, created_at, updated_at
+          ) VALUES (?, ?, ?, 'EXTERNAL', 'BANK', 'INCOME', ?, 'SALES', ?, 'CARD', ?, 1, ?, ?, ?)
+        `, [
+          txId,
+          targetDate,
+          cardPaid,
+          customer_name ? customer_name.trim() : 'Walk-in Customer',
+          `Manual Bill #${cleanBillNumber}`,
+          cleanBillNumber,
+          req.user?.id || 'CASHIER',
+          createdAt,
+          createdAt
+        ]);
+      }
+
+      // Record audit log
+      logAudit(
+        req.user?.id || 'usr_unknown',
+        'CREATE_MANUAL_BILL',
+        'sales',
+        saleId,
+        {
+          message: `Created handwritten manual bill #${cleanBillNumber} for ₹${calculatedTotal} (${payment_method}) dated ${targetDate}`,
+          bill_number: cleanBillNumber,
+          bill_date: targetDate,
+          total_amount: calculatedTotal,
+          items_count: validatedItems.length,
+          payment_method,
+          channel: 'MANUAL',
+          inventory_deducted: false
+        }
+      );
+    });
+
+    saveDb();
+
+    res.json({
+      success: true,
+      message: `Manual bill #${cleanBillNumber} saved successfully for ${targetDate}.`,
+      sale: {
+        id: saleId,
+        bill_number: cleanBillNumber,
+        bill_date: targetDate,
+        total_amount: calculatedTotal,
+        payment_method,
+        cash_paid: cashPaid,
+        upi_paid: upiPaid,
+        card_paid: cardPaid,
+        balance_due: balanceDue,
+        items: validatedItems,
+        channel: 'MANUAL',
+        created_at: createdAt
+      }
+    });
+  } catch (err: any) {
+    console.error('Error saving manual bill:', err);
+    res.status(500).json({ error: err.message || 'Failed to save manual bill' });
   }
 });
 
@@ -636,7 +1128,7 @@ router.get('/recent', authMiddleware, (req, res) => {
 // Bill History / Sales History listing with filters
 router.get('/bills', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { search, date, start_date, end_date, status, limit = 50, offset = 0 } = req.query;
+    const { search, date, start_date, end_date, status, channel, limit = 50, offset = 0 } = req.query;
 
     let sql = `
       SELECT 
@@ -648,8 +1140,9 @@ router.get('/bills', authMiddleware, (req: AuthenticatedRequest, res: Response) 
         COALESCE(s.status, 'COMPLETED') as status,
         s.cancelled_at, s.cancelled_by, s.cancelled_by_name, s.cancelled_reason,
         u.full_name as cashier_name,
-        COUNT(DISTINCT si.product_id) as product_count,
+        COUNT(DISTINCT si.id) as product_count,
         COALESCE(SUM(si.quantity), 0) as total_items,
+        GROUP_CONCAT(si.product_name || ' (' || si.quantity || ')', ', ') as items_summary,
         COALESCE(r.total_refunded, 0) as total_refunded_amount,
         COALESCE(r.return_count, 0) as return_count
       FROM sales s
@@ -682,6 +1175,11 @@ router.get('/bills', authMiddleware, (req: AuthenticatedRequest, res: Response) 
         sql += ` AND DATE(s.created_at) <= ?`;
         params.push(end_date.trim());
       }
+    }
+
+    if (channel && typeof channel === 'string' && channel.trim() !== 'ALL') {
+      sql += ` AND s.channel = ?`;
+      params.push(channel.trim());
     }
 
     if (status && status !== 'ALL') {
@@ -823,59 +1321,61 @@ router.post('/bills/:id/cancel', authMiddleware, requireRole(['OWNER']), (req: A
         WHERE id = ?
       `, [now, req.user?.id || 'OWNER', cancelledByName, fullReason, sale.id]);
 
-      // 2. Restore inventory & FIFO batches for every item
-      const saleItems = dbQueryAll<any>('SELECT * FROM sale_items WHERE sale_id = ?', [sale.id]);
-      for (const item of saleItems) {
-        let qtyToRestore = item.quantity;
+      // 2. Restore inventory & FIFO batches for every item (Only for POS sales; manual bills never deducted stock)
+      if (sale.channel !== 'MANUAL') {
+        const saleItems = dbQueryAll<any>('SELECT * FROM sale_items WHERE sale_id = ?', [sale.id]);
+        for (const item of saleItems) {
+          let qtyToRestore = item.quantity;
 
-        // Restore to FIFO purchase_batches where remaining_qty < initial_qty
-        const batches = dbQueryAll<any>(`
-          SELECT * FROM purchase_batches 
-          WHERE product_id = ? AND remaining_qty < initial_qty 
-          ORDER BY received_date DESC, created_at DESC
-        `, [item.product_id]);
+          // Restore to FIFO purchase_batches where remaining_qty < initial_qty
+          const batches = dbQueryAll<any>(`
+            SELECT * FROM purchase_batches 
+            WHERE product_id = ? AND remaining_qty < initial_qty 
+            ORDER BY received_date DESC, created_at DESC
+          `, [item.product_id]);
 
-        for (const batch of batches) {
-          if (qtyToRestore <= 0) break;
-          const space = batch.initial_qty - batch.remaining_qty;
-          const restore = Math.min(space, qtyToRestore);
-          dbRun('UPDATE purchase_batches SET remaining_qty = remaining_qty + ?, is_active = 1 WHERE id = ?', [
-            restore,
-            batch.id
-          ]);
-          qtyToRestore -= restore;
-        }
-
-        // If any excess remaining or no batch with space, restore to latest batch if available
-        if (qtyToRestore > 0) {
-          const latestBatch = dbQueryOne<any>(
-            'SELECT id FROM purchase_batches WHERE product_id = ? ORDER BY received_date DESC, created_at DESC LIMIT 1',
-            [item.product_id]
-          );
-          if (latestBatch) {
+          for (const batch of batches) {
+            if (qtyToRestore <= 0) break;
+            const space = batch.initial_qty - batch.remaining_qty;
+            const restore = Math.min(space, qtyToRestore);
             dbRun('UPDATE purchase_batches SET remaining_qty = remaining_qty + ?, is_active = 1 WHERE id = ?', [
-              qtyToRestore,
-              latestBatch.id
+              restore,
+              batch.id
             ]);
+            qtyToRestore -= restore;
           }
-        }
 
-        // Record stock ledger reversal movement (movement_type: CUSTOMER_RETURN)
-        dbRun(`
-          INSERT INTO stock_ledger (
-            id, product_id, variant_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
-          ) VALUES (?, ?, ?, 'CUSTOMER_RETURN', ?, ?, 'RETURN', ?, ?, ?, ?)
-        `, [
-          'stk_rev_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
-          item.product_id,
-          item.variant_id,
-          item.quantity, // positive quantity restores stock
-          item.cogs > 0 ? (item.cogs / item.quantity) : 0,
-          sale.id,
-          `Void Reversal Bill #${sale.bill_number}: ${fullReason}`,
-          req.user?.id || 'OWNER',
-          now
-        ]);
+          // If any excess remaining or no batch with space, restore to latest batch if available
+          if (qtyToRestore > 0) {
+            const latestBatch = dbQueryOne<any>(
+              'SELECT id FROM purchase_batches WHERE product_id = ? ORDER BY received_date DESC, created_at DESC LIMIT 1',
+              [item.product_id]
+            );
+            if (latestBatch) {
+              dbRun('UPDATE purchase_batches SET remaining_qty = remaining_qty + ?, is_active = 1 WHERE id = ?', [
+                qtyToRestore,
+                latestBatch.id
+              ]);
+            }
+          }
+
+          // Record stock ledger reversal movement (movement_type: CUSTOMER_RETURN)
+          dbRun(`
+            INSERT INTO stock_ledger (
+              id, product_id, variant_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
+            ) VALUES (?, ?, ?, 'CUSTOMER_RETURN', ?, ?, 'RETURN', ?, ?, ?, ?)
+          `, [
+            'stk_rev_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+            item.product_id,
+            item.variant_id,
+            item.quantity, // positive quantity restores stock
+            item.cogs > 0 ? (item.cogs / item.quantity) : 0,
+            sale.id,
+            `Void Reversal Bill #${sale.bill_number}: ${fullReason}`,
+            req.user?.id || 'OWNER',
+            now
+          ]);
+        }
       }
 
       // 3. Reverse Financial movements (Cash, UPI, Split)
@@ -989,10 +1489,7 @@ router.post('/bills/:id/cancel', authMiddleware, requireRole(['OWNER']), (req: A
           `, [now, ` [CANCELLED with Bill #${sale.bill_number}]`, due.id]);
 
           if (sale.customer_id) {
-            dbRun('UPDATE customers SET total_dues = MAX(0, total_dues - ?) WHERE id = ?', [
-              due.balance_due,
-              sale.customer_id
-            ]);
+            syncCustomerBalance(sale.customer_id);
           }
         }
       }
@@ -1005,6 +1502,8 @@ router.post('/bills/:id/cancel', authMiddleware, requireRole(['OWNER']), (req: A
         ]);
       }
     });
+
+    saveDb(true);
 
     logAudit(req.user?.id || 'OWNER', 'BILL_VOIDED', 'SALE', sale.id, {
       bill_number: sale.bill_number,
@@ -1265,10 +1764,7 @@ router.post('/bills/:id/return', authMiddleware, (req: AuthenticatedRequest, res
           `, [newBal, newStatus, now, ` [Adjusted -₹${totalRefundAmount} via Return #${returnNumber}]`, due.id]);
 
           if (sale.customer_id) {
-            dbRun('UPDATE customers SET total_dues = MAX(0, total_dues - ?) WHERE id = ?', [
-              totalRefundAmount,
-              sale.customer_id
-            ]);
+            syncCustomerBalance(sale.customer_id);
           }
         }
       }
@@ -1281,6 +1777,8 @@ router.post('/bills/:id/return', authMiddleware, (req: AuthenticatedRequest, res
         ]);
       }
     });
+
+    saveDb(true);
 
     logAudit(req.user?.id || 'STAFF', 'CUSTOMER_RETURN', 'SALE', sale.id, {
       bill_number: sale.bill_number,

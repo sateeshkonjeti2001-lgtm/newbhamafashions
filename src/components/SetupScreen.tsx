@@ -198,7 +198,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onSetupSuccess }) => {
                 autoFocus
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
-                placeholder="e.g. Sateesh Konjeti"
+                placeholder="Full name"
                 className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52] focus:ring-2 focus:ring-[#A67C52]/20"
               />
             </div>
@@ -213,7 +213,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onSetupSuccess }) => {
                   required
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. admin or your name"
+                  placeholder="Username"
                   className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52] focus:ring-2 focus:ring-[#A67C52]/20"
                 />
               </div>
@@ -251,7 +251,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onSetupSuccess }) => {
                   type="tel"
                   value={phone}
                   onChange={(e) => handlePhoneChange(e.target.value)}
-                  placeholder="e.g. 9876543210"
+                  placeholder="Owner mobile number"
                   className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52] focus:ring-2 focus:ring-[#A67C52]/20"
                 />
                 <span className="text-[10px] text-[#9A938B] block mt-1">For account recovery &amp; staff records</span>
@@ -264,7 +264,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onSetupSuccess }) => {
                   type="tel"
                   value={shopPhone}
                   onChange={(e) => setShopPhone(e.target.value)}
-                  placeholder="e.g. Counter Phone / Landline"
+                  placeholder="Counter phone number"
                   className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] text-xs focus:outline-none focus:border-[#A67C52] focus:ring-2 focus:ring-[#A67C52]/20"
                 />
                 <span className="text-[10px] text-[#9A938B] block mt-1">Printed on thermal receipts (can update in Settings)</span>

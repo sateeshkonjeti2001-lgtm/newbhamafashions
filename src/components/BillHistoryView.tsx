@@ -29,22 +29,46 @@ import {
 import { api } from '../services/api.ts';
 import { UserRole } from '../types.ts';
 import { ReceiptModal } from './ReceiptModal.tsx';
+import { ManualBillModal } from './ManualBillModal.tsx';
 
 interface BillHistoryViewProps {
   role: UserRole;
   onNavigateToPOS?: () => void;
+  initialDateFilter?: string;
+  initialChannelFilter?: 'ALL' | 'POS' | 'MANUAL';
 }
 
-export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNavigateToPOS }) => {
+export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
+  role,
+  onNavigateToPOS,
+  initialDateFilter = '',
+  initialChannelFilter = 'ALL',
+}) => {
   const isOwner = role === 'OWNER';
 
   // Filters & Search
   const [search, setSearch] = useState('');
-  const [dateFilter, setDateFilter] = useState('');
+  const [dateFilter, setDateFilter] = useState(initialDateFilter);
   const [statusFilter, setStatusFilter] = useState('');
+  const [channelFilter, setChannelFilter] = useState<'ALL' | 'POS' | 'MANUAL'>(initialChannelFilter);
   const [loading, setLoading] = useState(false);
   const [bills, setBills] = useState<any[]>([]);
   const [totalCount, setTotalCount] = useState(0);
+
+  useEffect(() => {
+    if (initialDateFilter !== undefined) {
+      setDateFilter(initialDateFilter);
+    }
+  }, [initialDateFilter]);
+
+  useEffect(() => {
+    if (initialChannelFilter !== undefined) {
+      setChannelFilter(initialChannelFilter);
+    }
+  }, [initialChannelFilter]);
+
+  // Manual Bill Entry Modal
+  const [showManualBillModal, setShowManualBillModal] = useState(false);
 
   // Selected Bill Details Modal
   const [selectedBillId, setSelectedBillId] = useState<string | null>(null);
@@ -337,17 +361,25 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-5 rounded-2xl border border-[#E3DED5] shadow-[0_2px_12px_rgba(23,21,19,0.03)]">
         <div>
           <div className="flex items-center gap-2">
-            <h1 className="text-xl font-bold text-[#1C1917] tracking-tight">Completed Bills &amp; Returns</h1>
+            <h1 className="text-xl font-bold text-[#1C1917] tracking-tight">Day Sales &amp; Bills History</h1>
             <span className="text-xs bg-[#FAF8F4] border border-[#E3DED5] px-2.5 py-0.5 rounded-full font-semibold text-[#6F6962]">
               {totalCount} Bills
             </span>
           </div>
           <p className="text-xs text-[#6F6962] mt-1">
-            Search past sales, reprint thermal receipts, process customer item returns, and cancel/void bills with complete audit trail.
+            Search past sales, record handwritten customer bills, reprint thermal receipts, and process returns.
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            onClick={() => setShowManualBillModal(true)}
+            className="px-4 py-2 text-xs font-semibold rounded-xl bg-[#A67C52] hover:bg-[#8C653E] text-white flex items-center gap-1.5 shadow-sm transition"
+            title="Record handwritten customer bills for day sales"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            <span>+ Manual Bill Entry</span>
+          </button>
           <button
             onClick={fetchBills}
             disabled={loading}
@@ -376,7 +408,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by Bill # (e.g. 0001), Customer name, phone..."
+            placeholder="Search by Bill #, Customer name, or phone..."
             className="w-full pl-9 pr-4 py-2 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl text-xs text-[#1C1917] focus:outline-none focus:border-[#A67C52] transition placeholder-[#9A938B]"
           />
         </form>
@@ -412,6 +444,20 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
             <option value="">All Statuses</option>
             <option value="COMPLETED">Active (Completed)</option>
             <option value="CANCELLED">Cancelled / Void</option>
+          </select>
+        </div>
+
+        {/* Type / Channel Filter */}
+        <div className="flex items-center gap-1.5 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl px-3 py-1.5 text-xs text-[#1C1917]">
+          <span className="text-[#6F6962] font-semibold text-[11px]">Type:</span>
+          <select
+            value={channelFilter}
+            onChange={(e) => setChannelFilter(e.target.value as any)}
+            className="bg-transparent text-xs focus:outline-none text-[#1C1917] font-medium"
+          >
+            <option value="ALL">All Bills</option>
+            <option value="POS">POS Billing Only</option>
+            <option value="MANUAL">Handwritten Bills Only</option>
           </select>
         </div>
 
@@ -457,23 +503,39 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
                   </td>
                 </tr>
               ) : (
-                bills.map((bill) => {
-                  const isCancelled = bill.status === 'CANCELLED';
-                  const hasReturns = bill.return_count > 0;
-                  const totalRefund = bill.total_refunded_amount || 0;
+                bills
+                  .filter((b) => {
+                    if (channelFilter === 'POS') return b.channel !== 'MANUAL';
+                    if (channelFilter === 'MANUAL') return b.channel === 'MANUAL';
+                    return true;
+                  })
+                  .map((bill) => {
+                    const isCancelled = bill.status === 'CANCELLED';
+                    const hasReturns = bill.return_count > 0;
+                    const totalRefund = bill.total_refunded_amount || 0;
 
-                  return (
-                    <tr
-                      key={bill.id}
-                      className={`hover:bg-[#FAF8F4]/80 transition ${
-                        isCancelled ? 'bg-[#FCF7F7]/60 text-[#8C6969]' : ''
-                      }`}
-                    >
-                      <td className="py-3 px-4 font-mono font-bold text-xs">
-                        <span className={isCancelled ? 'line-through text-[#A34F4F]' : 'text-[#1C1917]'}>
-                          {bill.bill_number}
-                        </span>
-                      </td>
+                    return (
+                      <tr
+                        key={bill.id}
+                        className={`hover:bg-[#FAF8F4]/80 transition ${
+                          isCancelled ? 'bg-[#FCF7F7]/60 text-[#8C6969]' : ''
+                        }`}
+                      >
+                        <td className="py-3 px-4 font-mono font-bold text-xs">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className={isCancelled ? 'line-through text-[#A34F4F]' : 'text-[#1C1917]'}>
+                              {bill.bill_number}
+                            </span>
+                            {bill.channel === 'MANUAL' && (
+                              <span
+                                className="text-[10px] font-sans font-semibold px-1.5 py-0.2 rounded bg-amber-50 text-amber-800 border border-amber-200"
+                                title="Handwritten Customer Bill (0 Inventory Deducted)"
+                              >
+                                Manual
+                              </span>
+                            )}
+                          </div>
+                        </td>
                       <td className="py-3 px-4 text-[#6F6962] whitespace-nowrap">
                         <div>
                           {new Date(bill.created_at).toLocaleDateString('en-IN', {
@@ -665,6 +727,24 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
                       <p className="text-[11px] text-[#6F6962] italic mt-1">
                         Stock has been restored to FIFO purchase batches, financial transactions reversed, and customer dues updated. Bill number is retained for auditing.
                       </p>
+                    </div>
+                  )}
+
+                  {/* MANUAL BILL NOTICE BANNER */}
+                  {billDetail.sale.channel === 'MANUAL' && (
+                    <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-amber-900 flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-2">
+                        <FileText className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-bold text-xs block">Handwritten Customer Bill Record</span>
+                          <span className="text-[11px] text-amber-800 leading-relaxed">
+                            This bill was recorded from a physical handwritten receipt. No inventory was deducted from store stock.
+                          </span>
+                        </div>
+                      </div>
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200 shrink-0">
+                        0 Stock Deducted
+                      </span>
                     </div>
                   )}
 
@@ -1033,7 +1113,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
                 <textarea
                   value={cancelNotes}
                   onChange={(e) => setCancelNotes(e.target.value)}
-                  placeholder="E.g. Approved by Owner in person, cash drawer refunded..."
+                  placeholder="Enter cancellation notes or authorization details..."
                   rows={2}
                   className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl text-xs text-[#1C1917] focus:outline-none focus:border-[#A67C52] resize-none"
                 />
@@ -1349,7 +1429,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
                   type="text"
                   value={returnNotes}
                   onChange={(e) => setReturnNotes(e.target.value)}
-                  placeholder="E.g. Customer returned 1 Kurti in good condition, unworn..."
+                  placeholder="Customer notes or return remarks..."
                   className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl text-xs text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
                 />
               </div>
@@ -1409,6 +1489,16 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({ role, onNaviga
           }}
         />
       )}
+
+      {/* Manual Bill Entry Modal */}
+      <ManualBillModal
+        isOpen={showManualBillModal}
+        onClose={() => setShowManualBillModal(false)}
+        onBillSaved={(saved) => {
+          showNotice('success', `Manual bill #${saved.bill_number} recorded successfully!`);
+          fetchBills();
+        }}
+      />
     </div>
   );
 };

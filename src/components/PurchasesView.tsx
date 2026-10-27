@@ -20,6 +20,7 @@ export const PurchasesView: React.FC = () => {
   const [purchases, setPurchases] = useState<Purchase[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   // New Purchase Modal
@@ -41,6 +42,20 @@ export const PurchasesView: React.FC = () => {
   const [itemQty, setItemQty] = useState<number>(1);
   const [itemCost, setItemCost] = useState<number>(0);
 
+  // Add New Product Directly from Invoice Modal
+  const [showNewProductModal, setShowNewProductModal] = useState(false);
+  const [newProdName, setNewProdName] = useState('');
+  const [newProdCategoryId, setNewProdCategoryId] = useState('');
+  const [newProdCode, setNewProdCode] = useState('');
+  const [newProdSku, setNewProdSku] = useState('');
+  const [newProdBarcode, setNewProdBarcode] = useState('');
+  const [newProdPurchaseCost, setNewProdPurchaseCost] = useState<number | ''>('');
+  const [newProdSellingPrice, setNewProdSellingPrice] = useState<number | ''>('');
+  const [newProdMrp, setNewProdMrp] = useState<number | ''>('');
+  const [newProdQty, setNewProdQty] = useState<number>(1);
+  const [newProdError, setNewProdError] = useState<string | null>(null);
+  const [newProdSaving, setNewProdSaving] = useState(false);
+
   // New Supplier Modal
   const [showSupplierModal, setShowSupplierModal] = useState(false);
   const [supName, setSupName] = useState('');
@@ -61,18 +76,116 @@ export const PurchasesView: React.FC = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [pRes, sRes, prodRes] = await Promise.all([
+      const [pRes, sRes, prodRes, catRes] = await Promise.all([
         api.getPurchases(),
         api.getSuppliers(),
         api.getProducts(),
+        api.getCategories().catch(() => ({ categories: [] })),
       ]);
       setPurchases(pRes.purchases || []);
       setSuppliers(sRes.suppliers || []);
       setProducts(prodRes.products || []);
+      setCategories(catRes.categories || []);
     } catch (err: any) {
       console.error('Error loading purchases:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleCreateProductFromInvoice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newProdName.trim()) {
+      setNewProdError('Product Name is required.');
+      return;
+    }
+
+    const costNum = Number(newProdPurchaseCost) || 0;
+    const sellNum = Number(newProdSellingPrice) || 0;
+    const mrpNum = Number(newProdMrp) || sellNum;
+    const qtyNum = Math.max(1, Number(newProdQty) || 1);
+
+    if (costNum < 0 || sellNum < 0 || mrpNum < 0) {
+      setNewProdError('Prices cannot be negative.');
+      return;
+    }
+
+    if (sellNum > mrpNum) {
+      setNewProdError(`Selling price (₹${sellNum}) cannot exceed MRP (₹${mrpNum}).`);
+      return;
+    }
+
+    // Uniqueness validation against loaded products
+    const trimmedSku = newProdSku.trim().toLowerCase();
+    const trimmedCode = newProdCode.trim().toLowerCase();
+    const trimmedBarcode = newProdBarcode.trim();
+
+    if (trimmedSku && products.some((p) => p.sku?.toLowerCase() === trimmedSku)) {
+      setNewProdError(`SKU '${newProdSku.trim()}' is already in use by an existing product.`);
+      return;
+    }
+    if (trimmedCode && products.some((p) => p.code?.toLowerCase() === trimmedCode)) {
+      setNewProdError(`Item code '${newProdCode.trim()}' is already in use by an existing product.`);
+      return;
+    }
+    if (trimmedBarcode && products.some((p) => p.barcode === trimmedBarcode)) {
+      setNewProdError(`Barcode '${trimmedBarcode}' is already assigned to an existing product.`);
+      return;
+    }
+
+    setNewProdSaving(true);
+    setNewProdError(null);
+
+    try {
+      const res = await api.createProduct({
+        name: newProdName.trim(),
+        category_id: newProdCategoryId || (categories[0]?.id || null),
+        code: trimmedCode || null,
+        sku: trimmedSku || null,
+        barcode: trimmedBarcode || null,
+        purchase_cost: costNum,
+        selling_price: sellNum,
+        mrp: mrpNum,
+        initial_stock: 0, // Stock strictly increases only when invoice is successfully saved!
+      });
+
+      // Reload products catalog so the new product is available in the store
+      const prodRes = await api.getProducts();
+      setProducts(prodRes.products || []);
+
+      // Automatically add new product directly into the current purchase invoice items
+      const newCreatedId = res.id;
+      const totalCost = qtyNum * costNum;
+      setPurchaseItems((prev) => [
+        ...prev,
+        {
+          product_id: newCreatedId,
+          product_name: newProdName.trim(),
+          quantity: qtyNum,
+          unit_cost: costNum,
+          total: totalCost,
+        },
+      ]);
+
+      // Set selector inputs
+      setSelectedProdId(newCreatedId);
+      setItemQty(qtyNum);
+      setItemCost(costNum);
+
+      // Close modal and reset form
+      setShowNewProductModal(false);
+      setNewProdName('');
+      setNewProdCode('');
+      setNewProdSku('');
+      setNewProdBarcode('');
+      setNewProdPurchaseCost('');
+      setNewProdSellingPrice('');
+      setNewProdMrp('');
+      setNewProdQty(1);
+    } catch (err: any) {
+      setNewProdError(err.message || 'Failed to create product');
+    } finally {
+      setNewProdSaving(false);
     }
   };
 
@@ -450,12 +563,31 @@ export const PurchasesView: React.FC = () => {
 
               {/* Items in Invoice */}
               <div className="p-3.5 bg-[#FAF8F4] rounded-xl border border-[#E3DED5] space-y-3">
-                <div className="font-bold text-[#1C1917]">Stock Items on Invoice</div>
+                <div className="flex items-center justify-between">
+                  <div className="font-bold text-[#1C1917]">Stock Items on Invoice</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewProdError(null);
+                      setShowNewProductModal(true);
+                    }}
+                    className="text-[11px] font-semibold text-[#A67C52] hover:text-[#8F6843] bg-white border border-[#D4CDC2] hover:border-[#A67C52] px-2.5 py-1 rounded-lg transition shadow-2xs flex items-center gap-1"
+                    title="Quickly add a newly purchased product directly to catalog and this invoice"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-[#A67C52]" />
+                    <span>+ Add New Product</span>
+                  </button>
+                </div>
 
                 <div className="flex flex-col sm:flex-row gap-2">
                   <select
                     value={selectedProdId}
                     onChange={(e) => {
+                      if (e.target.value === '__NEW__') {
+                        setNewProdError(null);
+                        setShowNewProductModal(true);
+                        return;
+                      }
                       setSelectedProdId(e.target.value);
                       const prod = products.find((p) => p.id === e.target.value);
                       if (prod && prod.purchase_cost) {
@@ -465,6 +597,9 @@ export const PurchasesView: React.FC = () => {
                     className="flex-1 px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
                   >
                     <option value="">Choose item to add...</option>
+                    <option value="__NEW__" className="font-semibold text-[#A67C52] bg-[#FAF8F4]">
+                      + Add New Product to Catalog...
+                    </option>
                     {products.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name} (Code: {p.code || p.barcode || 'N/A'})
@@ -731,6 +866,179 @@ export const PurchasesView: React.FC = () => {
                   className="px-4 py-2 bg-[#171513] hover:bg-[#25211D] text-[#F5F2EC] rounded-xl font-semibold shadow-sm transition"
                 >
                   Save Supplier
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Add New Product Directly from Purchase Invoice Modal */}
+      {showNewProductModal && (
+        <div className="fixed inset-0 z-50 bg-[#171513]/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white border border-[#E3DED5] rounded-2xl p-6 max-w-lg w-full space-y-4 my-8 shadow-[0_8px_30px_rgba(23,21,19,0.12)]">
+            <div className="flex items-center justify-between border-b border-[#E3DED5] pb-3">
+              <div>
+                <h3 className="font-bold text-base text-[#1C1917]">Add New Product to Catalog</h3>
+                <p className="text-xs text-[#6F6962]">
+                  Creates product in store catalog &amp; automatically adds it to this purchase invoice
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowNewProductModal(false)}
+                className="text-[#9A938B] hover:text-[#1C1917]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {newProdError && (
+              <div className="p-2.5 bg-[#FDF5F5] border border-[#F0CCCC] rounded-lg text-xs text-[#A34F4F] flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{newProdError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleCreateProductFromInvoice} className="space-y-3.5 text-xs">
+              <div>
+                <label className="block font-semibold text-[#1C1917] mb-1">
+                  Product / Garment Name *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newProdName}
+                  onChange={(e) => setNewProdName(e.target.value)}
+                  placeholder="Product / item name"
+                  className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">Category *</label>
+                  <select
+                    value={newProdCategoryId}
+                    onChange={(e) => setNewProdCategoryId(e.target.value)}
+                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
+                  >
+                    {categories.length > 0 ? (
+                      categories.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))
+                    ) : (
+                      <option value="">General Garments</option>
+                    )}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">Item Code / SKU</label>
+                  <input
+                    type="text"
+                    value={newProdSku}
+                    onChange={(e) => setNewProdSku(e.target.value)}
+                    placeholder="Item code / SKU"
+                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-mono focus:outline-none focus:border-[#A67C52]"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">Barcode (Optional)</label>
+                  <input
+                    type="text"
+                    value={newProdBarcode}
+                    onChange={(e) => setNewProdBarcode(e.target.value)}
+                    placeholder="Barcode number"
+                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-mono focus:outline-none focus:border-[#A67C52]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">
+                    Invoice Quantity *
+                  </label>
+                  <input
+                    type="number"
+                    required
+                    min="1"
+                    value={newProdQty}
+                    onChange={(e) => setNewProdQty(Math.max(1, Number(e.target.value)))}
+                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-bold text-center focus:outline-none focus:border-[#A67C52]"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-3 bg-[#FAF8F4] rounded-xl border border-[#E3DED5]">
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">
+                    Purchase Cost (₹) *
+                  </label>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    value={newProdPurchaseCost}
+                    onChange={(e) => setNewProdPurchaseCost(e.target.value === '' ? '' : Number(e.target.value))}
+                    placeholder="Cost price"
+                    className="w-full px-3 py-1.5 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] font-bold text-right focus:outline-none focus:border-[#A67C52]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">
+                    Selling Price (₹) *
+                  </label>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    value={newProdSellingPrice}
+                    onChange={(e) => setNewProdSellingPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                    placeholder="Selling price"
+                    className="w-full px-3 py-1.5 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] font-bold text-right focus:outline-none focus:border-[#A67C52]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-[#1C1917] mb-1">
+                    MRP (₹) *
+                  </label>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    value={newProdMrp}
+                    onChange={(e) => setNewProdMrp(e.target.value === '' ? '' : Number(e.target.value))}
+                    placeholder="MRP"
+                    className="w-full px-3 py-1.5 bg-white border border-[#D4CDC2] rounded-lg text-[#1C1917] font-bold text-right focus:outline-none focus:border-[#A67C52]"
+                  />
+                </div>
+              </div>
+
+              <div className="text-[11px] text-[#6F6962] bg-amber-50 border border-amber-200 p-2 rounded-lg">
+                <strong>Inventory Note:</strong> Product stock will not increase until this purchase invoice is submitted and saved.
+              </div>
+
+              <div className="flex justify-end gap-2.5 pt-3 border-t border-[#E3DED5]">
+                <button
+                  type="button"
+                  onClick={() => setShowNewProductModal(false)}
+                  className="px-4 py-2 border border-[#D4CDC2] text-[#6F6962] hover:text-[#1C1917] rounded-xl font-medium transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={newProdSaving}
+                  className="px-4 py-2 bg-[#171513] hover:bg-[#25211D] text-[#F5F2EC] rounded-xl font-semibold shadow-sm transition disabled:opacity-50"
+                >
+                  {newProdSaving ? 'Creating Product...' : 'Create & Add to Invoice'}
                 </button>
               </div>
             </form>

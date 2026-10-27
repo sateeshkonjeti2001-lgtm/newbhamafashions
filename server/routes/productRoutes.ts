@@ -96,7 +96,7 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       LEFT JOIN categories c ON p.category_id = c.id
       LEFT JOIN brands b ON p.brand_id = b.id
       LEFT JOIN stock_ledger sl ON p.id = sl.product_id
-      WHERE 1=1
+      WHERE p.id != 'prod_manual_billing'
     `;
     const params: any[] = [];
 
