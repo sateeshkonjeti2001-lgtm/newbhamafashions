@@ -54,7 +54,9 @@ export function saveDb(force: boolean = false): void {
   try {
     const data = dbInstance.export();
     const buffer = Buffer.from(data);
-    fs.writeFileSync(DB_FILE, buffer);
+    const tempFile = `${DB_FILE}.tmp.${Date.now()}`;
+    fs.writeFileSync(tempFile, buffer);
+    fs.renameSync(tempFile, DB_FILE);
   } catch (err) {
     console.error('Failed to save sqlite database to disk:', err);
   }

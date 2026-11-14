@@ -70,13 +70,22 @@ export function verifyToken(token: string): string | null {
 }
 
 export function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  // 1. Check HTTP-only cookie first (preferred secure session mechanism)
+  let token: string | undefined = (req as any).cookies?.nbf_session;
+
+  // 2. Fallback to Authorization: Bearer <token> for backward compatibility / API tools
+  if (!token) {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    }
+  }
+
+  if (!token) {
     res.status(401).json({ error: 'Authentication required' });
     return;
   }
 
-  const token = authHeader.substring(7);
   const userId = verifyToken(token);
   if (!userId) {
     res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });

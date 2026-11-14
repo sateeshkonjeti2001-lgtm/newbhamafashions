@@ -184,7 +184,11 @@ export interface FirestoreManualBill {
 
 export async function saveManualBillToFirestore(
   billData: Omit<FirestoreManualBill, 'createdAt'>
-): Promise<{ ok: boolean; id?: string; error?: string }> {
+): Promise<{ ok: boolean; id?: string; error?: string; skipped?: boolean }> {
+  // Only attempt Firestore cloud sync if the user has authenticated with Google/Firebase
+  if (!auth.currentUser) {
+    return { ok: true, skipped: true, error: 'Saved to local SQLite database' };
+  }
   try {
     const col = collection(db, 'manual_bills');
     // Strip undefined properties to ensure Firestore SDK compatibility
@@ -197,6 +201,7 @@ export async function saveManualBillToFirestore(
     const docRef = await addDoc(col, {
       ...cleanPayload,
       createdAt: new Date().toISOString(),
+      syncedBy: auth.currentUser.email || auth.currentUser.uid,
     });
     return { ok: true, id: docRef.id };
   } catch (err: any) {

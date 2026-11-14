@@ -1,9 +1,47 @@
 import { Router, Response } from 'express';
+import rateLimit from 'express-rate-limit';
 import { dbQueryOne, dbQueryAll, dbRun } from '../db.ts';
 import { hashPassword, checkPassword, generateToken, authMiddleware, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
 const router = Router();
+
+// Rate limiting: max 5 login attempts per 15-minute window per IP to prevent brute-force attacks
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts from this connection. Please try again after 15 minutes.' },
+  // Disable the xForwardedFor / forwarded header validation warnings when running in proxied cloud environments
+  validate: {
+    xForwardedForHeader: false,
+    forwardedHeader: false,
+    trustProxy: false,
+  },
+});
+
+// Helper to set secure HTTP-only session cookie
+function setSessionCookie(res: Response, token: string) {
+  const isProd = process.env.NODE_ENV === 'production';
+  res.cookie('nbf_session', token, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'strict' : 'lax',
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    path: '/',
+  });
+}
+
+function clearSessionCookie(res: Response) {
+  const isProd = process.env.NODE_ENV === 'production';
+  res.clearCookie('nbf_session', {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'strict' : 'lax',
+    path: '/',
+  });
+}
 
 // Check if store is initialized (supports both /status and /setup-status)
 router.get(['/status', '/setup-status'], async (req, res) => {
@@ -129,6 +167,8 @@ router.post('/setup', async (req, res) => {
     });
 
     const token = generateToken(userId);
+    setSessionCookie(res, token);
+
     res.json({
       success: true,
       token,
@@ -150,8 +190,8 @@ router.post('/setup', async (req, res) => {
   }
 });
 
-// Login
-router.post('/login', async (req, res) => {
+// Login (rate limited: 5 attempts per 15 min per IP)
+router.post('/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -181,6 +221,7 @@ router.post('/login', async (req, res) => {
     }
 
     const token = generateToken(user.id);
+    setSessionCookie(res, token);
     logAudit(user.id, 'USER_LOGIN', 'USER', user.id, { username: user.username });
 
     res.json({
@@ -196,6 +237,17 @@ router.post('/login', async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Logout: clear HTTP-only session cookie
+router.post('/logout', (req, res) => {
+  const token = (req as any).cookies?.nbf_session;
+  if (token) {
+    const userId = (req as any).user?.id || 'ANONYMOUS';
+    logAudit(userId, 'USER_LOGOUT', 'USER', userId, { message: 'Logged out successfully' });
+  }
+  clearSessionCookie(res);
+  res.json({ success: true, message: 'Logged out successfully' });
 });
 
 // Get current session info

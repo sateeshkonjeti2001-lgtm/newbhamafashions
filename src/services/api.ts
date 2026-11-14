@@ -31,6 +31,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}, retries =
   let res: Response;
   try {
     res = await fetch(`${BASE_URL}${endpoint}`, {
+      credentials: 'same-origin',
       ...options,
       headers,
     });
@@ -111,6 +112,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  logout: () => {
+    clearStoredToken();
+    return request<{ success: boolean; message: string }>('/auth/logout', { method: 'POST' });
+  },
   getMe: () => request<{ user: User }>('/auth/me'),
   getUsers: () => request<{ users: User[] }>('/auth/users'),
   createUser: (data: any) => request<{ success: boolean; user: User }>('/auth/users', {

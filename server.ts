@@ -1,8 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'path';
+import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
-import { getDb } from './server/db.ts';
+import { getDb, saveDb } from './server/db.ts';
 
 import authRoutes from './server/routes/authRoutes.ts';
 import dashboardRoutes from './server/routes/dashboardRoutes.ts';
@@ -19,11 +21,14 @@ import exportRoutes from './server/routes/exportRoutes.ts';
 import auditRoutes from './server/routes/auditRoutes.ts';
 import backupRoutes from './server/routes/backupRoutes.ts';
 import reportRoutes from './server/routes/reportRoutes.ts';
-import { startBackupScheduler } from './server/backupScheduler.ts';
+import { startBackupScheduler, stopBackupScheduler } from './server/backupScheduler.ts';
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
+
+  // Trust proxy: Cloud Run and reverse proxies forward client IP in X-Forwarded-For
+  app.set('trust proxy', 1);
 
   // Initialize SQLite database
   await getDb();
@@ -32,6 +37,15 @@ async function startServer() {
   // Initialize persistent automatic backup scheduler
   startBackupScheduler();
 
+  // Security Headers via Helmet (HSTS, X-Content-Type-Options, Frameguard)
+  app.use(
+    helmet({
+      contentSecurityPolicy: false, // Allows Vite and embedded assets
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+
+  app.use(cookieParser());
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -82,9 +96,33 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
+
+  // Graceful shutdown on Cloud Run container termination (SIGTERM)
+  const shutdown = (signal: string) => {
+    console.log(`🛑 Received ${signal}. Flushing database and shutting down gracefully...`);
+    stopBackupScheduler();
+    try {
+      saveDb(true);
+      console.log('💾 Database flushed to disk successfully.');
+    } catch (saveErr) {
+      console.error('Error flushing database on shutdown:', saveErr);
+    }
+    server.close(() => {
+      console.log('👋 HTTP server closed.');
+      process.exit(0);
+    });
+    // Force exit after 8 seconds (Cloud Run max grace is 10s)
+    setTimeout(() => {
+      console.error('⚠️ Forcing process exit after timeout.');
+      process.exit(1);
+    }, 8000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer().catch((err) => {

@@ -1,0 +1,9 @@
+# Litestream configuration for New Bhama Fashions ERP on Google Cloud Run
+# Replicates SQLite database and Write-Ahead Log (WAL) to Google Cloud Storage (GCS)
+dbs:
+  - path: /app/data/bhama_store.sqlite
+    replicas:
+      - type: gcs
+        bucket: "${GCS_BUCKET}"
+        path: "db/bhama_store.sqlite"
+        retention: 720h # 30 days retention

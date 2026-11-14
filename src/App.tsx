@@ -52,28 +52,25 @@ export default function App() {
       }
       setSetupRequired(false);
 
-      // 2. Check if logged in
-      const token = getStoredToken();
-      if (token) {
-        try {
-          const meRes = await api.getMe();
-          if (meRes.user) {
-            setCurrentUser(meRes.user);
+      // 2. Check if logged in (checks HTTP-only session cookie or token)
+      try {
+        const meRes = await api.getMe();
+        if (meRes.user) {
+          setCurrentUser(meRes.user);
 
-            // Fetch day closed status
-            try {
-              const todayStr = new Date().toISOString().split('T')[0];
-              const closingRes = await api.getDayClosingSummary(todayStr);
-              setDayClosed(Boolean(closingRes.isClosed));
-            } catch (e) {
-              // Non-blocking
-            }
-          } else {
-            removeStoredToken();
+          // Fetch day closed status
+          try {
+            const todayStr = new Date().toISOString().split('T')[0];
+            const closingRes = await api.getDayClosingSummary(todayStr);
+            setDayClosed(Boolean(closingRes.isClosed));
+          } catch (e) {
+            // Non-blocking
           }
-        } catch (err) {
+        } else {
           removeStoredToken();
         }
+      } catch (err) {
+        removeStoredToken();
       }
     } catch (err) {
       console.error('App init error:', err);
@@ -86,7 +83,12 @@ export default function App() {
     initAuth();
   }, []);
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } catch (err) {
+      console.warn('Logout server notification failed:', err);
+    }
     removeStoredToken();
     setCurrentUser(null);
     setActiveTab('dashboard');
