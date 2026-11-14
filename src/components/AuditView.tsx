@@ -20,6 +20,7 @@ import {
 import { api } from '../services/api.ts';
 import { AuditLogEntry, User as UserType } from '../types.ts';
 import { BackupRestoreView } from './BackupRestoreView.tsx';
+import { DatabaseBackup } from './DatabaseBackup.tsx';
 
 export const AuditView: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'AUDIT' | 'SETTINGS' | 'BACKUP'>('AUDIT');
@@ -479,6 +480,9 @@ export const AuditView: React.FC = () => {
                   </p>
                 </div>
               </div>
+
+              {/* Manual Local Database Backup Component */}
+              <DatabaseBackup onOpenFullBackupTab={() => setActiveTab('BACKUP')} />
             </div>
           </div>
         </div>

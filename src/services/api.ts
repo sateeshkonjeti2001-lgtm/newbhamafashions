@@ -516,13 +516,74 @@ export const api = {
     request<{ success: boolean; message: string }>(`/backup/${id}`, {
       method: 'DELETE',
     }),
+  getLiveDatabaseInfo: () =>
+    request<{
+      filename: string;
+      sizeBytes: number;
+      totalTables: number;
+      totalRecords: number;
+      tableCounts: Record<string, number>;
+    }>('/backup/live-info'),
+  downloadLiveDatabase: async (): Promise<{
+    filename: string;
+    sizeBytes: number;
+    checksum: string | null;
+  }> => {
+    const token = getStoredToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const res = await fetch(`${BASE_URL}/backup/download-live`, {
+      credentials: 'same-origin',
+      headers,
+    });
+
+    if (!res.ok) {
+      let errMsg = `Download failed (${res.status})`;
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        try {
+          const errJson = await res.json();
+          errMsg = errJson.error || errMsg;
+        } catch {}
+      }
+      throw new Error(errMsg);
+    }
+
+    const disposition = res.headers.get('content-disposition') || '';
+    const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+    const filename = filenameMatch?.[1] || `nbf_live_database_${Date.now()}.sqlite`;
+    const checksum = res.headers.get('x-backup-checksum');
+    const headerSize = Number(res.headers.get('x-database-size') || 0);
+
+    const blob = await res.blob();
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(downloadUrl);
+
+    return {
+      filename,
+      sizeBytes: headerSize || blob.size,
+      checksum,
+    };
+  },
   downloadBackupFile: (id: string, filename: string) => {
     const token = getStoredToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
     const url = `${BASE_URL}/backup/download/${id}`;
     fetch(url, {
-      headers: {
-        Authorization: token ? `Bearer ${token}` : '',
-      },
+      credentials: 'same-origin',
+      headers,
     })
       .then((res) => {
         if (!res.ok) throw new Error('Download failed: ' + res.statusText);
@@ -538,7 +599,7 @@ export const api = {
         a.remove();
         window.URL.revokeObjectURL(downloadUrl);
       })
-      .catch((err) => alert(err.message));
+      .catch((err) => console.error('Backup download error:', err.message));
   },
 
   // Sales Trends & Visualization

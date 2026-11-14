@@ -884,3 +884,94 @@ function applyRetentionPolicy() {
     saveRegistry(newRegistry);
   }
 }
+
+export function getLiveDatabaseInfo(): {
+  filename: string;
+  sizeBytes: number;
+  totalTables: number;
+  totalRecords: number;
+  tableCounts: Record<string, number>;
+} {
+  const dbPath = path.join(DATA_DIR, 'bhama_store.sqlite');
+  let sizeBytes = 0;
+  try {
+    if (fs.existsSync(dbPath)) {
+      sizeBytes = fs.statSync(dbPath).size;
+    } else {
+      sizeBytes = exportDatabaseBuffer().length;
+    }
+  } catch {
+    sizeBytes = 0;
+  }
+
+  const tableCounts = getDatabaseStats();
+  const totalTables = Object.keys(tableCounts).length;
+  const totalRecords = Object.values(tableCounts).reduce((acc, count) => acc + (Number(count) || 0), 0);
+
+  return {
+    filename: 'bhama_store.sqlite',
+    sizeBytes,
+    totalTables,
+    totalRecords,
+    tableCounts,
+  };
+}
+
+export async function exportVerifiedLiveDatabase(
+  userId?: string,
+  userFullName?: string
+): Promise<{
+  buffer: Buffer;
+  filename: string;
+  sha256: string;
+  size: number;
+  tableCounts: Record<string, number>;
+}> {
+  const buffer = exportDatabaseBuffer();
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+
+  // Verify SQLite integrity on exported buffer before streaming to administrator
+  const SQL = await initSqlJs();
+  const testDb = new SQL.Database(buffer);
+  const integrityStmt = testDb.prepare('PRAGMA integrity_check;');
+  let passedIntegrity = false;
+  let integrityMsg = '';
+  if (integrityStmt.step()) {
+    const row = integrityStmt.getAsObject();
+    integrityMsg = String(Object.values(row)[0]);
+    passedIntegrity = integrityMsg === 'ok';
+  }
+  integrityStmt.free();
+  testDb.close();
+
+  if (!passedIntegrity) {
+    throw new Error(`Live database export failed SQLite integrity check: ${integrityMsg}`);
+  }
+
+  const now = new Date();
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const istDateTag = new Date(now.getTime() + istOffsetMs)
+    .toISOString()
+    .replace(/[:.]/g, '-')
+    .replace('T', '_')
+    .slice(0, 19);
+
+  const shortHash = sha256.substring(0, 8);
+  const filename = `nbf_live_database_${istDateTag}_${shortHash}.sqlite`;
+  const tableCounts = getDatabaseStats();
+
+  logAudit(userId || 'OWNER', 'DOWNLOAD_LIVE_DATABASE', 'DATABASE', 'bhama_store.sqlite', {
+    filename,
+    size: buffer.length,
+    checksum: sha256,
+    downloaded_by: userFullName || 'Store Owner',
+  });
+
+  return {
+    buffer,
+    filename,
+    sha256,
+    size: buffer.length,
+    tableCounts,
+  };
+}

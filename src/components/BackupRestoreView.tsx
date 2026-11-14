@@ -47,6 +47,7 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
 
   // Manual Backup State
   const [creatingBackup, setCreatingBackup] = useState(false);
+  const [downloadingLiveDb, setDownloadingLiveDb] = useState(false);
   const [backupProgressStep, setBackupProgressStep] = useState<string | null>(null);
   const [manualSuccessMsg, setManualSuccessMsg] = useState<string | null>(null);
   const [manualErrorMsg, setManualErrorMsg] = useState<string | null>(null);
@@ -128,6 +129,25 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
     } finally {
       setCreatingBackup(false);
       setBackupProgressStep(null);
+    }
+  };
+
+  const handleDownloadLiveDatabase = async () => {
+    setDownloadingLiveDb(true);
+    setManualSuccessMsg(null);
+    setManualErrorMsg(null);
+    try {
+      const result = await api.downloadLiveDatabase();
+      const sizeText = result.sizeBytes >= 1024 * 1024
+        ? `${(result.sizeBytes / (1024 * 1024)).toFixed(2)} MB`
+        : `${(result.sizeBytes / 1024).toFixed(1)} KB`;
+      setManualSuccessMsg(
+        `Verified SQLite database downloaded for local storage: ${result.filename} (${sizeText})`
+      );
+    } catch (err: any) {
+      setManualErrorMsg(err.message || 'Failed to download live SQLite database');
+    } finally {
+      setDownloadingLiveDb(false);
     }
   };
 
@@ -448,6 +468,25 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
               <>
                 <Play className="w-4 h-4 text-[#A67C52] fill-[#A67C52]" />
                 <span>Create Backup Now</span>
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleDownloadLiveDatabase}
+            disabled={downloadingLiveDb}
+            className="px-4 py-2.5 bg-white hover:bg-[#FAF8F4] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center gap-2 transition cursor-pointer shadow-xs disabled:opacity-50"
+          >
+            {downloadingLiveDb ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin text-[#A67C52]" />
+                <span>Preparing SQLite...</span>
+              </>
+            ) : (
+              <>
+                <Download className="w-4 h-4 text-[#A67C52]" />
+                <span>Download SQLite (.sqlite)</span>
               </>
             )}
           </button>

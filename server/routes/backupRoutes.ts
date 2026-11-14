@@ -13,6 +13,8 @@ import {
   deleteBackup,
   toggleBackupLock,
   getBackupById,
+  getLiveDatabaseInfo,
+  exportVerifiedLiveDatabase,
 } from '../backupService.ts';
 import { rescheduleBackup } from '../backupScheduler.ts';
 import { logAudit } from '../audit.ts';
@@ -129,9 +131,37 @@ router.get('/download/:id', (req: AuthenticatedRequest, res: Response) => {
 
     res.setHeader('Content-Disposition', `attachment; filename="${record.filename}"`);
     res.setHeader('Content-Type', 'application/x-sqlite3');
+    res.setHeader('Cache-Control', 'no-store');
     res.sendFile(record.filepath);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// 7b. Get Live Database Info (size, tables, records)
+router.get('/live-info', (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const info = getLiveDatabaseInfo();
+    res.json(info);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7c. Direct Manual Download of Live SQLite Database
+router.get('/download-live', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await exportVerifiedLiveDatabase(req.user?.id, req.user?.full_name);
+
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.setHeader('Content-Type', 'application/x-sqlite3');
+    res.setHeader('Content-Length', String(result.size));
+    res.setHeader('X-Backup-Checksum', result.sha256);
+    res.setHeader('X-Database-Size', String(result.size));
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(result.buffer);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to export verified SQLite database' });
   }
 });
 
