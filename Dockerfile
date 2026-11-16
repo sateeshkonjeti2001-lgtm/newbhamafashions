@@ -43,9 +43,9 @@ RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/firebase-applet-config.json ./firebase-applet-config.json
 
-# Copy initialized initial database seed into /app/seed_data (isolated from /app/data)
-# This prevents future container builds from ever overwriting a newer live database in GCS/Litestream
-COPY --from=builder /app/data ./seed_data
+# Ensure empty runtime data directories exist without baking any .sqlite files into the image.
+# Production database state is always restored from Google Cloud Storage via Litestream at boot.
+RUN mkdir -p /app/data/backups
 
 EXPOSE 3000
 

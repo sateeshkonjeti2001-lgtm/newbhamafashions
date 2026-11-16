@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import initSqlJs from 'sql.js';
 import {
   exportDatabaseBuffer,
@@ -973,5 +975,272 @@ export async function exportVerifiedLiveDatabase(
     sha256,
     size: buffer.length,
     tableCounts,
+  };
+}
+
+const execFileAsync = promisify(execFile);
+
+function findLitestreamBinary(): string | null {
+  const candidates = ['/usr/local/bin/litestream', '/usr/bin/litestream'];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+  return null;
+}
+
+function findLitestreamConfig(): { path: string | null; retention: string | null } {
+  const candidates = ['/etc/litestream.yml', path.join(process.cwd(), 'litestream.yml')];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf-8');
+        const retMatch = content.match(/retention:\s*([^\s#]+)/i);
+        return { path: p, retention: retMatch?.[1] || null };
+      }
+    } catch {}
+  }
+  return { path: null, retention: null };
+}
+
+function isLitestreamProcessRunning(): boolean {
+  try {
+    if (!fs.existsSync('/proc')) return false;
+    const entries = fs.readdirSync('/proc');
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+        if (cmdline.includes('litestream') && cmdline.includes('replicate')) {
+          return true;
+        }
+      } catch {
+        // Ignore short-lived or restricted PIDs
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function getLatestMtimeInDir(dirPath: string, maxDepth = 3): string | null {
+  let latestMs = 0;
+
+  const walk = (current: string, depth: number) => {
+    if (depth > maxDepth) return;
+    try {
+      const items = fs.readdirSync(current, { withFileTypes: true });
+      for (const item of items) {
+        const full = path.join(current, item.name);
+        try {
+          const st = fs.statSync(full);
+          if (st.mtimeMs > latestMs) {
+            latestMs = st.mtimeMs;
+          }
+          if (item.isDirectory()) {
+            walk(full, depth + 1);
+          }
+        } catch {}
+      }
+    } catch {}
+  };
+
+  walk(dirPath, 0);
+  return latestMs > 0 ? new Date(latestMs).toISOString() : null;
+}
+
+export interface DataSafetyStatus {
+  checkedAt: string;
+  database: {
+    filename: string;
+    filepath: string;
+    sizeBytes: number;
+    walSizeBytes: number;
+    lastModifiedAt: string | null;
+    totalTables: number;
+    totalRecords: number;
+  };
+  litestream: {
+    configured: boolean;
+    gcsBucket: string | null;
+    replicaPath: string | null;
+    binaryInstalled: boolean;
+    configPath: string | null;
+    retention: string | null;
+    processRunning: boolean;
+    shadowDirPresent: boolean;
+    shadowLastUpdatedAt: string | null;
+    latestSnapshotAt: string | null;
+    latestGeneration: string | null;
+    status: 'REPLICATING' | 'DEGRADED' | 'STANDALONE_LOCAL';
+    statusLabel: string;
+    statusDetail: string;
+  };
+  backup: {
+    healthStatus: 'HEALTHY' | 'BACKUP_DUE' | 'FAILED' | 'VERIFICATION_REQUIRED' | 'RESTORE_TEST_REQUIRED';
+    lastSuccessfulBackupAt: string | null;
+    lastSuccessfulBackup: {
+      id: string;
+      filename: string;
+      backup_type: 'MANUAL' | 'AUTOMATIC' | 'PRE_RESTORE';
+      file_size: number;
+      verification_status: 'VERIFIED' | 'FAILED' | 'UNCHECKED';
+      checksum_sha256: string;
+      created_at: string;
+    } | null;
+    lastAttemptAt: string | null;
+    lastErrorMessage: string | null;
+    autoBackupEnabled: boolean;
+    nextScheduledBackupDisplay: string;
+    totalValidBackups: number;
+    totalStorageBytes: number;
+    lastRestoreTestAt: string | null;
+    lastRestoreTestResult: string | null;
+  };
+}
+
+export async function getDataSafetyStatus(): Promise<DataSafetyStatus> {
+  const dbPath = path.join(DATA_DIR, 'bhama_store.sqlite');
+  const walPath = `${dbPath}-wal`;
+  const shmPath = `${dbPath}-shm`;
+  const shadowDir = path.join(DATA_DIR, '.bhama_store.sqlite-litestream');
+
+  let sizeBytes = 0;
+  let walSizeBytes = 0;
+  let lastModifiedAt: string | null = null;
+
+  try {
+    if (fs.existsSync(dbPath)) {
+      const st = fs.statSync(dbPath);
+      sizeBytes = st.size;
+      lastModifiedAt = st.mtime.toISOString();
+    } else {
+      sizeBytes = exportDatabaseBuffer().length;
+    }
+  } catch {
+    sizeBytes = 0;
+  }
+
+  try {
+    if (fs.existsSync(walPath)) walSizeBytes += fs.statSync(walPath).size;
+    if (fs.existsSync(shmPath)) walSizeBytes += fs.statSync(shmPath).size;
+  } catch {}
+
+  const tableCounts = getDatabaseStats();
+  const totalTables = Object.keys(tableCounts).length;
+  const totalRecords = Object.values(tableCounts).reduce((acc, count) => acc + (Number(count) || 0), 0);
+
+  // Litestream runtime inspection
+  const gcsBucket = process.env.GCS_BUCKET?.trim() || null;
+  const configured = Boolean(gcsBucket);
+  const replicaPath = gcsBucket ? `gs://${gcsBucket}/db/bhama_store.sqlite` : null;
+  const binaryPath = findLitestreamBinary();
+  const binaryInstalled = Boolean(binaryPath);
+  const { path: configPath, retention } = findLitestreamConfig();
+  const processRunning = isLitestreamProcessRunning();
+  const shadowDirPresent = fs.existsSync(shadowDir);
+  const shadowLastUpdatedAt = shadowDirPresent ? getLatestMtimeInDir(shadowDir) : null;
+
+  let latestSnapshotAt: string | null = null;
+  let latestGeneration: string | null = null;
+
+  if (configured && binaryPath && configPath) {
+    try {
+      const { stdout } = await execFileAsync(
+        binaryPath,
+        ['snapshots', '-config', configPath, dbPath],
+        { timeout: 2500 }
+      );
+      const lines = stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.toLowerCase().startsWith('replica'));
+      if (lines.length > 0) {
+        // Columns typically: replica generation index size created
+        const lastCols = lines[lines.length - 1].split(/\s+/);
+        if (lastCols.length >= 5) {
+          latestGeneration = lastCols[1] || null;
+          latestSnapshotAt = lastCols[4] || null;
+        }
+      }
+    } catch {
+      // Non-fatal: GCS lookup may be unreachable or no snapshot exists yet
+    }
+  }
+
+  let lsStatus: 'REPLICATING' | 'DEGRADED' | 'STANDALONE_LOCAL' = 'STANDALONE_LOCAL';
+  let statusLabel = 'Standalone Local Mode';
+  let statusDetail =
+    'GCS_BUCKET is not configured in this environment. Database runs in standalone local disk mode with scheduled and manual local backups.';
+
+  if (configured) {
+    if (processRunning) {
+      lsStatus = 'REPLICATING';
+      statusLabel = 'Active & Replicating';
+      statusDetail = `Litestream replicate process is running continuously and syncing changes to gs://${gcsBucket}/db/bhama_store.sqlite.`;
+    } else {
+      lsStatus = 'DEGRADED';
+      statusLabel = 'Not Running (Degraded)';
+      statusDetail =
+        'GCS_BUCKET is configured, but no active Litestream replicate process was detected in this container.';
+    }
+  }
+
+  const health = getBackupHealth();
+  const settings = getBackupSettings();
+  const lastSuccessful = health.lastSuccessfulBackup;
+
+  return {
+    checkedAt: new Date().toISOString(),
+    database: {
+      filename: 'bhama_store.sqlite',
+      filepath: dbPath,
+      sizeBytes,
+      walSizeBytes,
+      lastModifiedAt,
+      totalTables,
+      totalRecords,
+    },
+    litestream: {
+      configured,
+      gcsBucket,
+      replicaPath,
+      binaryInstalled,
+      configPath,
+      retention,
+      processRunning,
+      shadowDirPresent,
+      shadowLastUpdatedAt,
+      latestSnapshotAt,
+      latestGeneration,
+      status: lsStatus,
+      statusLabel,
+      statusDetail,
+    },
+    backup: {
+      healthStatus: health.status,
+      lastSuccessfulBackupAt: lastSuccessful?.created_at || null,
+      lastSuccessfulBackup: lastSuccessful
+        ? {
+            id: lastSuccessful.id,
+            filename: lastSuccessful.filename,
+            backup_type: lastSuccessful.backup_type,
+            file_size: lastSuccessful.file_size,
+            verification_status: lastSuccessful.verification_status,
+            checksum_sha256: lastSuccessful.checksum_sha256,
+            created_at: lastSuccessful.created_at,
+          }
+        : null,
+      lastAttemptAt: settings.last_attempt_at || health.lastAttemptedBackup?.created_at || null,
+      lastErrorMessage: settings.last_error_message || null,
+      autoBackupEnabled: health.autoBackupEnabled,
+      nextScheduledBackupDisplay: health.nextScheduledBackupDisplay,
+      totalValidBackups: health.totalValidBackups,
+      totalStorageBytes: health.totalStorageBytes,
+      lastRestoreTestAt: health.lastRestoreTestAt,
+      lastRestoreTestResult: health.lastRestoreTestResult,
+    },
   };
 }

@@ -4,7 +4,26 @@ import crypto from 'crypto';
 import { dbQueryOne, dbQueryAll, dbRun } from './db.ts';
 import { logAudit } from './audit.ts';
 
-const TOKEN_SECRET = process.env.AUTH_SECRET || 'bhama-fashions-secret-key-offline-2026';
+export function verifyAuthSecretsConfigured(): void {
+  if (process.env.NODE_ENV === 'production') {
+    if (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < 16) {
+      throw new Error('CRITICAL SECURITY ERROR: AUTH_SECRET environment variable must be set (min 16 chars) in production.');
+    }
+    if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 16) {
+      throw new Error('CRITICAL SECURITY ERROR: SESSION_SECRET environment variable must be set (min 16 chars) in production.');
+    }
+  }
+}
+
+export function getTokenSecret(): string {
+  const secret = process.env.AUTH_SECRET;
+  if (secret) return secret;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('CRITICAL SECURITY ERROR: AUTH_SECRET environment variable is required in production.');
+  }
+  return 'bhama-fashions-dev-local-ephemeral-secret';
+}
+
 const activeTokens = new Map<string, { userId: string; expiresAt: number }>();
 
 export interface AuthUser {
@@ -22,7 +41,7 @@ export interface AuthenticatedRequest extends Request {
 export function generateToken(userId: string): string {
   const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
   const payloadStr = `${userId}:${expiresAt}`;
-  const hmac = crypto.createHmac('sha256', TOKEN_SECRET).update(payloadStr).digest('hex');
+  const hmac = crypto.createHmac('sha256', getTokenSecret()).update(payloadStr).digest('hex');
   const token = Buffer.from(`${payloadStr}:${hmac}`).toString('base64');
   activeTokens.set(token, {
     userId,
@@ -54,7 +73,7 @@ export function verifyToken(token: string): string | null {
         return null;
       }
 
-      const expectedHmac = crypto.createHmac('sha256', TOKEN_SECRET).update(`${userId}:${expiresAt}`).digest('hex');
+      const expectedHmac = crypto.createHmac('sha256', getTokenSecret()).update(`${userId}:${expiresAt}`).digest('hex');
       const sigBuf = Buffer.from(sig, 'hex');
       const expBuf = Buffer.from(expectedHmac, 'hex');
       if (sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf)) {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import {
   LayoutDashboard,
   Receipt,
@@ -6,10 +6,9 @@ import {
   ReceiptText,
   Menu,
 } from 'lucide-react';
-import { api, getStoredToken, removeStoredToken } from './services/api.ts';
+import { api, removeStoredToken } from './services/api.ts';
 import { User } from './types.ts';
-import { SetupScreen } from './components/SetupScreen.tsx';
-import { LoginScreen } from './components/LoginScreen.tsx';
+import { EntryGateScreen } from './components/EntryGateScreen.tsx';
 import { Navbar } from './components/Navbar.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
@@ -28,7 +27,15 @@ import { ReportsView } from './components/ReportsView.tsx';
 import { AuditView } from './components/AuditView.tsx';
 import { GoogleWorkspaceView } from './components/GoogleWorkspaceView.tsx';
 
+const SetupScreen = lazy(() =>
+  import('./components/SetupScreen.tsx').then((m) => ({ default: m.SetupScreen }))
+);
+const LoginScreen = lazy(() =>
+  import('./components/LoginScreen.tsx').then((m) => ({ default: m.LoginScreen }))
+);
+
 export default function App() {
+  const [gateVerified, setGateVerified] = useState<boolean | null>(null);
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeTab, setActiveTab] = useState<string>('dashboard');
@@ -72,7 +79,11 @@ export default function App() {
       } catch (err) {
         removeStoredToken();
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.status === 403) {
+        setGateVerified(false);
+        return;
+      }
       console.error('App init error:', err);
     } finally {
       setLoading(false);
@@ -80,8 +91,34 @@ export default function App() {
   };
 
   useEffect(() => {
-    initAuth();
+    let active = true;
+    const checkGateAndBoot = async () => {
+      try {
+        const gateRes = await api.getGateStatus();
+        if (!active) return;
+        if (gateRes.verified) {
+          setGateVerified(true);
+          await initAuth();
+        } else {
+          setGateVerified(false);
+          setLoading(false);
+        }
+      } catch {
+        if (!active) return;
+        setGateVerified(false);
+        setLoading(false);
+      }
+    };
+    checkGateAndBoot();
+    return () => {
+      active = false;
+    };
   }, []);
+
+  const handleGateVerified = async () => {
+    setGateVerified(true);
+    await initAuth();
+  };
 
   const handleLogout = async () => {
     try {
@@ -94,6 +131,16 @@ export default function App() {
     setActiveTab('dashboard');
     setMobileMenuOpen(false);
   };
+
+  // Plain background while checking initial entry-gate cookie status on the server
+  if (gateVerified === null) {
+    return <div className="min-h-screen bg-[#F5F2EC]" />;
+  }
+
+  // 0. Private Entry Gate Screen (10 identical circular dots)
+  if (!gateVerified) {
+    return <EntryGateScreen onVerified={handleGateVerified} />;
+  }
 
   if (loading) {
     return (
@@ -111,23 +158,27 @@ export default function App() {
   // 1. First-time Owner Setup Screen
   if (setupRequired) {
     return (
-      <SetupScreen
-        onSetupSuccess={(user) => {
-          setSetupRequired(false);
-          setCurrentUser(user);
-        }}
-      />
+      <Suspense fallback={<div className="min-h-screen bg-[#F5F2EC]" />}>
+        <SetupScreen
+          onSetupSuccess={(user) => {
+            setSetupRequired(false);
+            setCurrentUser(user);
+          }}
+        />
+      </Suspense>
     );
   }
 
   // 2. Login Screen
   if (!currentUser) {
     return (
-      <LoginScreen
-        onLoginSuccess={(user) => {
-          setCurrentUser(user);
-        }}
-      />
+      <Suspense fallback={<div className="min-h-screen bg-[#F5F2EC]" />}>
+        <LoginScreen
+          onLoginSuccess={(user) => {
+            setCurrentUser(user);
+          }}
+        />
+      </Suspense>
     );
   }
 

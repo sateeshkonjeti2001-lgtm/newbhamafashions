@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { dbQueryOne, dbQueryAll, dbRun } from '../db.ts';
 import { hashPassword, checkPassword, generateToken, authMiddleware, AuthenticatedRequest } from '../auth.ts';
+import { entryGateMiddleware } from '../gate.ts';
 import { logAudit } from '../audit.ts';
 
 const router = Router();
@@ -44,7 +45,7 @@ function clearSessionCookie(res: Response) {
 }
 
 // Check if store is initialized (supports both /status and /setup-status)
-router.get(['/status', '/setup-status'], async (req, res) => {
+router.get(['/status', '/setup-status'], entryGateMiddleware, async (req, res) => {
   try {
     const userCountRow = dbQueryOne<{ count: number }>('SELECT COUNT(*) as count FROM users');
     const isInitialized = (userCountRow?.count || 0) > 0;
@@ -77,7 +78,7 @@ router.get(['/status', '/setup-status'], async (req, res) => {
 
 // Setup initial OWNER account (only allowed when 0 users exist)
 // Configures one administrator account for New Bhama Fashions
-router.post('/setup', async (req, res) => {
+router.post('/setup', entryGateMiddleware, async (req, res) => {
   try {
     const userCountRow = dbQueryOne<{ count: number }>('SELECT COUNT(*) as count FROM users');
     if ((userCountRow?.count || 0) > 0) {
@@ -190,8 +191,8 @@ router.post('/setup', async (req, res) => {
   }
 });
 
-// Login (rate limited: 5 attempts per 15 min per IP)
-router.post('/login', loginLimiter, async (req, res) => {
+// Login (rate limited: 5 attempts per 15 min per IP; requires verified entry gate)
+router.post('/login', entryGateMiddleware, loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -408,8 +409,8 @@ router.delete('/users/:id', authMiddleware, (req: AuthenticatedRequest, res: Res
   res.json({ success: true, message: 'User deactivated' });
 });
 
-// Store Profile & 3 Contact Numbers (GET)
-router.get('/store-profile', async (req, res) => {
+// Store Profile & 3 Contact Numbers (GET - requires authenticated ERP user)
+router.get('/store-profile', authMiddleware, async (req, res) => {
   try {
     const storeNameRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_name']);
     const storeLocationRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_location']);

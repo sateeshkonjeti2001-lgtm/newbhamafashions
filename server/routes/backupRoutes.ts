@@ -15,6 +15,7 @@ import {
   getBackupById,
   getLiveDatabaseInfo,
   exportVerifiedLiveDatabase,
+  getDataSafetyStatus,
 } from '../backupService.ts';
 import { rescheduleBackup } from '../backupScheduler.ts';
 import { logAudit } from '../audit.ts';
@@ -30,6 +31,17 @@ router.get('/health', (req: AuthenticatedRequest, res: Response) => {
   try {
     const health = getBackupHealth();
     res.json(health);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 1b. Real-Time Data Safety & Litestream Monitor
+router.get('/data-safety', async (req: AuthenticatedRequest, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const status = await getDataSafetyStatus();
+    res.json(status);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -400,3 +400,53 @@ export interface DryRunRestoreReport {
   message: string;
 }
 
+export interface DataSafetyStatus {
+  checkedAt: string;
+  database: {
+    filename: string;
+    filepath: string;
+    sizeBytes: number;
+    walSizeBytes: number;
+    lastModifiedAt: string | null;
+    totalTables: number;
+    totalRecords: number;
+  };
+  litestream: {
+    configured: boolean;
+    gcsBucket: string | null;
+    replicaPath: string | null;
+    binaryInstalled: boolean;
+    configPath: string | null;
+    retention: string | null;
+    processRunning: boolean;
+    shadowDirPresent: boolean;
+    shadowLastUpdatedAt: string | null;
+    latestSnapshotAt: string | null;
+    latestGeneration: string | null;
+    status: 'REPLICATING' | 'DEGRADED' | 'STANDALONE_LOCAL';
+    statusLabel: string;
+    statusDetail: string;
+  };
+  backup: {
+    healthStatus: 'HEALTHY' | 'BACKUP_DUE' | 'FAILED' | 'VERIFICATION_REQUIRED' | 'RESTORE_TEST_REQUIRED';
+    lastSuccessfulBackupAt: string | null;
+    lastSuccessfulBackup: {
+      id: string;
+      filename: string;
+      backup_type: 'MANUAL' | 'AUTOMATIC' | 'PRE_RESTORE';
+      file_size: number;
+      verification_status: 'VERIFIED' | 'FAILED' | 'UNCHECKED';
+      checksum_sha256: string;
+      created_at: string;
+    } | null;
+    lastAttemptAt: string | null;
+    lastErrorMessage: string | null;
+    autoBackupEnabled: boolean;
+    nextScheduledBackupDisplay: string;
+    totalValidBackups: number;
+    totalStorageBytes: number;
+    lastRestoreTestAt: string | null;
+    lastRestoreTestResult: string | null;
+  };
+}
+

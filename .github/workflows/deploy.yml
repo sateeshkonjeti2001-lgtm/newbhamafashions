@@ -1,11 +1,11 @@
 name: Deploy to Google Cloud Run
 
 on:
-  # Manual trigger only — requires explicit user approval in GitHub Actions before running
+  # Manual trigger only — never auto-deploys on push
   workflow_dispatch:
     inputs:
       confirm_deploy:
-        description: 'Type "DEPLOY" to confirm production deployment to Cloud Run'
+        description: 'Type "DEPLOY" to confirm manual production deployment to Cloud Run'
         required: true
         default: 'CANCEL'
 
@@ -13,6 +13,7 @@ env:
   PROJECT_ID: gen-lang-client-0483853938
   SERVICE_NAME: new-bhama-fashions-erp
   REGION: asia-southeast1
+  AR_REPO: erp-containers
 
 jobs:
   deploy:
@@ -22,47 +23,104 @@ jobs:
       id-token: write
 
     steps:
-      - name: Verify Deployment Confirmation
+      - name: Verify Manual DEPLOY Confirmation
         run: |
           if [ "${{ github.event.inputs.confirm_deploy }}" != "DEPLOY" ]; then
-            echo "❌ Deployment aborted: confirmation phrase did not match 'DEPLOY'."
+            echo "Deployment aborted: confirm_deploy input did not match 'DEPLOY'."
+            exit 1
+          fi
+
+      - name: Validate Required Deployment Configuration
+        env:
+          HAS_WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+          HAS_WIF_SA: ${{ secrets.GCP_SERVICE_ACCOUNT != '' }}
+          HAS_SA_KEY: ${{ secrets.GCP_SA_KEY != '' }}
+          HAS_GCS_BUCKET: ${{ secrets.GCS_BUCKET != '' }}
+          HAS_RUNTIME_SA: ${{ secrets.CLOUD_RUN_RUNTIME_SA != '' }}
+        run: |
+          if [ "$HAS_WIF_PROVIDER" = "true" ] && [ "$HAS_WIF_SA" = "true" ]; then
+            echo "Using Workload Identity Federation (recommended keyless authentication)."
+          elif [ "$HAS_SA_KEY" = "true" ]; then
+            echo "Warning: Using fallback GCP_SA_KEY authentication. Configure GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT for keyless WIF."
+          else
+            echo "Error: Missing Google Cloud authentication secrets. Set GCP_WORKLOAD_IDENTITY_PROVIDER + GCP_SERVICE_ACCOUNT (preferred) or GCP_SA_KEY (fallback)."
+            exit 1
+          fi
+
+          if [ "$HAS_GCS_BUCKET" != "true" ]; then
+            echo "Error: Missing GCS_BUCKET secret for Litestream database replication."
+            exit 1
+          fi
+
+          if [ "$HAS_RUNTIME_SA" != "true" ]; then
+            echo "Error: Missing CLOUD_RUN_RUNTIME_SA secret (dedicated Cloud Run runtime service account)."
             exit 1
           fi
 
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud (Workload Identity Federation or Service Account Key)
+      # Preferred: Keyless Workload Identity Federation
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        if: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
         uses: google-github-actions/auth@v2
         with:
-          # Preferred: Workload Identity Federation (keyless, zero credential leakage risk)
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          # Fallback: Service Account JSON key if WIF is not configured
+
+      # Fallback: Service Account JSON key (runs ONLY when WIF secrets are not configured)
+      - name: Authenticate to Google Cloud (Fallback Service Account Key)
+        if: ${{ (secrets.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || secrets.GCP_SERVICE_ACCOUNT == '') && secrets.GCP_SA_KEY != '' }}
+        uses: google-github-actions/auth@v2
+        with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Verify Artifact Registry Repository Exists
+        run: |
+          if ! gcloud artifacts repositories describe "${{ env.AR_REPO }}" \
+            --location="${{ env.REGION }}" \
+            --project="${{ env.PROJECT_ID }}" >/dev/null 2>&1; then
+            echo "Error: Artifact Registry repository '${{ env.AR_REPO }}' not found in '${{ env.REGION }}'."
+            echo "Create it once with: gcloud artifacts repositories create ${{ env.AR_REPO }} --repository-format=docker --location=${{ env.REGION }} --project=${{ env.PROJECT_ID }}"
+            exit 1
+          fi
+
+      - name: Verify Required Secret Manager Secrets Exist
+        run: |
+          for SECRET_NAME in erp-auth-secret erp-session-secret; do
+            if ! gcloud secrets versions access latest --secret="$SECRET_NAME" --project="${{ env.PROJECT_ID }}" >/dev/null 2>&1; then
+              echo "Error: Secret Manager secret '$SECRET_NAME' is missing or inaccessible."
+              exit 1
+            fi
+          done
+          echo "Secret Manager secrets verified."
+
       - name: Configure Docker for Google Artifact Registry
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
 
       - name: Build and Push Container Image
         run: |
-          IMAGE_TAG="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/erp-containers/${{ env.SERVICE_NAME }}:${{ github.sha }}"
-          docker build -t "$IMAGE_TAG" -t "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/erp-containers/${{ env.SERVICE_NAME }}:latest" .
-          docker push "$IMAGE_TAG"
-          docker push "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/erp-containers/${{ env.SERVICE_NAME }}:latest"
+          IMAGE_SHA="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          IMAGE_LATEST="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:latest"
+          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/erp-containers/${{ env.SERVICE_NAME }}:latest" \
-            --region ${{ env.REGION }} \
+          gcloud run deploy "${{ env.SERVICE_NAME }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --image "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" \
+            --region "${{ env.REGION }}" \
             --platform managed \
+            --service-account "${{ secrets.CLOUD_RUN_RUNTIME_SA }}" \
             --allow-unauthenticated \
             --max-instances 1 \
             --port 3000 \
             --memory 512Mi \
             --cpu 1 \
-            --set-env-vars "NODE_ENV=production,GCS_BUCKET=${{ secrets.GCS_BUCKET }}"
+            --set-env-vars "NODE_ENV=production,GCS_BUCKET=${{ secrets.GCS_BUCKET }}" \
+            --set-secrets "AUTH_SECRET=erp-auth-secret:latest,SESSION_SECRET=erp-session-secret:latest"

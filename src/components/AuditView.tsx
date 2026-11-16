@@ -16,14 +16,16 @@ import {
   ShieldCheck,
   Building,
   Database,
+  Activity,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { AuditLogEntry, User as UserType } from '../types.ts';
 import { BackupRestoreView } from './BackupRestoreView.tsx';
 import { DatabaseBackup } from './DatabaseBackup.tsx';
+import { DataSafetyMonitor } from './DataSafetyMonitor.tsx';
 
 export const AuditView: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'AUDIT' | 'SETTINGS' | 'BACKUP'>('AUDIT');
+  const [activeTab, setActiveTab] = useState<'AUDIT' | 'DATA_SAFETY' | 'SETTINGS' | 'BACKUP'>('AUDIT');
   const [logs, setLogs] = useState<AuditLogEntry[]>([]);
   const [actionFilter, setActionFilter] = useState('');
   const [loading, setLoading] = useState(true);
@@ -103,6 +105,8 @@ export const AuditView: React.FC = () => {
           <h2 className="text-xl font-bold tracking-tight text-[#1C1917]">
             {activeTab === 'AUDIT'
               ? 'System Security & Audit Logs'
+              : activeTab === 'DATA_SAFETY'
+              ? 'Data Safety & Litestream Monitor'
               : activeTab === 'SETTINGS'
               ? 'Store Settings & Official Contacts'
               : 'Database Backup & Restore'}
@@ -110,6 +114,8 @@ export const AuditView: React.FC = () => {
           <p className="text-xs text-[#6F6962] mt-0.5">
             {activeTab === 'AUDIT'
               ? 'Immutable tamper-evident record of all critical store actions, price changes, reversals & adjustments'
+              : activeTab === 'DATA_SAFETY'
+              ? 'Real-time Litestream replication status, live SQLite database size, and latest verified backup tracking'
               : activeTab === 'SETTINGS'
               ? 'Official shop contact numbers, store identity, and thermal receipt details for New Bhama Fashions'
               : 'Automatic nightly backups at 10:00 PM IST, manual snapshots, integrity verification, and safe disaster recovery'}
@@ -117,8 +123,8 @@ export const AuditView: React.FC = () => {
         </div>
 
         {/* Tab Switcher & Filter Controls */}
-        <div className="flex items-center gap-2.5">
-          <div className="flex bg-white border border-[#D4CDC2] p-1 rounded-xl text-xs shadow-xs">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap bg-white border border-[#D4CDC2] p-1 rounded-xl text-xs shadow-xs">
             <button
               onClick={() => setActiveTab('AUDIT')}
               className={`px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5 cursor-pointer ${
@@ -129,6 +135,17 @@ export const AuditView: React.FC = () => {
             >
               <History className="w-3.5 h-3.5 text-[#A67C52]" />
               <span>Audit Logs</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('DATA_SAFETY')}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5 cursor-pointer ${
+                activeTab === 'DATA_SAFETY'
+                  ? 'bg-[#171513] text-[#F5F2EC] shadow-sm'
+                  : 'text-[#6F6962] hover:text-[#1C1917]'
+              }`}
+            >
+              <Activity className="w-3.5 h-3.5 text-[#A67C52]" />
+              <span>Data Safety</span>
             </button>
             <button
               onClick={() => setActiveTab('SETTINGS')}
@@ -486,6 +503,11 @@ export const AuditView: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Tab 1b: Data Safety & Litestream Real-Time Monitor */}
+      {activeTab === 'DATA_SAFETY' && (
+        <DataSafetyMonitor onOpenBackupCenter={() => setActiveTab('BACKUP')} />
       )}
 
       {/* Tab 3: Database Backup & Restore View */}

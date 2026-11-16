@@ -5,7 +5,9 @@ import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
 import { getDb, saveDb } from './server/db.ts';
+import { verifyAuthSecretsConfigured } from './server/auth.ts';
 
+import gateRoutes from './server/routes/gateRoutes.ts';
 import authRoutes from './server/routes/authRoutes.ts';
 import dashboardRoutes from './server/routes/dashboardRoutes.ts';
 import productRoutes from './server/routes/productRoutes.ts';
@@ -24,6 +26,8 @@ import reportRoutes from './server/routes/reportRoutes.ts';
 import { startBackupScheduler, stopBackupScheduler } from './server/backupScheduler.ts';
 
 async function startServer() {
+  verifyAuthSecretsConfigured();
+
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
@@ -45,7 +49,7 @@ async function startServer() {
     })
   );
 
-  app.use(cookieParser());
+  app.use(cookieParser(process.env.SESSION_SECRET || process.env.AUTH_SECRET || undefined));
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -54,6 +58,7 @@ async function startServer() {
     res.json({ status: 'ok', store: 'New Bhama Fashions', system: 'Offline Retail ERP' });
   });
 
+  app.use('/api/gate', gateRoutes);
   app.use('/api/auth', authRoutes);
   app.use('/api/dashboard', dashboardRoutes);
   app.use('/api/products', productRoutes);
