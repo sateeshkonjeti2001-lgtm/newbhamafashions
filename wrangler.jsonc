@@ -14,7 +14,7 @@
     {
       "binding": "DB",
       "database_name": "new-bhama-fashions-erp-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "b2c08216-28af-4b65-9e6c-88fb07388143",
       "migrations_dir": "migrations"
     }
   ],
