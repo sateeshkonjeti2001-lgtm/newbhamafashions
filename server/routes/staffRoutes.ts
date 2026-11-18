@@ -1,16 +1,16 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 
 // Staff list
-router.get('/', (req: AuthenticatedRequest, res: Response) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
-    const staff = dbQueryAll(`
+    const staff = await dbQueryAll(`
       SELECT 
         s.id, s.name, s.phone, s.role_title, s.joining_date, s.address, s.emergency_contact, s.is_active, s.created_at
         ${isOwner ? ', s.monthly_salary' : ''}
@@ -24,7 +24,7 @@ router.get('/', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Create Staff (Owner only)
-router.post('/', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { name, phone, role_title, monthly_salary, joining_date, address, emergency_contact } = req.body;
     if (!name || !name.trim() || !role_title || !role_title.trim()) {
@@ -35,7 +35,7 @@ router.post('/', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Respon
     const id = 'stf_' + Date.now();
     const now = new Date().toISOString();
 
-    dbRun(`
+    await dbRun(`
       INSERT INTO staff (
         id, name, phone, role_title, monthly_salary, joining_date, address, emergency_contact, is_active, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -51,7 +51,7 @@ router.post('/', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Respon
       now
     ]);
 
-    logAudit(req.user?.id || 'OWNER', 'CREATE_STAFF', 'STAFF', id, { name, role: role_title });
+    await logAudit(req.user?.id || 'OWNER', 'CREATE_STAFF', 'STAFF', id, { name, role: role_title });
     res.json({ success: true, id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -59,7 +59,7 @@ router.post('/', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Respon
 });
 
 // Mark / Update Attendance for a date
-router.post('/attendance', (req: AuthenticatedRequest, res: Response) => {
+router.post('/attendance', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { staff_id, date, status, check_in_time, check_out_time, notes } = req.body;
     // status: 'PRESENT' | 'ABSENT' | 'HALF_DAY' | 'LEAVE'
@@ -77,7 +77,7 @@ router.post('/attendance', (req: AuthenticatedRequest, res: Response) => {
     const now = new Date().toISOString();
     const attId = 'att_' + Date.now();
 
-    dbRun(`
+    await dbRun(`
       INSERT INTO attendance (id, staff_id, date, status, check_in_time, check_out_time, notes, marked_by, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(staff_id, date) DO UPDATE SET
@@ -98,7 +98,7 @@ router.post('/attendance', (req: AuthenticatedRequest, res: Response) => {
       now
     ]);
 
-    logAudit(req.user?.id || 'USER', 'MARK_ATTENDANCE', 'ATTENDANCE', staff_id, { date, status });
+    await logAudit(req.user?.id || 'USER', 'MARK_ATTENDANCE', 'ATTENDANCE', staff_id, { date, status });
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -106,7 +106,7 @@ router.post('/attendance', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Get attendance for a date or month
-router.get('/attendance', (req: AuthenticatedRequest, res: Response) => {
+router.get('/attendance', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { date, month, year } = req.query;
     let sql = `
@@ -132,7 +132,7 @@ router.get('/attendance', (req: AuthenticatedRequest, res: Response) => {
     }
 
     sql += ' ORDER BY a.date DESC, s.name ASC';
-    const records = dbQueryAll(sql, params);
+    const records = await dbQueryAll(sql, params);
     res.json({ attendance: records });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -140,7 +140,7 @@ router.get('/attendance', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Record Staff Salary or Advance Payment (Owner only)
-router.post('/salary-payment', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/salary-payment', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { staff_id, month, year, payment_type, amount, payment_method = 'CASH', notes } = req.body;
     // payment_type: 'SALARY' | 'ADVANCE'
@@ -151,7 +151,7 @@ router.post('/salary-payment', requireRole(['OWNER']), (req: AuthenticatedReques
       return;
     }
 
-    const staffMember = dbQueryOne<any>('SELECT * FROM staff WHERE id = ?', [staff_id]);
+    const staffMember = await dbQueryOne<any>('SELECT * FROM staff WHERE id = ?', [staff_id]);
     if (!staffMember) {
       res.status(404).json({ error: 'Staff member not found' });
       return;
@@ -162,9 +162,9 @@ router.post('/salary-payment', requireRole(['OWNER']), (req: AuthenticatedReques
     const payId = 'spay_' + Date.now();
     const ftxId = 'ftx_staff_' + Date.now();
 
-    dbTransaction(() => {
+    await dbTransaction(async () => {
       // 1. Record salary payment
-      dbRun(`
+      await dbRun(`
         INSERT INTO salary_payments (
           id, staff_id, month, year, payment_type, amount, payment_method, notes, paid_by, financial_tx_id, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -183,7 +183,7 @@ router.post('/salary-payment', requireRole(['OWNER']), (req: AuthenticatedReques
       ]);
 
       // 2. Financial Transaction (STAFF_PAYMENT)
-      dbRun(`
+      await dbRun(`
         INSERT INTO financial_transactions (
           id, date, amount, source_account, destination_account, transaction_type,
           person_entity, category, purpose, payment_method, reference_no,
@@ -204,7 +204,7 @@ router.post('/salary-payment', requireRole(['OWNER']), (req: AuthenticatedReques
       ]);
     });
 
-    logAudit(req.user?.id || 'OWNER', 'STAFF_PAYMENT', 'STAFF', staff_id, {
+    await logAudit(req.user?.id || 'OWNER', 'STAFF_PAYMENT', 'STAFF', staff_id, {
       staff: staffMember.name,
       type: payment_type,
       amount: payAmt
@@ -217,7 +217,7 @@ router.post('/salary-payment', requireRole(['OWNER']), (req: AuthenticatedReques
 });
 
 // Staff payment history (Owner only)
-router.get('/salary-payments', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.get('/salary-payments', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { staff_id } = req.query;
     let sql = `
@@ -239,7 +239,7 @@ router.get('/salary-payments', requireRole(['OWNER']), (req: AuthenticatedReques
     }
 
     sql += ' ORDER BY sp.created_at DESC';
-    const payments = dbQueryAll(sql, params);
+    const payments = await dbQueryAll(sql, params);
     res.json({ payments });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

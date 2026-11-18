@@ -1,29 +1,28 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'path';
-import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
-import { getDb, saveDb } from './server/db.ts';
+import { saveDb } from './server/db.ts';
+import { initNodeDatabase } from './server/dbNode.ts';
+import { registerNodeBackupProvider } from './server/backupNode.ts';
 import { verifyAuthSecretsConfigured } from './server/auth.ts';
-
-import gateRoutes from './server/routes/gateRoutes.ts';
-import authRoutes from './server/routes/authRoutes.ts';
-import dashboardRoutes from './server/routes/dashboardRoutes.ts';
-import productRoutes from './server/routes/productRoutes.ts';
-import inventoryRoutes from './server/routes/inventoryRoutes.ts';
-import posRoutes from './server/routes/posRoutes.ts';
-import purchaseRoutes from './server/routes/purchaseRoutes.ts';
-import moneyRoutes from './server/routes/moneyRoutes.ts';
-import dueRoutes from './server/routes/dueRoutes.ts';
-import staffRoutes from './server/routes/staffRoutes.ts';
-import closingRoutes from './server/routes/closingRoutes.ts';
-import assetLoanRoutes from './server/routes/assetLoanRoutes.ts';
-import exportRoutes from './server/routes/exportRoutes.ts';
-import auditRoutes from './server/routes/auditRoutes.ts';
-import backupRoutes from './server/routes/backupRoutes.ts';
-import reportRoutes from './server/routes/reportRoutes.ts';
+import { createApiRouter } from './server/apiApp.ts';
+import { handleWebRouterFetch } from './server/webRouter.ts';
 import { startBackupScheduler, stopBackupScheduler } from './server/backupScheduler.ts';
+
+function readRawRequestBody(req: express.Request): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer | string) => {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    });
+    req.on('end', () => {
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', reject);
+  });
+}
 
 async function startServer() {
   verifyAuthSecretsConfigured();
@@ -34,8 +33,9 @@ async function startServer() {
   // Trust proxy: Cloud Run and reverse proxies forward client IP in X-Forwarded-For
   app.set('trust proxy', 1);
 
-  // Initialize SQLite database
-  await getDb();
+  // Initialize local Node SQLite database & backup provider
+  await initNodeDatabase();
+  registerNodeBackupProvider();
   console.log('✅ SQLite Database initialized successfully.');
 
   // Initialize persistent automatic backup scheduler
@@ -49,42 +49,78 @@ async function startServer() {
     })
   );
 
-  app.use(cookieParser(process.env.SESSION_SECRET || process.env.AUTH_SECRET || undefined));
-  app.use(express.json({ limit: '100mb' }));
-  app.use(express.urlencoded({ limit: '100mb', extended: true }));
+  // Unified API Router bridge (identical routing/auth/gate behavior to Cloudflare Worker)
+  const apiRouter = createApiRouter();
 
-  // API Routes
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', store: 'New Bhama Fashions', system: 'Offline Retail ERP' });
-  });
+  const handleApiBridge = async (req: express.Request, res: express.Response) => {
+    try {
+      const protocol = req.protocol || 'http';
+      const host = req.get('host') || `127.0.0.1:${PORT}`;
+      const targetUrl = `${protocol}://${host}${req.originalUrl || req.url}`;
 
-  app.use('/api/gate', gateRoutes);
-  app.use('/api/auth', authRoutes);
-  app.use('/api/dashboard', dashboardRoutes);
-  app.use('/api/products', productRoutes);
-  app.use('/api/inventory', inventoryRoutes);
-  app.use('/api/pos', posRoutes);
-  app.use('/api/purchases', purchaseRoutes);
-  app.use('/api/money', moneyRoutes);
-  app.use('/api/dues', dueRoutes);
-  app.use('/api/staff', staffRoutes);
-  app.use('/api/closing', closingRoutes);
-  app.use('/api/assets-loans', assetLoanRoutes);
-  app.use('/api/export', exportRoutes);
-  app.use('/api/audit', auditRoutes);
-  app.use('/api/backup', backupRoutes);
-  app.use('/api/reports', reportRoutes);
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (value === undefined) continue;
+        if (Array.isArray(value)) {
+          for (const v of value) headers.append(key, v);
+        } else {
+          headers.set(key, String(value));
+        }
+      }
+      if (!headers.has('x-forwarded-proto') && req.protocol) {
+        headers.set('x-forwarded-proto', req.protocol);
+      }
+      if (!headers.has('x-forwarded-for') && req.ip) {
+        headers.set('x-forwarded-for', req.ip);
+      }
 
-  // Catch-all 404 for unhandled API routes so they NEVER fall through to Vite SPA HTML fallback
-  app.all('/api/*', (req, res) => {
-    res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl || req.path}` });
-  });
+      const method = req.method.toUpperCase();
+      let body: BodyInit | undefined;
+      if (method !== 'GET' && method !== 'HEAD') {
+        const rawBytes = await readRawRequestBody(req);
+        if (rawBytes.byteLength > 0) {
+          body = rawBytes as unknown as BodyInit;
+        }
+      }
 
-  // Global error handler for API routes ensuring JSON responses
-  app.use('/api', (err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error('Unhandled API Error:', err);
-    res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
-  });
+      const webReq = new Request(targetUrl, {
+        method,
+        headers,
+        body,
+      });
+
+      const webRes = await handleWebRouterFetch(apiRouter, webReq);
+
+      res.status(webRes.status);
+
+      const getSetCookie = (webRes.headers as any).getSetCookie;
+      const setCookies: string[] = typeof getSetCookie === 'function' ? getSetCookie.call(webRes.headers) : [];
+
+      webRes.headers.forEach((value, key) => {
+        if (key.toLowerCase() === 'set-cookie') return;
+        res.setHeader(key, value);
+      });
+
+      if (setCookies.length > 0) {
+        res.setHeader('Set-Cookie', setCookies);
+      } else {
+        const fallbackCookie = webRes.headers.get('set-cookie');
+        if (fallbackCookie) {
+          res.setHeader('Set-Cookie', fallbackCookie);
+        }
+      }
+
+      const buf = Buffer.from(await webRes.arrayBuffer());
+      res.send(buf);
+    } catch (err: any) {
+      console.error('Unhandled API Bridge Error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    }
+  };
+
+  app.use('/api', handleApiBridge);
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
@@ -96,7 +132,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -105,7 +141,7 @@ async function startServer() {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 
-  // Graceful shutdown on Cloud Run container termination (SIGTERM)
+  // Graceful shutdown on container termination (SIGTERM)
   const shutdown = (signal: string) => {
     console.log(`🛑 Received ${signal}. Flushing database and shutting down gracefully...`);
     stopBackupScheduler();
@@ -119,7 +155,7 @@ async function startServer() {
       console.log('👋 HTTP server closed.');
       process.exit(0);
     });
-    // Force exit after 8 seconds (Cloud Run max grace is 10s)
+    // Force exit after 8 seconds
     setTimeout(() => {
       console.error('⚠️ Forcing process exit after timeout.');
       process.exit(1);

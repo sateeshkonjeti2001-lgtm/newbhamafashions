@@ -107,14 +107,20 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
     loadData();
   }, []);
 
+  const isD1 = health?.engine === 'cloudflare-d1';
+
   const handleCreateBackupNow = async () => {
     setCreatingBackup(true);
-    setBackupProgressStep('Exporting consistent SQLite binary database...');
+    setBackupProgressStep(
+      isD1 ? 'Exporting consistent Cloudflare D1 SQL snapshot...' : 'Exporting consistent SQLite binary database...'
+    );
     setManualSuccessMsg(null);
     setManualErrorMsg(null);
 
     try {
-      setBackupProgressStep('Validating SQLite PRAGMA integrity & SHA-256...');
+      setBackupProgressStep(
+        isD1 ? 'Validating table counts & SHA-256 checksum...' : 'Validating SQLite PRAGMA integrity & SHA-256...'
+      );
       const res = await api.createManualBackup('Manual backup created from Backup & Restore Dashboard');
 
       if (res.success && res.backup) {
@@ -142,10 +148,10 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
         ? `${(result.sizeBytes / (1024 * 1024)).toFixed(2)} MB`
         : `${(result.sizeBytes / 1024).toFixed(1)} KB`;
       setManualSuccessMsg(
-        `Verified SQLite database downloaded for local storage: ${result.filename} (${sizeText})`
+        `Verified ${isD1 ? 'Cloudflare D1 SQL' : 'SQLite'} database downloaded for local storage: ${result.filename} (${sizeText})`
       );
     } catch (err: any) {
-      setManualErrorMsg(err.message || 'Failed to download live SQLite database');
+      setManualErrorMsg(err.message || 'Failed to download live database');
     } finally {
       setDownloadingLiveDb(false);
     }
@@ -159,13 +165,17 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
     try {
       const res = await api.updateBackupSettings({
         auto_backup_enabled: autoEnabled,
-        schedule_time_ist: scheduleTime,
+        schedule_time_ist: isD1 ? '22:00' : scheduleTime,
         retention_daily_count: Number(dailyRetention) || 14,
         retention_weekly_count: Number(weeklyRetention) || 8,
       });
 
       if (res.success) {
-        setSettingsSuccess('Backup schedule & retention policy saved and rescheduled in the persistent background service.');
+        setSettingsSuccess(
+          isD1
+            ? 'Automatic backup toggle & retention policy saved for the Cloudflare Cron scheduler (22:00 IST / 16:30 UTC).'
+            : 'Backup schedule & retention policy saved and rescheduled in the persistent background service.'
+        );
         setTimeout(() => setSettingsSuccess(null), 5000);
         loadData();
       }
@@ -241,9 +251,24 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
 
-    if (!file.name.endsWith('.sqlite') && !file.name.endsWith('.db') && !file.name.endsWith('.nbfbak')) {
+    const lowerName = file.name.toLowerCase();
+    const isSqlFile = lowerName.endsWith('.sql');
+    const isSqliteFile =
+      lowerName.endsWith('.sqlite') || lowerName.endsWith('.db') || lowerName.endsWith('.nbfbak');
+
+    if (isD1 && !isSqlFile) {
+      alert(
+        isSqliteFile
+          ? 'Cloudflare D1 requires a .sql backup export. Binary .sqlite files cannot be restored directly on D1 (convert using scripts/export-sqlite-to-d1.ts).'
+          : 'Please select a valid Cloudflare D1 SQL backup file (.sql).'
+      );
+      return;
+    }
+
+    if (!isD1 && !isSqliteFile) {
       alert('Please select a valid SQLite backup file (.sqlite, .db, or .nbfbak)');
       return;
     }
@@ -280,10 +305,18 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
     try {
       let res: any;
       if (uploadedFile) {
-        setRestoreProgressMsg('2. Uploading file and running SQLite constraint checks...');
+        setRestoreProgressMsg(
+          isD1
+            ? '2. Validating SQL backup format, schema compatibility & OWNER safety...'
+            : '2. Uploading file and running SQLite constraint checks...'
+        );
         res = await api.uploadRestoreBackup(uploadedFile.name, uploadedFile.base64);
       } else if (selectedBackupForRestore) {
-        setRestoreProgressMsg('2. Loading backup buffer and validating foreign-key integrity...');
+        setRestoreProgressMsg(
+          isD1
+            ? '2. Validating D1 snapshot and applying atomic batch restore...'
+            : '2. Loading backup buffer and validating foreign-key integrity...'
+        );
         res = await api.restoreBackup(selectedBackupForRestore.id);
       } else {
         throw new Error('No backup selected for restore');
@@ -417,7 +450,11 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
           </div>
           <p className="text-[11px] text-[#6F6962]">
             {health?.autoBackupEnabled ? (
-              <span className="text-[#3F6B50] font-medium">Nightly at {settings?.schedule_time_ist || '22:00'} IST</span>
+              <span className="text-[#3F6B50] font-medium">
+                {isD1
+                  ? 'Nightly at 22:00 IST (16:30 UTC Cron)'
+                  : `Nightly at ${settings?.schedule_time_ist || '22:00'} IST`}
+              </span>
             ) : (
               <span className="text-[#A67C52]">Automatic scheduler paused</span>
             )}
@@ -436,7 +473,7 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
             {health?.totalValidBackups ?? 0} Valid Snapshots
           </div>
           <p className="text-[11px] text-[#6F6962]">
-            Disk used: {((health?.totalStorageBytes ?? 0) / (1024 * 1024)).toFixed(2)} MB
+            {isD1 ? 'D1 snapshots:' : 'Disk used:'} {((health?.totalStorageBytes ?? 0) / (1024 * 1024)).toFixed(2)} MB
           </p>
         </div>
       </div>
@@ -481,22 +518,22 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
             {downloadingLiveDb ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin text-[#A67C52]" />
-                <span>Preparing SQLite...</span>
+                <span>{isD1 ? 'Preparing SQL...' : 'Preparing SQLite...'}</span>
               </>
             ) : (
               <>
                 <Download className="w-4 h-4 text-[#A67C52]" />
-                <span>Download SQLite (.sqlite)</span>
+                <span>{isD1 ? 'Download D1 Backup (.sql)' : 'Download SQLite (.sqlite)'}</span>
               </>
             )}
           </button>
 
           <label className="px-4 py-2.5 bg-white hover:bg-[#FAF8F4] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center gap-2 transition cursor-pointer shadow-xs">
             <Upload className="w-4 h-4 text-[#A67C52]" />
-            <span>Upload Backup File</span>
+            <span>{isD1 ? 'Upload SQL Backup (.sql)' : 'Upload Backup File'}</span>
             <input
               type="file"
-              accept=".sqlite,.db,.nbfbak"
+              accept={isD1 ? '.sql' : '.sqlite,.db,.nbfbak'}
               onChange={handleFileUpload}
               className="hidden"
             />
@@ -595,15 +632,23 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
                   Daily Backup Time (India Standard Time)
                 </label>
                 <div className="relative">
-                  <input
-                    type="time"
-                    value={scheduleTime}
-                    onChange={(e) => setScheduleTime(e.target.value)}
-                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold focus:outline-none focus:border-[#A67C52]"
-                  />
+                  {isD1 ? (
+                    <div className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold">
+                      22:00 IST (16:30 UTC · Cloudflare Cron)
+                    </div>
+                  ) : (
+                    <input
+                      type="time"
+                      value={scheduleTime}
+                      onChange={(e) => setScheduleTime(e.target.value)}
+                      className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold focus:outline-none focus:border-[#A67C52]"
+                    />
+                  )}
                 </div>
                 <span className="text-[10px] text-[#6F6962] block mt-1">
-                  Default: 22:00 (10:00 PM IST) after retail store closing
+                  {isD1
+                    ? 'Managed by Cloudflare Worker Cron Trigger ("30 16 * * *" = 10:00 PM IST nightly)'
+                    : 'Default: 22:00 (10:00 PM IST) after retail store closing'}
                 </span>
               </div>
 
@@ -845,7 +890,7 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
                           {isSuccess && (
                             <button
                               onClick={() => api.downloadBackupFile(item.id, item.filename)}
-                              title="Download backup file (.sqlite)"
+                              title={`Download backup file (${isD1 ? '.sql' : '.sqlite'})`}
                               className="p-1.5 text-[#6F6962] hover:text-[#1C1917] hover:bg-white rounded-lg border border-transparent hover:border-[#D4CDC2] transition cursor-pointer"
                             >
                               <Download className="w-3.5 h-3.5 text-[#A67C52]" />
@@ -1099,7 +1144,9 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
                   Safety snapshot ID: <span className="font-mono font-bold">{restoreSuccessReport.preRestoreBackupId}</span>
                 </p>
                 <div className="text-[10px] text-[#1E6B37] font-mono">
-                  The live SQLite database has been replaced with the verified archive.
+                  {isD1
+                    ? 'The live Cloudflare D1 database has been restored from the validated SQL backup.'
+                    : 'The live SQLite database has been replaced with the verified archive.'}
                 </div>
               </div>
             )}

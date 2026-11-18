@@ -1,6 +1,6 @@
-import { Router, Response } from 'express';
-import fs from 'fs';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
+import { getDbEngine } from '../db.ts';
 import {
   getBackupHealth,
   getBackupHistory,
@@ -12,32 +12,31 @@ import {
   restoreDatabase,
   deleteBackup,
   toggleBackupLock,
-  getBackupById,
+  getBackupDownloadPayload,
   getLiveDatabaseInfo,
   exportVerifiedLiveDatabase,
   getDataSafetyStatus,
 } from '../backupService.ts';
 import { rescheduleBackup } from '../backupScheduler.ts';
-import { logAudit } from '../audit.ts';
 
-const router = Router();
+const router = new Router();
 
 // Protect all backup and restore endpoints: Owner only
 router.use(authMiddleware);
 router.use(requireRole(['OWNER']));
 
 // 1. Health Status & Overview
-router.get('/health', (req: AuthenticatedRequest, res: Response) => {
+router.get('/health', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const health = getBackupHealth();
+    const health = await getBackupHealth();
     res.json(health);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 1b. Real-Time Data Safety & Litestream Monitor
-router.get('/data-safety', async (req: AuthenticatedRequest, res: Response) => {
+// 1b. Real-Time Data Safety & Replication Monitor
+router.get('/data-safety', async (_req: AuthenticatedRequest, res: Response) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
     const status = await getDataSafetyStatus();
@@ -48,9 +47,9 @@ router.get('/data-safety', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 2. Backup History
-router.get('/history', (req: AuthenticatedRequest, res: Response) => {
+router.get('/history', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const history = getBackupHistory();
+    const history = await getBackupHistory();
     res.json({ history });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -58,19 +57,21 @@ router.get('/history', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 3. Settings (Schedule & Retention)
-router.get('/settings', (req: AuthenticatedRequest, res: Response) => {
+router.get('/settings', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const settings = getBackupSettings();
+    const settings = await getBackupSettings();
     res.json({ settings });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.put('/settings', (req: AuthenticatedRequest, res: Response) => {
+router.put('/settings', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const updated = updateBackupSettings(req.body, req.user?.id);
-    rescheduleBackup();
+    const updated = await updateBackupSettings(req.body, req.user?.id);
+    if (getDbEngine() === 'sqlite-node') {
+      await rescheduleBackup();
+    }
     res.json({ success: true, settings: updated });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -123,57 +124,49 @@ router.post('/test-restore/:id', async (req: AuthenticatedRequest, res: Response
 });
 
 // 7. Download Backup File
-router.get('/download/:id', (req: AuthenticatedRequest, res: Response) => {
+router.get('/download/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const record = getBackupById(id);
-    if (!record) {
-      res.status(404).json({ error: 'Backup not found' });
-      return;
-    }
-    if (!record.filepath || !fs.existsSync(record.filepath)) {
-      res.status(404).json({ error: 'Backup file missing on disk' });
+    const payload = await getBackupDownloadPayload(id, req.user?.id);
+    if (!payload) {
+      res.status(404).json({ error: 'Backup not found or payload unavailable' });
       return;
     }
 
-    logAudit(req.user?.id || 'SYSTEM', 'DOWNLOAD_BACKUP', 'BACKUP', id, {
-      filename: record.filename,
-      size: record.file_size,
-    });
-
-    res.setHeader('Content-Disposition', `attachment; filename="${record.filename}"`);
-    res.setHeader('Content-Type', 'application/x-sqlite3');
+    res.setHeader('Content-Disposition', `attachment; filename="${payload.filename}"`);
+    res.setHeader('Content-Type', payload.contentType);
+    res.setHeader('Content-Length', String(payload.size));
     res.setHeader('Cache-Control', 'no-store');
-    res.sendFile(record.filepath);
+    res.send(payload.data);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // 7b. Get Live Database Info (size, tables, records)
-router.get('/live-info', (req: AuthenticatedRequest, res: Response) => {
+router.get('/live-info', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const info = getLiveDatabaseInfo();
+    const info = await getLiveDatabaseInfo();
     res.json(info);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 7c. Direct Manual Download of Live SQLite Database
+// 7c. Direct Manual Download of Live Database
 router.get('/download-live', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const result = await exportVerifiedLiveDatabase(req.user?.id, req.user?.full_name);
 
     res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
-    res.setHeader('Content-Type', 'application/x-sqlite3');
+    res.setHeader('Content-Type', result.contentType);
     res.setHeader('Content-Length', String(result.size));
     res.setHeader('X-Backup-Checksum', result.sha256);
     res.setHeader('X-Database-Size', String(result.size));
     res.setHeader('Cache-Control', 'no-store');
     res.send(result.buffer);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to export verified SQLite database' });
+    res.status(500).json({ error: err.message || 'Failed to export verified database' });
   }
 });
 
@@ -188,7 +181,7 @@ router.post('/restore/:id', async (req: AuthenticatedRequest, res: Response) => 
 
     const result = await restoreDatabase(id, req.user.id, req.user.full_name);
     if (!result.success) {
-      res.status(500).json({
+      res.status(result.validationError ? 400 : 500).json({
         error: result.error,
         preRestoreBackupId: result.preRestoreBackupId,
       });
@@ -210,7 +203,7 @@ router.post('/restore/:id', async (req: AuthenticatedRequest, res: Response) => 
 router.post('/upload-restore', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { filename, fileData } = req.body;
-    if (!fileData) {
+    if (!fileData || typeof fileData !== 'string') {
       res.status(400).json({ error: 'No file data received' });
       return;
     }
@@ -219,15 +212,26 @@ router.post('/upload-restore', async (req: AuthenticatedRequest, res: Response) 
       return;
     }
 
-    const buffer = Buffer.from(fileData, 'base64');
-    if (buffer.length < 100) {
-      res.status(400).json({ error: 'Uploaded file is too small to be a valid SQLite database' });
+    const cleanB64 = fileData.includes(',') ? fileData.split(',')[1] : fileData;
+    const binary = atob(cleanB64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    if (bytes.byteLength < 100) {
+      res.status(400).json({ error: 'Uploaded file is too small to be a valid database backup' });
       return;
     }
 
-    const result = await restoreDatabase(buffer, req.user.id, req.user.full_name, filename || 'uploaded_backup.sqlite');
+    const result = await restoreDatabase(
+      bytes,
+      req.user.id,
+      req.user.full_name,
+      filename || 'uploaded_backup.sql'
+    );
     if (!result.success) {
-      res.status(500).json({
+      res.status(result.validationError ? 400 : 500).json({
         error: result.error,
         preRestoreBackupId: result.preRestoreBackupId,
       });
@@ -246,14 +250,14 @@ router.post('/upload-restore', async (req: AuthenticatedRequest, res: Response) 
 });
 
 // 10. Toggle Lock Status
-router.post('/toggle-lock/:id', (req: AuthenticatedRequest, res: Response) => {
+router.post('/toggle-lock/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     if (!req.user) {
       res.status(401).json({ error: 'Authentication required' });
       return;
     }
-    const result = toggleBackupLock(id, req.user.id);
+    const result = await toggleBackupLock(id, req.user.id);
     if (!result.success) {
       res.status(400).json({ error: result.error });
       return;
@@ -265,14 +269,14 @@ router.post('/toggle-lock/:id', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 11. Delete Backup
-router.delete('/:id', (req: AuthenticatedRequest, res: Response) => {
+router.delete('/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     if (!req.user) {
       res.status(401).json({ error: 'Authentication required' });
       return;
     }
-    const result = deleteBackup(id, req.user.id);
+    const result = await deleteBackup(id, req.user.id);
     if (!result.success) {
       res.status(400).json({ error: result.error });
       return;

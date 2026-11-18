@@ -1,16 +1,16 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 router.use(requireRole(['OWNER']));
 
 // ----------------- Assets -----------------
-router.get('/assets', (req: AuthenticatedRequest, res: Response) => {
+router.get('/assets', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const assets = dbQueryAll(`
+    const assets = await dbQueryAll(`
       SELECT 
         a.*,
         l.lender_name
@@ -24,7 +24,7 @@ router.get('/assets', (req: AuthenticatedRequest, res: Response) => {
   }
 });
 
-router.post('/assets', (req: AuthenticatedRequest, res: Response) => {
+router.post('/assets', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { name, purchase_date, purchase_value, funding_source, loan_id, payment_method = 'BANK', notes } = req.body;
     // funding_source: 'OWN_FUNDS' | 'LOAN' | 'OTHER'
@@ -39,8 +39,8 @@ router.post('/assets', (req: AuthenticatedRequest, res: Response) => {
     const now = new Date().toISOString();
     const pDate = purchase_date || now.split('T')[0];
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         INSERT INTO assets (
           id, name, purchase_date, purchase_value, funding_source, loan_id, current_status, notes, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
@@ -58,7 +58,7 @@ router.post('/assets', (req: AuthenticatedRequest, res: Response) => {
       // If funded from own business money, record ASSET_PURCHASE financial transaction
       if (funding_source === 'OWN_FUNDS') {
         const ftxId = 'ftx_ast_' + Date.now();
-        dbRun(`
+        await dbRun(`
           INSERT INTO financial_transactions (
             id, date, amount, source_account, destination_account, transaction_type,
             person_entity, category, purpose, payment_method, reference_no,
@@ -80,7 +80,7 @@ router.post('/assets', (req: AuthenticatedRequest, res: Response) => {
       }
     });
 
-    logAudit(req.user?.id || 'OWNER', 'CREATE_ASSET', 'ASSET', assetId, { name, value: val });
+    await logAudit(req.user?.id || 'OWNER', 'CREATE_ASSET', 'ASSET', assetId, { name, value: val });
     res.json({ success: true, id: assetId });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -88,12 +88,12 @@ router.post('/assets', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Dispose / Sell Asset
-router.post('/assets/:id/dispose', (req: AuthenticatedRequest, res: Response) => {
+router.post('/assets/:id/dispose', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { disposal_date, disposal_value, payment_method = 'BANK', disposal_notes } = req.body;
 
-    const asset = dbQueryOne<any>('SELECT * FROM assets WHERE id = ?', [id]);
+    const asset = await dbQueryOne<any>('SELECT * FROM assets WHERE id = ?', [id]);
     if (!asset) {
       res.status(404).json({ error: 'Asset not found' });
       return;
@@ -104,8 +104,8 @@ router.post('/assets/:id/dispose', (req: AuthenticatedRequest, res: Response) =>
     const now = new Date().toISOString();
     const dDate = disposal_date || now.split('T')[0];
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         UPDATE assets SET
           current_status = 'SOLD',
           disposal_date = ?,
@@ -117,7 +117,7 @@ router.post('/assets/:id/dispose', (req: AuthenticatedRequest, res: Response) =>
 
       if (dVal > 0) {
         const ftxId = 'ftx_ast_sale_' + Date.now();
-        dbRun(`
+        await dbRun(`
           INSERT INTO financial_transactions (
             id, date, amount, source_account, destination_account, transaction_type,
             person_entity, category, purpose, payment_method, reference_no,
@@ -139,7 +139,7 @@ router.post('/assets/:id/dispose', (req: AuthenticatedRequest, res: Response) =>
       }
     });
 
-    logAudit(req.user?.id || 'OWNER', 'DISPOSE_ASSET', 'ASSET', id, {
+    await logAudit(req.user?.id || 'OWNER', 'DISPOSE_ASSET', 'ASSET', id, {
       name: asset.name,
       disposal_value: dVal,
       profitOrLoss
@@ -152,9 +152,9 @@ router.post('/assets/:id/dispose', (req: AuthenticatedRequest, res: Response) =>
 });
 
 // ----------------- Loans -----------------
-router.get('/loans', (req: AuthenticatedRequest, res: Response) => {
+router.get('/loans', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const loans = dbQueryAll(`
+    const loans = await dbQueryAll(`
       SELECT 
         l.*,
         COUNT(lr.id) as total_repayments_count
@@ -170,7 +170,7 @@ router.get('/loans', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Record New Loan Received
-router.post('/loans', (req: AuthenticatedRequest, res: Response) => {
+router.post('/loans', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { lender_name, loan_amount, loan_date, interest_info, payment_method = 'BANK', notes } = req.body;
 
@@ -184,8 +184,8 @@ router.post('/loans', (req: AuthenticatedRequest, res: Response) => {
     const now = new Date().toISOString();
     const lDate = loan_date || now.split('T')[0];
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         INSERT INTO loans (
           id, lender_name, loan_amount, loan_date, interest_info, total_repaid, outstanding_balance, status, notes, created_at
         ) VALUES (?, ?, ?, ?, ?, 0, ?, 'ACTIVE', ?, ?)
@@ -202,7 +202,7 @@ router.post('/loans', (req: AuthenticatedRequest, res: Response) => {
 
       // Loan receipt into business accounts (LOAN_RECEIVED)
       const ftxId = 'ftx_loan_' + Date.now();
-      dbRun(`
+      await dbRun(`
         INSERT INTO financial_transactions (
           id, date, amount, source_account, destination_account, transaction_type,
           person_entity, category, purpose, payment_method, reference_no,
@@ -223,7 +223,7 @@ router.post('/loans', (req: AuthenticatedRequest, res: Response) => {
       ]);
     });
 
-    logAudit(req.user?.id || 'OWNER', 'CREATE_LOAN', 'LOAN', loanId, { lender: lender_name, amount: amt });
+    await logAudit(req.user?.id || 'OWNER', 'CREATE_LOAN', 'LOAN', loanId, { lender: lender_name, amount: amt });
     res.json({ success: true, id: loanId });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -231,12 +231,12 @@ router.post('/loans', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Record Loan Repayment
-router.post('/loans/:id/repay', (req: AuthenticatedRequest, res: Response) => {
+router.post('/loans/:id/repay', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { principal_amount, interest_amount = 0, payment_method = 'BANK', repayment_date, notes } = req.body;
 
-    const loan = dbQueryOne<any>('SELECT * FROM loans WHERE id = ?', [id]);
+    const loan = await dbQueryOne<any>('SELECT * FROM loans WHERE id = ?', [id]);
     if (!loan) {
       res.status(404).json({ error: 'Loan record not found' });
       return;
@@ -266,9 +266,9 @@ router.post('/loans/:id/repay', (req: AuthenticatedRequest, res: Response) => {
     const repayId = 'lrp_' + Date.now();
     const ftxId = 'ftx_lrp_' + Date.now();
 
-    dbTransaction(() => {
+    await dbTransaction(async () => {
       // 1. Update loan
-      dbRun(`
+      await dbRun(`
         UPDATE loans SET
           total_repaid = ?,
           outstanding_balance = ?,
@@ -277,7 +277,7 @@ router.post('/loans/:id/repay', (req: AuthenticatedRequest, res: Response) => {
       `, [newTotalRepaid, newOutstanding, newStatus, id]);
 
       // 2. Insert repayment log
-      dbRun(`
+      await dbRun(`
         INSERT INTO loan_repayments (
           id, loan_id, repayment_date, principal_amount, interest_amount, total_amount, payment_method, notes, financial_tx_id, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -295,7 +295,7 @@ router.post('/loans/:id/repay', (req: AuthenticatedRequest, res: Response) => {
       ]);
 
       // 3. Financial Transaction for repayment
-      dbRun(`
+      await dbRun(`
         INSERT INTO financial_transactions (
           id, date, amount, source_account, destination_account, transaction_type,
           person_entity, category, purpose, payment_method, reference_no,
@@ -316,7 +316,7 @@ router.post('/loans/:id/repay', (req: AuthenticatedRequest, res: Response) => {
       ]);
     });
 
-    logAudit(req.user?.id || 'OWNER', 'REPAY_LOAN', 'LOAN', id, {
+    await logAudit(req.user?.id || 'OWNER', 'REPAY_LOAN', 'LOAN', id, {
       lender: loan.lender_name,
       principal: pAmt,
       interest: iAmt,

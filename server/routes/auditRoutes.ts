@@ -1,12 +1,12 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 router.use(requireRole(['OWNER']));
 
-router.get('/', (req: AuthenticatedRequest, res: Response) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { entity_type, action, limit = 100 } = req.query;
     let sql = `
@@ -34,9 +34,10 @@ router.get('/', (req: AuthenticatedRequest, res: Response) => {
     sql += ' ORDER BY a.created_at DESC LIMIT ?';
     params.push(Number(limit) || 100);
 
-    const logs = dbQueryAll(sql, params).map((l) => ({
+    const rows = await dbQueryAll(sql, params);
+    const logs = rows.map((l) => ({
       ...l,
-      details: l.details ? JSON.parse(l.details) : null
+      details: l.details ? JSON.parse(l.details) : null,
     }));
 
     res.json({ logs });

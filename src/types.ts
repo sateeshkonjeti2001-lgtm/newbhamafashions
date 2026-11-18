@@ -355,6 +355,7 @@ export interface BackupRecord {
 }
 
 export interface BackupHealth {
+  engine?: 'sqlite-node' | 'cloudflare-d1';
   status: 'HEALTHY' | 'BACKUP_DUE' | 'FAILED' | 'VERIFICATION_REQUIRED' | 'RESTORE_TEST_REQUIRED';
   lastSuccessfulBackup: BackupRecord | null;
   lastAttemptedBackup: BackupRecord | null;
@@ -402,6 +403,7 @@ export interface DryRunRestoreReport {
 
 export interface DataSafetyStatus {
   checkedAt: string;
+  engine?: 'sqlite-node' | 'cloudflare-d1';
   database: {
     filename: string;
     filepath: string;
@@ -423,7 +425,7 @@ export interface DataSafetyStatus {
     shadowLastUpdatedAt: string | null;
     latestSnapshotAt: string | null;
     latestGeneration: string | null;
-    status: 'REPLICATING' | 'DEGRADED' | 'STANDALONE_LOCAL';
+    status: 'REPLICATING' | 'DEGRADED' | 'STANDALONE_LOCAL' | 'D1_CLOUDFLARE';
     statusLabel: string;
     statusDetail: string;
   };

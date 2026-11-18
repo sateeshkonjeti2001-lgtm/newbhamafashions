@@ -88,7 +88,7 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
       const res = await api.downloadLiveDatabase();
       setActionMessage({
         type: 'success',
-        text: `Downloaded verified SQLite copy: ${res.filename}`,
+        text: `Downloaded verified database copy: ${res.filename}`,
       });
       await fetchStatus(false);
     } catch (err: any) {
@@ -143,7 +143,7 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
       <div className="bg-white border border-[#E3DED5] rounded-2xl p-10 text-center space-y-2.5 shadow-[0_2px_12px_rgba(23,21,19,0.03)]">
         <RefreshCw className="w-6 h-6 animate-spin text-[#A67C52] mx-auto" />
         <p className="text-xs font-medium text-[#6F6962]">
-          Checking Litestream replication, SQLite storage &amp; backup status...
+          Checking database persistence, storage metrics &amp; backup status...
         </p>
       </div>
     );
@@ -153,8 +153,10 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
   const db = status?.database;
   const bak = status?.backup;
 
+  const isD1 = ls?.status === 'D1_CLOUDFLARE' || status?.engine === 'cloudflare-d1';
+
   const lsBadgeClasses =
-    ls?.status === 'REPLICATING'
+    ls?.status === 'REPLICATING' || ls?.status === 'D1_CLOUDFLARE'
       ? 'bg-[#EBF7EE] text-[#1E6B37] border-[#BDE5C8]'
       : ls?.status === 'DEGRADED'
       ? 'bg-[#FDF5F5] text-[#A34F4F] border-[#F0CCCC]'
@@ -239,8 +241,12 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
                     <Cloud className="w-4 h-4 text-[#A67C52]" />
                   </div>
                   <div>
-                    <h4 className="font-bold text-sm text-[#1C1917]">Litestream Replication</h4>
-                    <p className="text-[11px] text-[#6F6962]">Continuous GCS WAL Sync</p>
+                    <h4 className="font-bold text-sm text-[#1C1917]">
+                      {isD1 ? 'Cloudflare D1 Storage' : 'Litestream Replication'}
+                    </h4>
+                    <p className="text-[11px] text-[#6F6962]">
+                      {isD1 ? 'Edge SQLite Persistence' : 'Continuous GCS WAL Sync'}
+                    </p>
                   </div>
                 </div>
                 <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold border ${lsBadgeClasses}`}>
@@ -252,28 +258,30 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
 
               <div className="bg-[#FAF8F4] border border-[#E3DED5] rounded-xl p-3 space-y-2 text-xs">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-[#6F6962]">Target Bucket:</span>
+                  <span className="text-[#6F6962]">{isD1 ? 'Storage Backend:' : 'Target Bucket:'}</span>
                   <span className="font-mono text-[11px] font-semibold text-[#1C1917] truncate max-w-[190px]">
                     {ls.replicaPath || 'Not set (Local mode)'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-[#6F6962]">Replicate Process:</span>
+                  <span className="text-[#6F6962]">{isD1 ? 'Database Status:' : 'Replicate Process:'}</span>
                   <span
                     className={`font-semibold ${
                       ls.processRunning ? 'text-[#1E6B37]' : 'text-[#6F6962]'
                     }`}
                   >
-                    {ls.processRunning ? 'Running' : 'Inactive'}
+                    {ls.processRunning ? (isD1 ? 'Connected' : 'Running') : 'Inactive'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[#6F6962]">Binary &amp; Config:</span>
-                  <span className="font-medium text-[#1C1917]">
-                    {ls.binaryInstalled ? 'Installed' : 'Not installed'} &middot;{' '}
-                    {ls.configPath ? 'Configured' : 'Missing'}
-                  </span>
-                </div>
+                {!isD1 && (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[#6F6962]">Binary &amp; Config:</span>
+                    <span className="font-medium text-[#1C1917]">
+                      {ls.binaryInstalled ? 'Installed' : 'Not installed'} &middot;{' '}
+                      {ls.configPath ? 'Configured' : 'Missing'}
+                    </span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-[#6F6962]">Retention Policy:</span>
                   <span className="font-mono text-[11px] text-[#1C1917]">
@@ -306,7 +314,7 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
                   </div>
                 </div>
                 <span className="text-[10px] px-2.5 py-0.5 rounded-full font-bold bg-[#FAF8F4] text-[#A67C52] border border-[#E3DED5]">
-                  SQLite
+                  {isD1 ? 'Cloudflare D1' : 'SQLite'}
                 </span>
               </div>
 
@@ -315,7 +323,7 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
                   {formatBytes(db.sizeBytes)}
                 </p>
                 <p className="text-[11px] text-[#6F6962] font-mono mt-0.5">
-                  {db.sizeBytes.toLocaleString('en-IN')} bytes on disk
+                  {db.sizeBytes.toLocaleString('en-IN')} {isD1 ? 'bytes (estimated D1 footprint)' : 'bytes on disk'}
                 </p>
               </div>
 
@@ -326,14 +334,16 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
                     {db.totalTables} tables &middot; {db.totalRecords.toLocaleString('en-IN')} rows
                   </span>
                 </div>
+                {!isD1 && (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[#6F6962]">WAL / SHM Overhead:</span>
+                    <span className="font-mono text-[11px] text-[#1C1917]">
+                      {formatBytes(db.walSizeBytes)}
+                    </span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-[#6F6962]">WAL / SHM Overhead:</span>
-                  <span className="font-mono text-[11px] text-[#1C1917]">
-                    {formatBytes(db.walSizeBytes)}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[#6F6962]">Last Disk Write:</span>
+                  <span className="text-[#6F6962]">{isD1 ? 'Last Record Update:' : 'Last Disk Write:'}</span>
                   <span className="font-medium text-[11px] text-[#1C1917] text-right">
                     {formatIstDateTime(db.lastModifiedAt)}
                   </span>
@@ -348,7 +358,13 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
               className="w-full py-2 px-3 bg-[#FAF8F4] hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
             >
               <Download className="w-3.5 h-3.5 text-[#A67C52]" />
-              <span>{downloadingDb ? 'Exporting Verified Copy...' : 'Download Live .sqlite Copy'}</span>
+              <span>
+                {downloadingDb
+                  ? 'Exporting Verified Copy...'
+                  : isD1
+                  ? 'Download Live .sql Backup'
+                  : 'Download Live .sqlite Copy'}
+              </span>
             </button>
           </div>
 
@@ -418,7 +434,7 @@ export const DataSafetyMonitor: React.FC<DataSafetyMonitorProps> = ({
                   </>
                 ) : (
                   <p className="text-[11px] text-[#6F6962]">
-                    No local backup snapshot has been created yet. Create your first snapshot below.
+                    No backup snapshot has been created yet. Create your first snapshot below.
                   </p>
                 )}
 

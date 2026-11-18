@@ -1,10 +1,10 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryOne, dbQueryAll } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
 
-const router = Router();
+const router = new Router();
 
-router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const todayStr = new Date().toISOString().split('T')[0];
@@ -12,10 +12,10 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     const isToday = targetDate === todayStr;
 
     // 1. Store Details
-    const storeNameRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_name']);
-    const storeLocationRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_location']);
-    const storeTaglineRow = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_tagline']);
-    const phone1Row = dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['contact_phone_1']);
+    const storeNameRow = await dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_name']);
+    const storeLocationRow = await dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_location']);
+    const storeTaglineRow = await dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['store_tagline']);
+    const phone1Row = await dbQueryOne<{ value: string }>('SELECT value FROM store_settings WHERE key = ?', ['contact_phone_1']);
 
     const storeInfo = {
       name: storeNameRow?.value || 'New Bhama Fashions',
@@ -24,8 +24,8 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       phone: phone1Row?.value || '6305782832',
     };
 
-    // 2. Sales Metrics for targetDate (only completed sales, exactly counted once)
-    const salesSummary = dbQueryOne<any>(`
+    // 2. Sales Metrics for targetDate
+    const salesSummary = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as total_bills,
         COALESCE(SUM(total_amount), 0) as gross_sales,
@@ -41,7 +41,7 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         COALESCE(SUM(CASE WHEN channel != 'MANUAL' OR channel IS NULL THEN total_amount ELSE 0 END), 0) as pos_bills_total
       FROM sales 
       WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
-    `, [targetDate]) || {
+    `, [targetDate])) || {
       total_bills: 0,
       gross_sales: 0,
       cash_sales: 0,
@@ -57,7 +57,7 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     };
 
     // 3. Returns and Refunds for targetDate
-    const returnsSummary = dbQueryOne<any>(`
+    const returnsSummary = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as return_count,
         COALESCE(SUM(refund_amount), 0) as total_refunds,
@@ -65,14 +65,14 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         COALESCE(SUM(CASE WHEN refund_method = 'UPI' THEN refund_amount ELSE 0 END), 0) as upi_refunds
       FROM sale_returns
       WHERE DATE(created_at) = ?
-    `, [targetDate]) || { return_count: 0, total_refunds: 0, cash_refunds: 0, upi_refunds: 0 };
+    `, [targetDate])) || { return_count: 0, total_refunds: 0, cash_refunds: 0, upi_refunds: 0 };
 
     const netSales = Math.max(0, salesSummary.gross_sales - returnsSummary.total_refunds);
     const netSalesCash = Math.max(0, salesSummary.cash_sales - returnsSummary.cash_refunds);
     const netSalesUpi = Math.max(0, salesSummary.upi_sales - returnsSummary.upi_refunds);
 
-    // 4. Customer Due Collections on targetDate (Credit settlements received)
-    const dueCollections = dbQueryOne<any>(`
+    // 4. Customer Due Collections on targetDate
+    const dueCollections = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as count,
         COALESCE(SUM(amount), 0) as total_collected,
@@ -82,51 +82,47 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       WHERE date = ? 
         AND transaction_type = 'CUSTOMER_DUE_COLLECTION'
         AND is_reversed = 0
-    `, [targetDate]) || { count: 0, total_collected: 0, cash_collected: 0, upi_collected: 0 };
+    `, [targetDate])) || { count: 0, total_collected: 0, cash_collected: 0, upi_collected: 0 };
 
-    // Actual Collections Today
     const cashReceivedToday = netSalesCash + dueCollections.cash_collected;
     const upiReceivedToday = netSalesUpi + dueCollections.upi_collected;
 
-    // 5. Customer Dues Outstanding (unpaid customer balances across the business)
-    const customerDuesSummary = dbQueryOne<any>(`
+    // 5. Customer Dues Outstanding
+    const customerDuesSummary = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as pending_count,
         COALESCE(SUM(balance_due), 0) as total_pending_dues,
         COUNT(DISTINCT customer_id) as customer_count
       FROM customer_dues 
       WHERE status = 'PENDING' AND balance_due > 0
-    `) || { pending_count: 0, total_pending_dues: 0, customer_count: 0 };
+    `)) || { pending_count: 0, total_pending_dues: 0, customer_count: 0 };
 
     // 6. Current Cash Drawer Balance per Cash Ledger
-    // All cash in minus all cash out in financial_transactions
-    const cashInRow = dbQueryOne<any>(`
+    const cashInRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total 
       FROM financial_transactions 
       WHERE destination_account = 'CASH' AND is_reversed = 0
     `);
-    const cashOutRow = dbQueryOne<any>(`
+    const cashOutRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total 
       FROM financial_transactions 
       WHERE source_account = 'CASH' AND is_reversed = 0
     `);
     const currentCashBalance = Math.round(((cashInRow?.total || 0) - (cashOutRow?.total || 0)) * 100) / 100;
 
-    // Target date cash movements
-    const dateCashInRow = dbQueryOne<any>(`
+    const dateCashInRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total 
       FROM financial_transactions 
       WHERE destination_account = 'CASH' AND date = ? AND is_reversed = 0
     `, [targetDate]);
-    const dateCashOutRow = dbQueryOne<any>(`
+    const dateCashOutRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total 
       FROM financial_transactions 
       WHERE source_account = 'CASH' AND date = ? AND is_reversed = 0
     `, [targetDate]);
 
-    // 7. Today's Operating Expenses for targetDate
-    // Query expenses table
-    const expenseTable = dbQueryOne<any>(`
+    // 7. Operating Expenses for targetDate
+    const expenseTable = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as count,
         COALESCE(SUM(amount), 0) as total_expenses,
@@ -134,10 +130,9 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         COALESCE(SUM(CASE WHEN payment_method = 'UPI' THEN amount ELSE 0 END), 0) as upi_expenses
       FROM expenses 
       WHERE date = ?
-    `, [targetDate]) || { count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
+    `, [targetDate])) || { count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
 
-    // Also check financial_transactions for OPERATING_EXPENSE
-    const ftExpenses = dbQueryOne<any>(`
+    const ftExpenses = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as count,
         COALESCE(SUM(amount), 0) as total_expenses,
@@ -145,24 +140,24 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         COALESCE(SUM(CASE WHEN destination_account = 'UPI' OR source_account = 'UPI' OR payment_method = 'UPI' THEN amount ELSE 0 END), 0) as upi_expenses
       FROM financial_transactions
       WHERE date = ? AND transaction_type = 'OPERATING_EXPENSE' AND is_reversed = 0
-    `, [targetDate]) || { count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
+    `, [targetDate])) || { count: 0, total_expenses: 0, cash_expenses: 0, upi_expenses: 0 };
 
     const totalExpenses = Math.max(expenseTable.total_expenses, ftExpenses.total_expenses);
     const cashExpenses = Math.max(expenseTable.cash_expenses, ftExpenses.cash_expenses);
     const upiExpenses = Math.max(expenseTable.upi_expenses, ftExpenses.upi_expenses);
     const expenseCount = Math.max(expenseTable.count, ftExpenses.count);
 
-    // 8. Supplier Outstanding (Unpaid supplier balances)
-    const supplierDuesSummary = dbQueryOne<any>(`
+    // 8. Supplier Outstanding
+    const supplierDuesSummary = (await dbQueryOne<any>(`
       SELECT 
         COUNT(*) as pending_count,
         COALESCE(SUM(balance_due), 0) as total_supplier_dues
       FROM purchases 
       WHERE balance_due > 0
-    `) || { pending_count: 0, total_supplier_dues: 0 };
+    `)) || { pending_count: 0, total_supplier_dues: 0 };
 
-    // 9. Day Closing / Reconciliation Status for targetDate
-    const dailyClosing = dbQueryOne<any>(`
+    // 9. Day Closing Status
+    const dailyClosing = await dbQueryOne<any>(`
       SELECT 
         dc.id, 
         dc.closing_date, 
@@ -181,23 +176,20 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
 
     const isDayClosed = dailyClosing?.status === 'CLOSED';
 
-    // Opening cash lookup (from daily closing record or previous closed date)
     let openingCash = dailyClosing?.opening_cash || 0;
     if (!dailyClosing || dailyClosing.opening_cash === undefined) {
-      const prevClosing = dbQueryOne<any>(
+      const prevClosing = await dbQueryOne<any>(
         'SELECT actual_counted_cash FROM daily_closings WHERE closing_date < ? ORDER BY closing_date DESC LIMIT 1',
         [targetDate]
       );
       openingCash = prevClosing ? prevClosing.actual_counted_cash : 0;
     }
 
-    // Expected closing cash for target date
-    const expectedClosingCash = Math.round(
-      (openingCash + (dateCashInRow?.total || 0) - (dateCashOutRow?.total || 0)) * 100
-    ) / 100;
+    const expectedClosingCash =
+      Math.round((openingCash + (dateCashInRow?.total || 0) - (dateCashOutRow?.total || 0)) * 100) / 100;
 
-    // 10. Low Stock Alerts (quantity <= 3)
-    const stockAlerts = dbQueryAll(`
+    // 10. Low Stock Alerts
+    const stockAlerts = await dbQueryAll(`
       SELECT 
         p.id,
         p.name,
@@ -216,7 +208,7 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     `);
 
     // 11. Recent Sales for targetDate
-    const recentSales = dbQueryAll(`
+    const recentSales = await dbQueryAll(`
       SELECT 
         id, 
         bill_number, 
@@ -235,8 +227,8 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       LIMIT 6
     `, [targetDate]);
 
-    // 12. Available business dates with recorded sales (for date browsing)
-    const availableDates = dbQueryAll<{ sale_date: string; count: number; total: number }>(`
+    // 12. Available dates
+    const availableDates = await dbQueryAll<{ sale_date: string; count: number; total: number }>(`
       SELECT 
         DATE(created_at) as sale_date, 
         COUNT(*) as count,
@@ -248,8 +240,7 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       LIMIT 15
     `);
 
-    // Total products count
-    const totalProducts = dbQueryOne<any>('SELECT COUNT(*) as c FROM products WHERE is_active = 1')?.c || 0;
+    const totalProducts = (await dbQueryOne<any>('SELECT COUNT(*) as c FROM products WHERE is_active = 1'))?.c || 0;
     const lowStockCount = stockAlerts.filter((s: any) => s.current_stock > 0).length;
     const outOfStockCount = stockAlerts.filter((s: any) => s.current_stock <= 0).length;
 
@@ -259,7 +250,6 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       isOwner,
       store: storeInfo,
 
-      // Summary Row 1: Sales & Collections
       sales: {
         total_sales: netSales,
         gross_sales: salesSummary.gross_sales,
@@ -284,7 +274,6 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         due_upi: dueCollections.upi_collected,
       },
 
-      // Summary Row 2: Outstanding & Expenses
       customerDues: {
         total_pending: customerDuesSummary.total_pending_dues,
         pending_count: customerDuesSummary.pending_count,
@@ -305,7 +294,6 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         count: expenseCount,
       },
 
-      // Bottom Section: Supplier Outstanding & Day Closing & Manual Bills Count
       supplierOutstanding: {
         total_pending: supplierDuesSummary.total_supplier_dues,
         pending_count: supplierDuesSummary.pending_count,
@@ -328,7 +316,6 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         credit_amount: salesSummary.manual_credit_sales,
       },
 
-      // Navigation & Auxiliary Details
       recentSales,
       stockAlerts,
       availableDates,
@@ -338,7 +325,6 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         out_of_stock: outOfStockCount,
       },
 
-      // Legacy field aliases for backwards compatibility
       todaySales: {
         total: netSales,
         bills_count: salesSummary.total_bills,

@@ -1,28 +1,28 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
-const router = Router();
+const router = new Router();
 
 router.use(authMiddleware);
 
 // Get real account balances (Cash, UPI, Bank) computed from real transactions
-router.get('/accounts', (req: AuthenticatedRequest, res: Response) => {
+router.get('/accounts', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
 
     // Sum all movements into and out of CASH, UPI, BANK
-    const cashIn = dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE destination_account = 'CASH'")?.s || 0;
-    const cashOut = dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE source_account = 'CASH'")?.s || 0;
+    const cashIn = (await dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE destination_account = 'CASH'"))?.s || 0;
+    const cashOut = (await dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE source_account = 'CASH'"))?.s || 0;
     const cashBalance = cashIn - cashOut;
 
-    const upiIn = dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE destination_account = 'UPI'")?.s || 0;
-    const upiOut = dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE source_account = 'UPI'")?.s || 0;
+    const upiIn = (await dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE destination_account = 'UPI'"))?.s || 0;
+    const upiOut = (await dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE source_account = 'UPI'"))?.s || 0;
     const upiBalance = upiIn - upiOut;
 
-    const bankIn = dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE destination_account = 'BANK'")?.s || 0;
-    const bankOut = dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE source_account = 'BANK'")?.s || 0;
+    const bankIn = (await dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE destination_account = 'BANK'"))?.s || 0;
+    const bankOut = (await dbQueryOne<any>("SELECT COALESCE(SUM(amount), 0) as s FROM financial_transactions WHERE source_account = 'BANK'"))?.s || 0;
     const bankBalance = bankIn - bankOut;
 
     res.json({
@@ -38,7 +38,7 @@ router.get('/accounts', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Financial Transactions list
-router.get('/transactions', (req: AuthenticatedRequest, res: Response) => {
+router.get('/transactions', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const { start_date, end_date, type, account, limit = 100 } = req.query;
@@ -78,7 +78,7 @@ router.get('/transactions', (req: AuthenticatedRequest, res: Response) => {
     sql += ' ORDER BY ft.date DESC, ft.created_at DESC LIMIT ?';
     params.push(Number(limit) || 100);
 
-    const transactions = dbQueryAll(sql, params);
+    const transactions = await dbQueryAll(sql, params);
     res.json({ transactions });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -86,7 +86,7 @@ router.get('/transactions', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Record Manual Financial Entry (Expense, Owner Capital, Withdrawal, Transfer, Other)
-router.post('/transactions', (req: AuthenticatedRequest, res: Response) => {
+router.post('/transactions', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       date,
@@ -127,7 +127,7 @@ router.post('/transactions', (req: AuthenticatedRequest, res: Response) => {
     const txId = 'ftx_' + Date.now();
 
     // Check if the business day is already closed for this date
-    const closingRecord = dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [txDate]);
+    const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [txDate]);
     if (closingRecord && closingRecord.status === 'CLOSED') {
       res.status(400).json({
         error: `The business day for ${txDate} is already CLOSED. You cannot back-insert entries into a closed day. Please record as today's date or create a formal correction.`
@@ -135,8 +135,8 @@ router.post('/transactions', (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         INSERT INTO financial_transactions (
           id, date, amount, source_account, destination_account, transaction_type,
           person_entity, category, purpose, payment_method, reference_no, notes,
@@ -163,7 +163,7 @@ router.post('/transactions', (req: AuthenticatedRequest, res: Response) => {
       // If it's an operating expense, also mirror in expenses table for easy expense reporting
       if (transaction_type === 'OPERATING_EXPENSE') {
         const expId = 'exp_' + Date.now();
-        dbRun(`
+        await dbRun(`
           INSERT INTO expenses (
             id, date, category, amount, payment_method, paid_to, purpose, reference_no, user_id, financial_tx_id, day_closed, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
@@ -183,7 +183,7 @@ router.post('/transactions', (req: AuthenticatedRequest, res: Response) => {
       }
     });
 
-    logAudit(req.user?.id || 'USER', 'CREATE_FINANCIAL_TRANSACTION', 'FINANCIAL', txId, {
+    await logAudit(req.user?.id || 'USER', 'CREATE_FINANCIAL_TRANSACTION', 'FINANCIAL', txId, {
       type: transaction_type,
       amount: amt,
       purpose
@@ -197,12 +197,12 @@ router.post('/transactions', (req: AuthenticatedRequest, res: Response) => {
 
 // Rule 10: Manual Entry Editing & Correction Rule
 // Direct edit only during the same unclosed business day
-router.put('/transactions/:id', (req: AuthenticatedRequest, res: Response) => {
+router.put('/transactions/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { amount, purpose, category, person_entity, payment_method, notes } = req.body;
 
-    const existing = dbQueryOne<any>('SELECT * FROM financial_transactions WHERE id = ?', [id]);
+    const existing = await dbQueryOne<any>('SELECT * FROM financial_transactions WHERE id = ?', [id]);
     if (!existing) {
       res.status(404).json({ error: 'Transaction not found' });
       return;
@@ -219,7 +219,7 @@ router.put('/transactions/:id', (req: AuthenticatedRequest, res: Response) => {
     // Check if day is closed
     const today = new Date().toISOString().split('T')[0];
     const isPastDay = existing.date < today;
-    const closingRecord = dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [existing.date]);
+    const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [existing.date]);
     const isClosed = existing.day_closed || (closingRecord && closingRecord.status === 'CLOSED');
 
     if (isClosed || isPastDay) {
@@ -237,8 +237,8 @@ router.put('/transactions/:id', (req: AuthenticatedRequest, res: Response) => {
 
     const now = new Date().toISOString();
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         UPDATE financial_transactions SET
           amount = ?,
           purpose = ?,
@@ -260,7 +260,7 @@ router.put('/transactions/:id', (req: AuthenticatedRequest, res: Response) => {
       ]);
 
       // If mirrored in expenses, update it too
-      dbRun(`
+      await dbRun(`
         UPDATE expenses SET
           amount = ?,
           purpose = ?,
@@ -278,7 +278,7 @@ router.put('/transactions/:id', (req: AuthenticatedRequest, res: Response) => {
       ]);
     });
 
-    logAudit(req.user?.id || 'USER', 'EDIT_MANUAL_TRANSACTION', 'FINANCIAL', id, {
+    await logAudit(req.user?.id || 'USER', 'EDIT_MANUAL_TRANSACTION', 'FINANCIAL', id, {
       old_amount: existing.amount,
       new_amount: amt,
       purpose
@@ -291,7 +291,7 @@ router.put('/transactions/:id', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Rule 10: Correction / Reversal Entry for past or closed days
-router.post('/transactions/:id/correct', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/transactions/:id/correct', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { new_amount, reason } = req.body;
@@ -301,7 +301,7 @@ router.post('/transactions/:id/correct', requireRole(['OWNER']), (req: Authentic
       return;
     }
 
-    const original = dbQueryOne<any>('SELECT * FROM financial_transactions WHERE id = ?', [id]);
+    const original = await dbQueryOne<any>('SELECT * FROM financial_transactions WHERE id = ?', [id]);
     if (!original) {
       res.status(404).json({ error: 'Original transaction not found' });
       return;
@@ -318,9 +318,9 @@ router.post('/transactions/:id/correct', requireRole(['OWNER']), (req: Authentic
     const today = now.split('T')[0];
     const corrId = 'corr_' + Date.now();
 
-    dbTransaction(() => {
+    await dbTransaction(async () => {
       // 1. Record in financial_corrections
-      dbRun(`
+      await dbRun(`
         INSERT INTO financial_corrections (
           id, original_tx_id, correction_date, difference_amount, reason, user_id, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -340,7 +340,7 @@ router.post('/transactions/:id/correct', requireRole(['OWNER']), (req: Authentic
         const isIncrease = difference > 0;
         const absDiff = Math.abs(difference);
 
-        dbRun(`
+        await dbRun(`
           INSERT INTO financial_transactions (
             id, date, amount, source_account, destination_account, transaction_type,
             person_entity, category, purpose, payment_method, reference_no, notes,
@@ -366,7 +366,7 @@ router.post('/transactions/:id/correct', requireRole(['OWNER']), (req: Authentic
       }
     });
 
-    logAudit(req.user?.id || 'OWNER', 'FINANCIAL_CORRECTION', 'FINANCIAL', id, {
+    await logAudit(req.user?.id || 'OWNER', 'FINANCIAL_CORRECTION', 'FINANCIAL', id, {
       original_amount: original.amount,
       corrected_amount: newAmt,
       difference,
@@ -380,7 +380,7 @@ router.post('/transactions/:id/correct', requireRole(['OWNER']), (req: Authentic
 });
 
 // Profit & Loss / COGS Calculation (Strict Accounting logic) - Owner only
-router.get('/profit-loss', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.get('/profit-loss', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { start_date, end_date } = req.query;
     const today = new Date().toISOString().split('T')[0];
@@ -388,7 +388,7 @@ router.get('/profit-loss', requireRole(['OWNER']), (req: AuthenticatedRequest, r
     const end = (end_date as string) || today;
 
     // Real Sales Revenue (Active COMPLETED sales)
-    const salesRow = dbQueryOne<any>(`
+    const salesRow = await dbQueryOne<any>(`
       SELECT 
         COALESCE(SUM(total_amount), 0) as gross_sales,
         COALESCE(SUM(discount_amount), 0) as total_discounts,
@@ -399,7 +399,7 @@ router.get('/profit-loss', requireRole(['OWNER']), (req: AuthenticatedRequest, r
     `, [start, end]);
 
     // Returns / Refunds in this period
-    const returnsRow = dbQueryOne<any>(`
+    const returnsRow = await dbQueryOne<any>(`
       SELECT 
         COALESCE(SUM(refund_amount), 0) as total_refunds,
         COALESCE(SUM(cogs_reversed), 0) as total_cogs_reversed
@@ -408,7 +408,7 @@ router.get('/profit-loss', requireRole(['OWNER']), (req: AuthenticatedRequest, r
     `, [start, end]);
 
     // Real COGS (from sale_items calculated via FIFO purchase batches on completed sales)
-    const cogsRow = dbQueryOne<any>(`
+    const cogsRow = await dbQueryOne<any>(`
       SELECT 
         COALESCE(SUM(si.cogs), 0) as total_cogs
       FROM sale_items si
@@ -418,7 +418,7 @@ router.get('/profit-loss', requireRole(['OWNER']), (req: AuthenticatedRequest, r
     `, [start, end]);
 
     // Operating Expenses ONLY (Excludes inventory purchase, supplier payment, capital, withdrawal, loans)
-    const expenseRow = dbQueryOne<any>(`
+    const expenseRow = await dbQueryOne<any>(`
       SELECT 
         COALESCE(SUM(amount), 0) as total_operating_expenses
       FROM financial_transactions

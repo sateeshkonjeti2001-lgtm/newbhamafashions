@@ -4,14 +4,14 @@ import {
   calculateNextScheduledTime,
 } from './backupService.ts';
 
-let schedulerTimer: NodeJS.Timeout | null = null;
+let schedulerTimer: ReturnType<typeof setTimeout> | null = null;
 let retryCount = 0;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 15 * 60 * 1000; // 15 minutes
 
 export function startBackupScheduler() {
   console.log('⏰ [Backup Scheduler] Initializing persistent automatic backup service...');
-  rescheduleBackup();
+  void rescheduleBackup();
 }
 
 export function stopBackupScheduler() {
@@ -21,33 +21,36 @@ export function stopBackupScheduler() {
   }
 }
 
-export function rescheduleBackup() {
+export async function rescheduleBackup(): Promise<void> {
   stopBackupScheduler();
 
-  const settings = getBackupSettings();
-  if (!settings.auto_backup_enabled) {
-    console.log('⏸️ [Backup Scheduler] Automatic backups currently disabled by store owner.');
-    return;
+  try {
+    const settings = await getBackupSettings();
+    if (!settings.auto_backup_enabled) {
+      console.log('⏸️ [Backup Scheduler] Automatic backups currently disabled by store owner.');
+      return;
+    }
+
+    const { nextIso, nextDisplay, msUntilNext } = calculateNextScheduledTime(settings.schedule_time_ist);
+    console.log(`⏳ [Backup Scheduler] Next automatic backup scheduled for: ${nextDisplay} (${nextIso}) [in ${Math.round(msUntilNext / 60000)} minutes]`);
+
+    schedulerTimer = setTimeout(async () => {
+      await executeScheduledBackup();
+    }, msUntilNext);
+  } catch (err: any) {
+    console.error('[Backup Scheduler] Failed to schedule backup:', err?.message || err);
   }
-
-  const { nextIso, nextDisplay, msUntilNext } = calculateNextScheduledTime(settings.schedule_time_ist);
-  console.log(`⏳ [Backup Scheduler] Next automatic backup scheduled for: ${nextDisplay} (${nextIso}) [in ${Math.round(msUntilNext / 60000)} minutes]`);
-
-  // Node setTimeout max is 2147483647 ms (~24.8 days). Daily timer is ~86400000 ms, safely within range.
-  schedulerTimer = setTimeout(async () => {
-    await executeScheduledBackup();
-  }, msUntilNext);
 }
 
 async function executeScheduledBackup() {
-  const settings = getBackupSettings();
-  if (!settings.auto_backup_enabled) {
-    rescheduleBackup();
-    return;
-  }
-
-  console.log('🚀 [Backup Scheduler] Executing scheduled automatic database backup...');
   try {
+    const settings = await getBackupSettings();
+    if (!settings.auto_backup_enabled) {
+      await rescheduleBackup();
+      return;
+    }
+
+    console.log('🚀 [Backup Scheduler] Executing scheduled automatic database backup...');
     const result = await createBackup(
       'AUTOMATIC',
       'SYSTEM_SCHEDULER',
@@ -76,6 +79,5 @@ async function executeScheduledBackup() {
     }
   }
 
-  // Reschedule for next day
-  rescheduleBackup();
+  await rescheduleBackup();
 }

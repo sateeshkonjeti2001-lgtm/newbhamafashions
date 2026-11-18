@@ -1,18 +1,18 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction, saveDb } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
-const router = Router();
+const router = new Router();
 
 // Protect all supplier and purchase endpoints so only OWNER can access
 router.use(authMiddleware);
 router.use(requireRole(['OWNER']));
 
 // Suppliers List
-router.get('/suppliers', (req: AuthenticatedRequest, res: Response) => {
+router.get('/suppliers', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const suppliers = dbQueryAll(`
+    const suppliers = await dbQueryAll(`
       SELECT 
         s.*,
         COALESCE(SUM(p.balance_due), 0) as total_dues,
@@ -29,7 +29,7 @@ router.get('/suppliers', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Create Supplier
-router.post('/suppliers', (req: AuthenticatedRequest, res: Response) => {
+router.post('/suppliers', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { name, phone, email, address, gst_or_pan, notes } = req.body;
     if (!name || !name.trim()) {
@@ -40,7 +40,7 @@ router.post('/suppliers', (req: AuthenticatedRequest, res: Response) => {
     const id = 'sup_' + Date.now();
     const now = new Date().toISOString();
 
-    dbRun(`
+    await dbRun(`
       INSERT INTO suppliers (id, name, phone, email, address, gst_or_pan, notes, is_active, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
     `, [
@@ -51,11 +51,11 @@ router.post('/suppliers', (req: AuthenticatedRequest, res: Response) => {
       address?.trim() || null,
       gst_or_pan?.trim() || null,
       notes?.trim() || null,
-      now
+      now,
     ]);
     saveDb(true);
 
-    logAudit(req.user?.id || 'OWNER', 'CREATE_SUPPLIER', 'SUPPLIER', id, { name });
+    await logAudit(req.user?.id || 'OWNER', 'CREATE_SUPPLIER', 'SUPPLIER', id, { name });
     res.json({ success: true, id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -63,7 +63,7 @@ router.post('/suppliers', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Purchases List
-router.get('/', (req: AuthenticatedRequest, res: Response) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { supplier_id, status } = req.query;
     let sql = `
@@ -91,7 +91,7 @@ router.get('/', (req: AuthenticatedRequest, res: Response) => {
 
     sql += ' ORDER BY p.invoice_date DESC, p.created_at DESC';
 
-    const purchases = dbQueryAll(sql, params);
+    const purchases = await dbQueryAll(sql, params);
     res.json({ purchases });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -99,10 +99,10 @@ router.get('/', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Purchase details with items
-router.get('/:id', (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const purchase = dbQueryOne<any>(`
+    const purchase = await dbQueryOne<any>(`
       SELECT 
         p.*,
         s.name as supplier_name,
@@ -120,7 +120,7 @@ router.get('/:id', (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    const items = dbQueryAll(`
+    const items = await dbQueryAll(`
       SELECT 
         pi.*,
         pr.name as product_name,
@@ -137,7 +137,7 @@ router.get('/:id', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Record Purchase Invoice & Stock In
-router.post('/', (req: AuthenticatedRequest, res: Response) => {
+router.post('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       supplier_id,
@@ -145,8 +145,8 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
       invoice_date,
       items,
       paid_amount = 0,
-      payment_method = 'CASH', // 'CASH' | 'UPI' | 'BANK'
-      notes
+      payment_method = 'CASH',
+      notes,
     } = req.body;
 
     if (!supplier_id) {
@@ -164,7 +164,7 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    const supplier = dbQueryOne<any>('SELECT * FROM suppliers WHERE id = ?', [supplier_id]);
+    const supplier = await dbQueryOne<any>('SELECT * FROM suppliers WHERE id = ?', [supplier_id]);
     if (!supplier) {
       res.status(404).json({ error: 'Supplier not found' });
       return;
@@ -174,7 +174,7 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
     const validatedItems: any[] = [];
 
     for (const it of items) {
-      const product = dbQueryOne<any>('SELECT * FROM products WHERE id = ?', [it.product_id]);
+      const product = await dbQueryOne<any>('SELECT * FROM products WHERE id = ?', [it.product_id]);
       if (!product) {
         res.status(400).json({ error: `Product not found: ${it.product_id}` });
         return;
@@ -190,7 +190,7 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
         quantity: qty,
         unit_cost: unitCost,
         total_cost: totalItemCost,
-        batch_number: it.batch_number?.trim() || invoice_number.trim()
+        batch_number: it.batch_number?.trim() || invoice_number.trim(),
       });
     }
 
@@ -202,9 +202,8 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
     const now = new Date().toISOString();
     const invDate = invoice_date ? invoice_date : now.split('T')[0];
 
-    dbTransaction(() => {
-      // 1. Insert Purchase
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         INSERT INTO purchases (
           id, supplier_id, invoice_number, invoice_date, total_amount,
           paid_amount, balance_due, payment_status, payment_method, notes,
@@ -222,15 +221,14 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
         paidNum > 0 ? payment_method : null,
         notes?.trim() || null,
         req.user?.id || 'OWNER',
-        now
+        now,
       ]);
 
-      // 2. Insert items, create purchase batches, and ledger entries
       for (const it of validatedItems) {
         const purchaseItemId = 'pi_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
         const batchId = 'batch_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
 
-        dbRun(`
+        await dbRun(`
           INSERT INTO purchase_items (
             id, purchase_id, product_id, variant_id, quantity, unit_cost, total_cost, batch_number, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -243,10 +241,10 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
           it.unit_cost,
           it.total_cost,
           it.batch_number,
-          now
+          now,
         ]);
 
-        dbRun(`
+        await dbRun(`
           INSERT INTO purchase_batches (
             id, purchase_item_id, product_id, variant_id, batch_number, initial_qty, remaining_qty, unit_cost, received_date, is_active, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -260,11 +258,10 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
           it.quantity,
           it.unit_cost,
           invDate,
-          now
+          now,
         ]);
 
-        // Stock Ledger entry
-        dbRun(`
+        await dbRun(`
           INSERT INTO stock_ledger (
             id, product_id, variant_id, batch_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
           ) VALUES (?, ?, ?, ?, 'PURCHASE', ?, ?, 'PURCHASE', ?, ?, ?, ?)
@@ -278,17 +275,15 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
           purchaseId,
           `Purchase Invoice #${invoice_number}`,
           req.user?.id || 'OWNER',
-          now
+          now,
         ]);
 
-        // Update product latest purchase cost
-        dbRun('UPDATE products SET purchase_cost = ? WHERE id = ?', [it.unit_cost, it.product_id]);
+        await dbRun('UPDATE products SET purchase_cost = ? WHERE id = ?', [it.unit_cost, it.product_id]);
       }
 
-      // 3. Financial Transaction for paid amount (Distinct from operating expense!)
       if (paidNum > 0) {
         const ftxId = 'ftx_sup_' + Date.now();
-        dbRun(`
+        await dbRun(`
           INSERT INTO financial_transactions (
             id, date, amount, source_account, destination_account, transaction_type,
             person_entity, category, purpose, payment_method, reference_no,
@@ -298,24 +293,24 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
           ftxId,
           invDate,
           paidNum,
-          payment_method, // CASH | UPI | BANK
+          payment_method,
           supplier.name,
           `Purchase Invoice #${invoice_number}`,
           payment_method,
           invoice_number,
           req.user?.id || 'OWNER',
           now,
-          now
+          now,
         ]);
       }
     });
     saveDb(true);
 
-    logAudit(req.user?.id || 'OWNER', 'CREATE_PURCHASE', 'PURCHASE', purchaseId, {
+    await logAudit(req.user?.id || 'OWNER', 'CREATE_PURCHASE', 'PURCHASE', purchaseId, {
       invoice_number,
       supplier: supplier.name,
       total: calculatedTotalCost,
-      paid: paidNum
+      paid: paidNum,
     });
 
     res.json({ success: true, id: purchaseId });
@@ -325,12 +320,12 @@ router.post('/', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Pay Supplier Outstanding Due
-router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
+router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { amount, payment_method = 'CASH', notes } = req.body;
 
-    const purchase = dbQueryOne<any>(`
+    const purchase = await dbQueryOne<any>(`
       SELECT p.*, s.name as supplier_name 
       FROM purchases p 
       JOIN suppliers s ON p.supplier_id = s.id 
@@ -350,7 +345,7 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
 
     if (payNum > purchase.balance_due) {
       res.status(400).json({
-        error: `Payment amount ₹${payNum} cannot exceed outstanding balance due ₹${purchase.balance_due}`
+        error: `Payment amount ₹${payNum} cannot exceed outstanding balance due ₹${purchase.balance_due}`,
       });
       return;
     }
@@ -361,8 +356,8 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
     const now = new Date().toISOString();
     const today = now.split('T')[0];
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         UPDATE purchases SET
           paid_amount = ?,
           balance_due = ?,
@@ -370,9 +365,8 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
         WHERE id = ?
       `, [newPaid, newBalance, newStatus, id]);
 
-      // Financial transaction for supplier payment (not operating expense!)
       const ftxId = 'ftx_sup_due_' + Date.now();
-      dbRun(`
+      await dbRun(`
         INSERT INTO financial_transactions (
           id, date, amount, source_account, destination_account, transaction_type,
           person_entity, category, purpose, payment_method, reference_no,
@@ -389,15 +383,15 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
         purchase.invoice_number,
         req.user?.id || 'OWNER',
         now,
-        now
+        now,
       ]);
     });
     saveDb(true);
 
-    logAudit(req.user?.id || 'OWNER', 'PAY_SUPPLIER_DUE', 'PURCHASE', id, {
+    await logAudit(req.user?.id || 'OWNER', 'PAY_SUPPLIER_DUE', 'PURCHASE', id, {
       supplier: purchase.supplier_name,
       amount: payNum,
-      balance: newBalance
+      balance: newBalance,
     });
 
     res.json({ success: true, balance_due: newBalance });

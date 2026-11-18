@@ -1,25 +1,27 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import * as XLSX from 'xlsx';
 import { dbQueryAll } from '../db.ts';
 import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 
 function sendExcelBuffer(res: Response, data: Record<string, any>[], sheetName: string, fileName: string) {
   const ws = XLSX.utils.json_to_sheet(data.length > 0 ? data : [{ Info: 'No real records found in database' }]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, sheetName);
-  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  const arrayBuf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+  const bytes = new Uint8Array(arrayBuf);
   res.setHeader('Content-Disposition', `attachment; filename="${fileName}.xlsx"`);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.send(buf);
+  res.setHeader('Content-Length', String(bytes.byteLength));
+  res.send(bytes);
 }
 
 // 1. Sales Register Excel
-router.get('/sales', (req: AuthenticatedRequest, res: Response) => {
+router.get('/sales', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const sales = dbQueryAll(`
+    const sales = await dbQueryAll(`
       SELECT 
         s.bill_number as 'Bill Number',
         s.created_at as 'Date & Time',
@@ -46,10 +48,10 @@ router.get('/sales', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 2. Inventory / Stock Report Excel
-router.get('/inventory', (req: AuthenticatedRequest, res: Response) => {
+router.get('/inventory', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
-    let sql = `
+    const sql = `
       SELECT 
         p.name as 'Product Name',
         p.code as 'Item Code',
@@ -69,7 +71,7 @@ router.get('/inventory', (req: AuthenticatedRequest, res: Response) => {
       GROUP BY p.id
       ORDER BY p.name ASC
     `;
-    const rows = dbQueryAll(sql);
+    const rows = await dbQueryAll(sql);
     sendExcelBuffer(res, rows, 'Stock', `NBF_Stock_Inventory_${Date.now()}`);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -77,9 +79,9 @@ router.get('/inventory', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 3. Daily Closing Records Excel
-router.get('/daily-closings', (req: AuthenticatedRequest, res: Response) => {
+router.get('/daily-closings', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const closings = dbQueryAll(`
+    const closings = await dbQueryAll(`
       SELECT 
         dc.closing_date as 'Date',
         dc.opening_cash as 'Opening Cash (₹)',
@@ -108,9 +110,9 @@ router.get('/daily-closings', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 4. Customer Dues / Credit Ledger Excel
-router.get('/customer-dues', (req: AuthenticatedRequest, res: Response) => {
+router.get('/customer-dues', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const dues = dbQueryAll(`
+    const dues = await dbQueryAll(`
       SELECT 
         c.name as 'Customer Name',
         c.phone as 'Phone Number',
@@ -133,9 +135,9 @@ router.get('/customer-dues', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // 5. Purchases & Supplier Dues Excel (Owner only)
-router.get('/purchases', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.get('/purchases', requireRole(['OWNER']), async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const purchases = dbQueryAll(`
+    const purchases = await dbQueryAll(`
       SELECT 
         p.invoice_number as 'Invoice Number',
         p.invoice_date as 'Invoice Date',
@@ -158,9 +160,9 @@ router.get('/purchases', requireRole(['OWNER']), (req: AuthenticatedRequest, res
 });
 
 // 6. Expenses Register Excel (Owner only)
-router.get('/expenses', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.get('/expenses', requireRole(['OWNER']), async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const expenses = dbQueryAll(`
+    const expenses = await dbQueryAll(`
       SELECT 
         e.date as 'Date',
         e.category as 'Category',
@@ -181,9 +183,9 @@ router.get('/expenses', requireRole(['OWNER']), (req: AuthenticatedRequest, res:
 });
 
 // 7. Cashbook / Money Flow Excel (Owner only)
-router.get('/money-flow', requireRole(['OWNER']), (req: AuthenticatedRequest, res: Response) => {
+router.get('/money-flow', requireRole(['OWNER']), async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const transactions = dbQueryAll(`
+    const transactions = await dbQueryAll(`
       SELECT 
         ft.date as 'Date',
         ft.amount as 'Amount (₹)',

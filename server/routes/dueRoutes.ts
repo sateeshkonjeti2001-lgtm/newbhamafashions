@@ -1,34 +1,34 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction, saveDb } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
+import { randomHex } from '../cryptoUtil.ts';
+import {
+  getIdempotencyRecord,
+  insertIdempotencyRecord,
+  isIdempotencyConflictError,
+} from '../idempotency.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 
+const SYNC_CUSTOMER_DUES_SQL =
+  "UPDATE customers SET total_dues = COALESCE((SELECT SUM(balance_due) FROM customer_dues WHERE customer_id = ? AND status = 'PENDING'), 0) WHERE id = ?";
+
 // Synchronize customers.total_dues with the sum of active pending customer_dues
-export function syncCustomerBalance(customerId: string): number {
+export async function syncCustomerBalance(customerId: string): Promise<number> {
   if (!customerId) return 0;
-  const sumRow = dbQueryOne<any>(
+  const sumRow = await dbQueryOne<any>(
     "SELECT COALESCE(SUM(balance_due), 0) as pending FROM customer_dues WHERE customer_id = ? AND status = 'PENDING'",
     [customerId]
   );
   const pending = Number(sumRow?.pending) || 0;
-  dbRun('UPDATE customers SET total_dues = ? WHERE id = ?', [pending, customerId]);
+  await dbRun('UPDATE customers SET total_dues = ? WHERE id = ?', [pending, customerId]);
   return pending;
 }
 
-// In-memory cache to prevent duplicate repayment clicks/submissions
-const recentRepayments = new Map<string, { timestamp: number; response: any }>();
-function pruneRecentRepayments() {
-  const expiry = Date.now() - 30 * 1000;
-  for (const [k, v] of recentRepayments.entries()) {
-    if (v.timestamp < expiry) recentRepayments.delete(k);
-  }
-}
-
 // Get all customers with pending or total dues
-router.get('/customers', (req: AuthenticatedRequest, res: Response) => {
+router.get('/customers', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { search, pending_only } = req.query;
     let sql = `
@@ -63,7 +63,7 @@ router.get('/customers', (req: AuthenticatedRequest, res: Response) => {
 
     sql += ' ORDER BY current_pending_dues DESC, c.name ASC';
 
-    const customers = dbQueryAll(sql, params);
+    const customers = await dbQueryAll(sql, params);
     res.json({ customers });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -71,7 +71,7 @@ router.get('/customers', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Get individual dues ledger for customer or all dues
-router.get('/', (req: AuthenticatedRequest, res: Response) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { customer_id, status } = req.query;
     let sql = `
@@ -100,7 +100,7 @@ router.get('/', (req: AuthenticatedRequest, res: Response) => {
 
     sql += ' ORDER BY cd.created_at DESC';
 
-    const dues = dbQueryAll(sql, params);
+    const dues = await dbQueryAll(sql, params);
     res.json({ dues });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -108,10 +108,10 @@ router.get('/', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Single due detail with sale items and payment history
-router.get('/:id', (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const due = dbQueryOne<any>(`
+    const due = await dbQueryOne<any>(`
       SELECT 
         cd.*,
         c.name as customer_name,
@@ -131,14 +131,12 @@ router.get('/:id', (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    // Associated items from the sale
     let items: any[] = [];
     if (due.sale_id) {
-      items = dbQueryAll('SELECT * FROM sale_items WHERE sale_id = ?', [due.sale_id]);
+      items = await dbQueryAll('SELECT * FROM sale_items WHERE sale_id = ?', [due.sale_id]);
     }
 
-    // Payment history for this due
-    const payments = dbQueryAll(`
+    const payments = await dbQueryAll(`
       SELECT 
         cdp.*,
         u.full_name as received_by_name
@@ -155,19 +153,25 @@ router.get('/:id', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Collect Customer Due Payment
-router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
+router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { amount, payment_method = 'CASH', notes, idempotency_key } = req.body;
 
-    pruneRecentRepayments();
-    const clientKey = (req.headers['x-idempotency-key'] as string) || (typeof idempotency_key === 'string' ? idempotency_key.trim() : null);
-    if (clientKey && recentRepayments.has(clientKey)) {
-      res.json(recentRepayments.get(clientKey)!.response);
-      return;
+    const rawClientKey =
+      req.headers['x-idempotency-key'] || (typeof idempotency_key === 'string' ? idempotency_key.trim() : '');
+    const clientKey = typeof rawClientKey === 'string' && rawClientKey.trim() ? rawClientKey.trim() : null;
+    const scopedIdempotencyKey = clientKey ? `due_pay:${id}:${clientKey}` : null;
+
+    if (scopedIdempotencyKey) {
+      const cached = await getIdempotencyRecord(scopedIdempotencyKey);
+      if (cached) {
+        res.json(cached);
+        return;
+      }
     }
 
-    const due = dbQueryOne<any>(`
+    const due = await dbQueryOne<any>(`
       SELECT cd.*, c.name as customer_name, s.bill_number
       FROM customer_dues cd
       JOIN customers c ON cd.customer_id = c.id
@@ -180,100 +184,172 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    const payNum = Number(amount);
-    if (!payNum || payNum <= 0) {
+    const payNum = Math.round(Number(amount) * 100) / 100;
+    if (!Number.isFinite(payNum) || payNum <= 0) {
       res.status(400).json({ error: 'Valid positive amount is required' });
       return;
     }
 
-    if (payNum > due.balance_due) {
+    if (!['CASH', 'UPI', 'BANK'].includes(payment_method)) {
+      res.status(400).json({ error: 'Invalid payment method. Must be CASH, UPI, or BANK.' });
+      return;
+    }
+
+    const currentBalanceSnapshot = Math.round(Number(due.balance_due) * 100) / 100;
+    if (due.status === 'CLEARED' || payNum > currentBalanceSnapshot) {
       res.status(400).json({
-        error: `Payment amount ₹${payNum} cannot exceed current outstanding balance ₹${due.balance_due}`
+        error: `Payment amount ₹${payNum} cannot exceed current outstanding balance ₹${currentBalanceSnapshot}`,
       });
       return;
     }
 
-    const newPaid = due.amount_paid + payNum;
-    const newBalance = due.balance_due - payNum;
-    const newStatus = newBalance === 0 ? 'CLEARED' : 'PENDING';
     const now = new Date().toISOString();
     const today = now.split('T')[0];
 
-    const paymentId = 'cdp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
-    const ftxId = 'ftx_due_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+    const paymentId = 'cdp_' + Date.now() + '_' + randomHex(4);
+    const ftxId = 'ftx_due_' + Date.now() + '_' + randomHex(4);
 
-    dbTransaction(() => {
-      // 1. Update customer_dues
-      dbRun(`
-        UPDATE customer_dues SET
-          amount_paid = ?,
-          balance_due = ?,
-          status = ?,
-          updated_at = ?
-        WHERE id = ?
-      `, [newPaid, newBalance, newStatus, now, id]);
+    let updatedBalance = Math.max(0, Math.round((currentBalanceSnapshot - payNum) * 100) / 100);
+    let updatedStatus: 'PENDING' | 'CLEARED' = updatedBalance <= 0 ? 'CLEARED' : 'PENDING';
 
-      // 2. Synchronize customer total_dues
-      syncCustomerBalance(due.customer_id);
+    try {
+      await dbTransaction(async () => {
+        if (scopedIdempotencyKey) {
+          // Insert PK first so duplicate-key retries fail cleanly before modifying customer_dues;
+          // response_json is updated atomically in the same batch right after customer_dues is updated.
+          await insertIdempotencyRecord(scopedIdempotencyKey, 'DUE_PAY', {
+            success: true,
+            balance_due: updatedBalance,
+            status: updatedStatus,
+            payment_id: paymentId,
+          });
+        }
 
-      // 3. Record payment in customer_due_payments
-      dbRun(`
-        INSERT INTO customer_due_payments (
-          id, customer_due_id, customer_id, amount, payment_method, notes, received_by, financial_tx_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        paymentId,
-        id,
-        due.customer_id,
-        payNum,
-        payment_method, // CASH | UPI | BANK
-        notes?.trim() || null,
-        req.user?.id || 'STAFF',
-        ftxId,
-        now
-      ]);
+        // Atomic SQL-side arithmetic prevents lost-update races; trigger trg_customer_dues_prevent_overpay
+        // aborts the entire batch/transaction if concurrent payments exceed remaining balance_due.
+        await dbRun(`
+          UPDATE customer_dues SET
+            amount_paid = ROUND(amount_paid + ?, 2),
+            balance_due = ROUND(balance_due - ?, 2),
+            status = CASE WHEN ROUND(balance_due - ?, 2) <= 0 THEN 'CLEARED' ELSE 'PENDING' END,
+            updated_at = ?
+          WHERE id = ?
+        `, [payNum, payNum, payNum, now, id]);
 
-      // 4. Financial Transaction (Real cash/upi into the business)
-      dbRun(`
-        INSERT INTO financial_transactions (
-          id, date, amount, source_account, destination_account, transaction_type,
-          person_entity, category, purpose, payment_method, reference_no,
-          is_system_generated, user_id, created_at, updated_at
-        ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'CUSTOMER_DUE_COLLECTION', ?, 'CUSTOMER_DUES', ?, ?, ?, 1, ?, ?, ?)
-      `, [
-        ftxId,
-        today,
-        payNum,
-        payment_method, // CASH | UPI | BANK
-        due.customer_name,
-        `Customer Due Collected: ${due.customer_name} (Bill #${due.bill_number || id})`,
-        payment_method,
-        `DUE-${id.slice(-6)}`,
-        req.user?.id || 'STAFF',
-        now,
-        now
-      ]);
-    });
+        await dbRun(SYNC_CUSTOMER_DUES_SQL, [due.customer_id, due.customer_id]);
 
-    saveDb(true);
+        if (scopedIdempotencyKey) {
+          await dbRun(`
+            UPDATE idempotency_keys
+            SET response_json = (
+              SELECT json_object(
+                'success', json('true'),
+                'balance_due', cd.balance_due,
+                'status', cd.status,
+                'payment_id', ?
+              )
+              FROM customer_dues cd
+              WHERE cd.id = ?
+            )
+            WHERE key = ?
+          `, [paymentId, id, scopedIdempotencyKey]);
+        }
 
-    logAudit(req.user?.id || 'USER', 'COLLECT_CUSTOMER_DUE', 'CUSTOMER_DUE', id, {
-      customer: due.customer_name,
-      amount: payNum,
-      balance_remaining: newBalance,
-      method: payment_method
-    });
+        await dbRun(`
+          INSERT INTO customer_due_payments (
+            id, customer_due_id, customer_id, amount, payment_method, notes, received_by, financial_tx_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          paymentId,
+          id,
+          due.customer_id,
+          payNum,
+          payment_method,
+          notes?.trim() || null,
+          req.user?.id || 'STAFF',
+          ftxId,
+          now,
+        ]);
+
+        await dbRun(`
+          INSERT INTO financial_transactions (
+            id, date, amount, source_account, destination_account, transaction_type,
+            person_entity, category, purpose, payment_method, reference_no,
+            is_system_generated, user_id, created_at, updated_at
+          ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'CUSTOMER_DUE_COLLECTION', ?, 'CUSTOMER_DUES', ?, ?, ?, 1, ?, ?, ?)
+        `, [
+          ftxId,
+          today,
+          payNum,
+          payment_method,
+          due.customer_name,
+          `Customer Due Collected: ${due.customer_name} (Bill #${due.bill_number || id})`,
+          payment_method,
+          `DUE-${id.slice(-6)}`,
+          req.user?.id || 'STAFF',
+          now,
+          now,
+        ]);
+      });
+    } catch (txErr: any) {
+      if (scopedIdempotencyKey && isIdempotencyConflictError(txErr)) {
+        const existingResp = await getIdempotencyRecord(scopedIdempotencyKey);
+        if (existingResp) {
+          res.json(existingResp);
+          return;
+        }
+      }
+      if (String(txErr?.message || '').includes('OVERPAYMENT_EXCEEDS_BALANCE')) {
+        const freshDue = await dbQueryOne<{ balance_due: number }>(
+          'SELECT balance_due FROM customer_dues WHERE id = ?',
+          [id]
+        );
+        const remainingBal = freshDue ? Math.round(Number(freshDue.balance_due) * 100) / 100 : 0;
+        res.status(400).json({
+          error: `Payment amount ₹${payNum} cannot exceed current outstanding balance ₹${remainingBal}`,
+        });
+        return;
+      }
+      throw txErr;
+    }
+
+    if (scopedIdempotencyKey) {
+      const committedResp = await getIdempotencyRecord<{
+        success: boolean;
+        balance_due: number;
+        status: 'PENDING' | 'CLEARED';
+        payment_id: string;
+      }>(scopedIdempotencyKey);
+      if (committedResp) {
+        updatedBalance = Number(committedResp.balance_due);
+        updatedStatus = committedResp.status;
+      }
+    } else {
+      const freshDue = await dbQueryOne<{ balance_due: number; status: 'PENDING' | 'CLEARED' }>(
+        'SELECT balance_due, status FROM customer_dues WHERE id = ?',
+        [id]
+      );
+      if (freshDue) {
+        updatedBalance = Number(freshDue.balance_due);
+        updatedStatus = freshDue.status;
+      }
+    }
 
     const payResponse = {
       success: true,
-      balance_due: newBalance,
-      status: newStatus,
+      balance_due: updatedBalance,
+      status: updatedStatus,
       payment_id: paymentId,
     };
 
-    if (clientKey) {
-      recentRepayments.set(clientKey, { timestamp: Date.now(), response: payResponse });
-    }
+    saveDb(true);
+
+    await logAudit(req.user?.id || 'USER', 'COLLECT_CUSTOMER_DUE', 'CUSTOMER_DUE', id, {
+      customer: due.customer_name,
+      amount: payNum,
+      balance_remaining: updatedBalance,
+      method: payment_method,
+    });
 
     res.json(payResponse);
   } catch (err: any) {
@@ -281,18 +357,17 @@ router.post('/:id/pay', (req: AuthenticatedRequest, res: Response) => {
   }
 });
 
-// Comprehensive Customer Ledger (Credit sales, payments, returns, adjustments & running balance)
-router.get('/customers/:id/ledger', (req: AuthenticatedRequest, res: Response) => {
+// Comprehensive Customer Ledger
+router.get('/customers/:id/ledger', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const customer = dbQueryOne<any>('SELECT * FROM customers WHERE id = ?', [id]);
+    const customer = await dbQueryOne<any>('SELECT * FROM customers WHERE id = ?', [id]);
     if (!customer) {
       res.status(404).json({ error: 'Customer not found' });
       return;
     }
 
-    // 1. Credit Bills
-    const dues = dbQueryAll<any>(`
+    const dues = await dbQueryAll<any>(`
       SELECT 
         cd.*,
         s.bill_number,
@@ -306,8 +381,7 @@ router.get('/customers/:id/ledger', (req: AuthenticatedRequest, res: Response) =
       ORDER BY cd.created_at ASC
     `, [id]);
 
-    // 2. Payments Collected
-    const payments = dbQueryAll<any>(`
+    const payments = await dbQueryAll<any>(`
       SELECT 
         cdp.*,
         s.bill_number,
@@ -320,15 +394,14 @@ router.get('/customers/:id/ledger', (req: AuthenticatedRequest, res: Response) =
       ORDER BY cdp.created_at ASC
     `, [id]);
 
-    // 3. Build unified chronological statement entries with running balance
     interface LedgerEntry {
       id: string;
       date: string;
       type: 'CREDIT_BILL' | 'PAYMENT' | 'RETURN_ADJUSTMENT' | 'CANCELLATION';
       reference: string;
-      debit: number;   // adds to due
-      credit: number;  // reduces due
-      balance: number; // running balance after this entry
+      debit: number;
+      credit: number;
+      balance: number;
       notes?: string;
     }
 
@@ -378,8 +451,7 @@ router.get('/customers/:id/ledger', (req: AuthenticatedRequest, res: Response) =
       });
     });
 
-    // 2b. Return Adjustments against customer dues
-    const returnAdjustments = dbQueryAll<any>(`
+    const returnAdjustments = await dbQueryAll<any>(`
       SELECT 
         sr.id, sr.return_number, sr.bill_number, sr.refund_amount, sr.refund_method, sr.reason, sr.created_at
       FROM sale_returns sr
@@ -401,7 +473,6 @@ router.get('/customers/:id/ledger', (req: AuthenticatedRequest, res: Response) =
       });
     });
 
-    // Sort chronologically
     rawEvents.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
     let runningBalance = 0;
@@ -433,7 +504,7 @@ router.get('/customers/:id/ledger', (req: AuthenticatedRequest, res: Response) =
 });
 
 // Create manual customer profile
-router.post('/customers', (req: AuthenticatedRequest, res: Response) => {
+router.post('/customers', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { name, phone, address, notes } = req.body;
     if (!name || !name.trim()) {
@@ -444,13 +515,13 @@ router.post('/customers', (req: AuthenticatedRequest, res: Response) => {
     const id = 'cust_' + Date.now();
     const now = new Date().toISOString();
 
-    dbRun(`
+    await dbRun(`
       INSERT INTO customers (id, name, phone, address, notes, total_purchases, total_dues, created_at)
       VALUES (?, ?, ?, ?, ?, 0, 0, ?)
     `, [id, name.trim(), phone?.trim() || null, address?.trim() || null, notes?.trim() || null, now]);
 
     saveDb(true);
-    logAudit(req.user?.id || 'USER', 'CREATE_CUSTOMER', 'CUSTOMER', id, { name });
+    await logAudit(req.user?.id || 'USER', 'CREATE_CUSTOMER', 'CUSTOMER', id, { name });
     res.json({ success: true, id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

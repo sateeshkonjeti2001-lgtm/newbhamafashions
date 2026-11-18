@@ -1,5 +1,5 @@
-import { Router, Request, Response } from 'express';
-import rateLimit from 'express-rate-limit';
+import { WebRouter as Router, WebRequest as Request, WebResponse as Response } from '../webRouter.ts';
+import { createRateLimiter } from '../rateLimit.ts';
 import {
   ENTRY_GATE_COOKIE_NAME,
   verifyEntryPin,
@@ -9,28 +9,22 @@ import {
   getEntryGateCookieOptions,
 } from '../gate.ts';
 
-const router = Router();
+const router = new Router();
 
 // Rate-limit failed PIN attempts (max 10 incorrect attempts per 15 minutes per IP)
-const gateLimiter = rateLimit({
+const gateLimiter = createRateLimiter({
+  prefix: 'gate',
   windowMs: 15 * 60 * 1000,
   max: 10,
   skipSuccessfulRequests: true,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { verified: false },
-  validate: {
-    xForwardedForHeader: false,
-    forwardedHeader: false,
-    trustProxy: false,
-  },
 });
 
 // Check whether the current browser has a valid server-signed entry-gate cookie or token
-router.get('/status', (req: Request, res: Response) => {
+router.get('/status', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store');
   const token = extractEntryGateToken(req);
-  const verified = verifyEntryGateToken(token);
+  const verified = await verifyEntryGateToken(token);
   res.json({ verified });
 });
 
@@ -46,7 +40,7 @@ router.post('/verify', gateLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    const gateToken = generateEntryGateToken();
+    const gateToken = await generateEntryGateToken();
     res.cookie(ENTRY_GATE_COOKIE_NAME, gateToken, getEntryGateCookieOptions(req));
     res.json({ verified: true, gateToken });
   } catch {

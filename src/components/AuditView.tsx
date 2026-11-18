@@ -106,7 +106,7 @@ export const AuditView: React.FC = () => {
             {activeTab === 'AUDIT'
               ? 'System Security & Audit Logs'
               : activeTab === 'DATA_SAFETY'
-              ? 'Data Safety & Litestream Monitor'
+              ? 'Data Safety & Storage Monitor'
               : activeTab === 'SETTINGS'
               ? 'Store Settings & Official Contacts'
               : 'Database Backup & Restore'}
@@ -115,7 +115,7 @@ export const AuditView: React.FC = () => {
             {activeTab === 'AUDIT'
               ? 'Immutable tamper-evident record of all critical store actions, price changes, reversals & adjustments'
               : activeTab === 'DATA_SAFETY'
-              ? 'Real-time Litestream replication status, live SQLite database size, and latest verified backup tracking'
+              ? 'Real-time database persistence status, storage metrics, and latest verified backup tracking'
               : activeTab === 'SETTINGS'
               ? 'Official shop contact numbers, store identity, and thermal receipt details for New Bhama Fashions'
               : 'Automatic nightly backups at 10:00 PM IST, manual snapshots, integrity verification, and safe disaster recovery'}

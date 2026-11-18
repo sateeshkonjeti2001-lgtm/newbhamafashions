@@ -1,26 +1,19 @@
-name: Deploy to Google Cloud Run
+name: Deploy to Cloudflare Workers
 
 on:
-  # Manual trigger only — never auto-deploys on push
+  # Manual trigger only — never auto-deploys on push until verified
   workflow_dispatch:
     inputs:
       confirm_deploy:
-        description: 'Type "DEPLOY" to confirm manual production deployment to Cloud Run'
+        description: 'Type "DEPLOY" to confirm manual production deployment to Cloudflare'
         required: true
         default: 'CANCEL'
-
-env:
-  PROJECT_ID: gen-lang-client-0483853938
-  SERVICE_NAME: new-bhama-fashions-erp
-  REGION: asia-southeast1
-  AR_REPO: erp-containers
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
 
     steps:
       - name: Verify Manual DEPLOY Confirmation
@@ -30,97 +23,88 @@ jobs:
             exit 1
           fi
 
-      - name: Validate Required Deployment Configuration
+      - name: Validate Required Cloudflare & App Secrets
         env:
-          HAS_WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
-          HAS_WIF_SA: ${{ secrets.GCP_SERVICE_ACCOUNT != '' }}
-          HAS_SA_KEY: ${{ secrets.GCP_SA_KEY != '' }}
-          HAS_GCS_BUCKET: ${{ secrets.GCS_BUCKET != '' }}
-          HAS_RUNTIME_SA: ${{ secrets.CLOUD_RUN_RUNTIME_SA != '' }}
+          HAS_CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+          HAS_CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+          HAS_AUTH_SECRET: ${{ secrets.AUTH_SECRET != '' }}
+          HAS_SESSION_SECRET: ${{ secrets.SESSION_SECRET != '' }}
         run: |
-          if [ "$HAS_WIF_PROVIDER" = "true" ] && [ "$HAS_WIF_SA" = "true" ]; then
-            echo "Using Workload Identity Federation (recommended keyless authentication)."
-          elif [ "$HAS_SA_KEY" = "true" ]; then
-            echo "Warning: Using fallback GCP_SA_KEY authentication. Configure GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT for keyless WIF."
-          else
-            echo "Error: Missing Google Cloud authentication secrets. Set GCP_WORKLOAD_IDENTITY_PROVIDER + GCP_SERVICE_ACCOUNT (preferred) or GCP_SA_KEY (fallback)."
+          if [ "$HAS_CF_TOKEN" != "true" ]; then
+            echo "Error: Missing CLOUDFLARE_API_TOKEN secret."
             exit 1
           fi
-
-          if [ "$HAS_GCS_BUCKET" != "true" ]; then
-            echo "Error: Missing GCS_BUCKET secret for Litestream database replication."
+          if [ "$HAS_CF_ACCOUNT" != "true" ]; then
+            echo "Error: Missing CLOUDFLARE_ACCOUNT_ID secret."
             exit 1
           fi
-
-          if [ "$HAS_RUNTIME_SA" != "true" ]; then
-            echo "Error: Missing CLOUD_RUN_RUNTIME_SA secret (dedicated Cloud Run runtime service account)."
+          if [ "$HAS_AUTH_SECRET" != "true" ]; then
+            echo "Error: Missing AUTH_SECRET secret (min 16 random chars)."
             exit 1
           fi
+          if [ "$HAS_SESSION_SECRET" != "true" ]; then
+            echo "Error: Missing SESSION_SECRET secret (min 16 random chars)."
+            exit 1
+          fi
+          echo "All required Cloudflare deployment secrets present."
 
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Preferred: Keyless Workload Identity Federation
-      - name: Authenticate to Google Cloud (Workload Identity Federation)
-        if: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
-        uses: google-github-actions/auth@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          node-version: '22'
+          cache: 'npm'
 
-      # Fallback: Service Account JSON key (runs ONLY when WIF secrets are not configured)
-      - name: Authenticate to Google Cloud (Fallback Service Account Key)
-        if: ${{ (secrets.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || secrets.GCP_SERVICE_ACCOUNT == '') && secrets.GCP_SA_KEY != '' }}
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Install Dependencies
+        run: npm ci
 
-      - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - name: TypeScript & Code Check
+        run: npm run lint
 
-      - name: Verify Artifact Registry Repository Exists
+      - name: Build Frontend Static Assets for Cloudflare
+        run: npx vite build
+
+      - name: Configure D1 Database Binding
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
-          if ! gcloud artifacts repositories describe "${{ env.AR_REPO }}" \
-            --location="${{ env.REGION }}" \
-            --project="${{ env.PROJECT_ID }}" >/dev/null 2>&1; then
-            echo "Error: Artifact Registry repository '${{ env.AR_REPO }}' not found in '${{ env.REGION }}'."
-            echo "Create it once with: gcloud artifacts repositories create ${{ env.AR_REPO }} --repository-format=docker --location=${{ env.REGION }} --project=${{ env.PROJECT_ID }}"
+          if [ -n "$D1_DATABASE_ID" ]; then
+            sed -i "s/REPLACE_WITH_YOUR_D1_DATABASE_ID/${D1_DATABASE_ID}/g" wrangler.jsonc
+            echo "Applied D1_DATABASE_ID from GitHub Secret."
+          elif grep -q "REPLACE_WITH_YOUR_D1_DATABASE_ID" wrangler.jsonc; then
+            echo "Error: Set D1_DATABASE_ID in GitHub Secrets OR replace REPLACE_WITH_YOUR_D1_DATABASE_ID in wrangler.jsonc."
+            echo "Create database with: npx wrangler d1 create new-bhama-fashions-erp-db"
             exit 1
+          else
+            echo "Using D1 database_id configured in wrangler.jsonc."
           fi
 
-      - name: Verify Required Secret Manager Secrets Exist
+      - name: Apply Cloudflare D1 Schema Migrations (Safe & Idempotent)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          for SECRET_NAME in erp-auth-secret erp-session-secret; do
-            if ! gcloud secrets versions access latest --secret="$SECRET_NAME" --project="${{ env.PROJECT_ID }}" >/dev/null 2>&1; then
-              echo "Error: Secret Manager secret '$SECRET_NAME' is missing or inaccessible."
-              exit 1
-            fi
-          done
-          echo "Secret Manager secrets verified."
+          npx wrangler d1 migrations apply new-bhama-fashions-erp-db --remote
 
-      - name: Configure Docker for Google Artifact Registry
-        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
-
-      - name: Build and Push Container Image
+      - name: Sync Worker Secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+          ENTRY_PIN_HASH: ${{ secrets.ENTRY_PIN_HASH }}
         run: |
-          IMAGE_SHA="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
-          IMAGE_LATEST="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:latest"
-          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
-          docker push "$IMAGE_SHA"
-          docker push "$IMAGE_LATEST"
+          printf '%s' "$AUTH_SECRET" | npx wrangler secret put AUTH_SECRET
+          printf '%s' "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
+          if [ -n "$ENTRY_PIN_HASH" ]; then
+            printf '%s' "$ENTRY_PIN_HASH" | npx wrangler secret put ENTRY_PIN_HASH
+          fi
 
-      - name: Deploy to Cloud Run
+      - name: Deploy Worker & Static Assets to Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          gcloud run deploy "${{ env.SERVICE_NAME }}" \
-            --project "${{ env.PROJECT_ID }}" \
-            --image "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" \
-            --region "${{ env.REGION }}" \
-            --platform managed \
-            --service-account "${{ secrets.CLOUD_RUN_RUNTIME_SA }}" \
-            --allow-unauthenticated \
-            --max-instances 1 \
-            --port 3000 \
-            --memory 512Mi \
-            --cpu 1 \
-            --set-env-vars "NODE_ENV=production,GCS_BUCKET=${{ secrets.GCS_BUCKET }}" \
-            --set-secrets "AUTH_SECRET=erp-auth-secret:latest,SESSION_SECRET=erp-session-secret:latest"
+          npx wrangler deploy

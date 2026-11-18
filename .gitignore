@@ -6,7 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
-# Private shop database and backups
+.dev.vars
+.wrangler/
+.wrangler-tmp/
+# Private shop database, SQL exports, and backups
 data/*.sqlite
 data/*.sqlite.*
+data/*.sql
 data/backups/

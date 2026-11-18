@@ -20,6 +20,8 @@ interface LiveDbInfo {
   sizeBytes: number;
   totalTables: number;
   totalRecords: number;
+  engine?: 'sqlite-node' | 'cloudflare-d1';
+  downloadExtension?: string;
 }
 
 export const DatabaseBackup: React.FC<DatabaseBackupProps> = ({
@@ -48,6 +50,8 @@ export const DatabaseBackup: React.FC<DatabaseBackupProps> = ({
         sizeBytes: info.sizeBytes,
         totalTables: info.totalTables,
         totalRecords: info.totalRecords,
+        engine: info.engine,
+        downloadExtension: info.downloadExtension,
       });
     } catch (err: any) {
       setInfoError(err.message || 'Unable to inspect database status');
@@ -103,13 +107,17 @@ export const DatabaseBackup: React.FC<DatabaseBackupProps> = ({
           <div>
             <h3 className="font-bold text-sm text-[#1C1917]">Database Backup</h3>
             <p className="text-[11px] text-[#6F6962]">
-              Download live SQLite file to your device for local safety storage
+              {dbInfo?.engine === 'cloudflare-d1'
+                ? 'Download live Cloudflare D1 SQL snapshot to your device for local safety storage'
+                : 'Download live SQLite file to your device for local safety storage'}
             </p>
           </div>
         </div>
 
         <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-[#FAF8F4] text-[#A67C52] border border-[#E3DED5] shrink-0">
-          SQLite (.sqlite)
+          {dbInfo?.engine === 'cloudflare-d1'
+            ? `D1 Backup (${dbInfo.downloadExtension || '.sql'})`
+            : 'SQLite (.sqlite)'}
         </span>
       </div>
 
@@ -178,7 +186,11 @@ export const DatabaseBackup: React.FC<DatabaseBackupProps> = ({
           ) : (
             <>
               <Download className="w-4 h-4 text-[#A67C52]" />
-              <span>Download SQLite Database (.sqlite)</span>
+              <span>
+                {dbInfo?.engine === 'cloudflare-d1'
+                  ? 'Download D1 Database Snapshot (.sql)'
+                  : 'Download SQLite Database (.sqlite)'}
+              </span>
             </>
           )}
         </button>
@@ -213,7 +225,15 @@ export const DatabaseBackup: React.FC<DatabaseBackupProps> = ({
         <div className="flex items-start gap-2">
           <ShieldCheck className="w-3.5 h-3.5 text-[#3F6B50] shrink-0 mt-0.5" />
           <p className="leading-relaxed">
-            Runs <span className="font-mono text-[#1C1917]">PRAGMA integrity_check</span> before downloading. Save copies to your computer, USB drive, or private cloud folder.
+            {dbInfo?.engine === 'cloudflare-d1' ? (
+              <>
+                Exports a verified <span className="font-mono text-[#1C1917]">.sql</span> snapshot with SHA-256 verification before downloading. Save copies to your computer or offline storage.
+              </>
+            ) : (
+              <>
+                Runs <span className="font-mono text-[#1C1917]">PRAGMA integrity_check</span> before downloading. Save copies to your computer, USB drive, or private cloud folder.
+              </>
+            )}
           </p>
         </div>
 

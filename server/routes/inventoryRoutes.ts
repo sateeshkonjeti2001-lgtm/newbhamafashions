@@ -1,12 +1,13 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
+import { randomHex } from '../cryptoUtil.ts';
 
-const router = Router();
+const router = new Router();
 
 // Current stock status across all products
-router.get('/stock', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.get('/stock', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const { category_id, search } = req.query;
@@ -47,7 +48,7 @@ router.get('/stock', authMiddleware, (req: AuthenticatedRequest, res: Response) 
 
     sql += ' GROUP BY p.id ORDER BY p.name ASC';
 
-    const stockList = dbQueryAll(sql, params);
+    const stockList = await dbQueryAll(sql, params);
     res.json({ stock: stockList });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -55,7 +56,7 @@ router.get('/stock', authMiddleware, (req: AuthenticatedRequest, res: Response) 
 });
 
 // Immutable Stock Movement History / Ledger
-router.get('/ledger', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.get('/ledger', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const { product_id, movement_type, limit = 100 } = req.query;
@@ -96,15 +97,15 @@ router.get('/ledger', authMiddleware, (req: AuthenticatedRequest, res: Response)
     sql += ' ORDER BY sl.created_at DESC LIMIT ?';
     params.push(Number(limit) || 100);
 
-    const ledger = dbQueryAll(sql, params);
+    const ledger = await dbQueryAll(sql, params);
     res.json({ ledger });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Active Purchase Batches (Owner only for cost)
-router.get('/batches', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+// Active Purchase Batches
+router.get('/batches', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const { product_id } = req.query;
@@ -138,7 +139,7 @@ router.get('/batches', authMiddleware, (req: AuthenticatedRequest, res: Response
 
     sql += ' ORDER BY pb.received_date ASC, pb.created_at ASC';
 
-    const batches = dbQueryAll(sql, params);
+    const batches = await dbQueryAll(sql, params);
     res.json({ batches });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -146,7 +147,7 @@ router.get('/batches', authMiddleware, (req: AuthenticatedRequest, res: Response
 });
 
 // Manual Stock Adjustment / Damage / Write-off
-router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.post('/adjust', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.role !== 'OWNER') {
       res.status(403).json({ error: 'Only Owner can perform manual stock adjustments or write-offs' });
@@ -154,7 +155,6 @@ router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response
     }
 
     const { product_id, variant_id, adjustment_type, quantity, reason } = req.body;
-    // adjustment_type: 'DAMAGE' | 'WRITE_OFF' | 'ADJUSTMENT' (in or out)
 
     if (!product_id || !quantity || Number(quantity) === 0) {
       res.status(400).json({ error: 'Product and non-zero quantity are required.' });
@@ -166,7 +166,7 @@ router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response
       return;
     }
 
-    const product = dbQueryOne<any>('SELECT * FROM products WHERE id = ?', [product_id]);
+    const product = await dbQueryOne<any>('SELECT * FROM products WHERE id = ?', [product_id]);
     if (!product) {
       res.status(404).json({ error: 'Product not found.' });
       return;
@@ -174,32 +174,39 @@ router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response
 
     const qtyNum = Number(quantity);
     const now = new Date().toISOString();
-    const ledgerId = 'stk_adj_' + Date.now();
+    const ledgerId = 'stk_adj_' + Date.now() + '_' + randomHex(3);
 
-    dbTransaction(() => {
-      // If negative movement (out, damage, write-off)
+    const batchUpdates: Array<{ id: string; remaining_qty: number; is_active: number }> = [];
+    if (qtyNum < 0) {
+      let needed = Math.abs(qtyNum);
+      const batches = await dbQueryAll<any>(
+        'SELECT * FROM purchase_batches WHERE product_id = ? AND remaining_qty > 0 ORDER BY received_date ASC, created_at ASC',
+        [product_id]
+      );
+      for (const b of batches) {
+        if (needed <= 0) break;
+        const take = Math.min(b.remaining_qty, needed);
+        const newRemaining = b.remaining_qty - take;
+        batchUpdates.push({
+          id: b.id,
+          remaining_qty: newRemaining,
+          is_active: newRemaining > 0 ? 1 : 0,
+        });
+        needed -= take;
+      }
+    }
+
+    await dbTransaction(async () => {
       if (qtyNum < 0) {
-        // Reduce from oldest batch FIFO
-        const absQty = Math.abs(qtyNum);
-        let needed = absQty;
-        const batches = dbQueryAll<any>(
-          'SELECT * FROM purchase_batches WHERE product_id = ? AND remaining_qty > 0 ORDER BY received_date ASC, created_at ASC',
-          [product_id]
-        );
-
-        for (const b of batches) {
-          if (needed <= 0) break;
-          const take = Math.min(b.remaining_qty, needed);
-          const newRemaining = b.remaining_qty - take;
-          dbRun('UPDATE purchase_batches SET remaining_qty = ?, is_active = ? WHERE id = ?', [
-            newRemaining,
-            newRemaining > 0 ? 1 : 0,
-            b.id
+        for (const bu of batchUpdates) {
+          await dbRun('UPDATE purchase_batches SET remaining_qty = ?, is_active = ? WHERE id = ?', [
+            bu.remaining_qty,
+            bu.is_active,
+            bu.id,
           ]);
-          needed -= take;
         }
 
-        dbRun(`
+        await dbRun(`
           INSERT INTO stock_ledger (
             id, product_id, variant_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, 'MANUAL_ADJUSTMENT', ?, ?, ?, ?)
@@ -213,12 +220,11 @@ router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response
           ledgerId,
           reason.trim(),
           req.user?.id || 'SYSTEM',
-          now
+          now,
         ]);
       } else {
-        // Positive stock adjustment (Stock In)
-        const batchId = 'batch_adj_' + Date.now();
-        dbRun(`
+        const batchId = 'batch_adj_' + Date.now() + '_' + randomHex(3);
+        await dbRun(`
           INSERT INTO purchase_batches (
             id, product_id, variant_id, batch_number, initial_qty, remaining_qty, unit_cost, received_date, is_active, created_at
           ) VALUES (?, ?, ?, 'MANUAL-ADJ', ?, ?, ?, ?, 1, ?)
@@ -230,10 +236,10 @@ router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response
           qtyNum,
           product.purchase_cost || 0,
           now.split('T')[0],
-          now
+          now,
         ]);
 
-        dbRun(`
+        await dbRun(`
           INSERT INTO stock_ledger (
             id, product_id, variant_id, batch_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
           ) VALUES (?, ?, ?, ?, 'ADJUSTMENT', ?, ?, 'MANUAL_ADJUSTMENT', ?, ?, ?, ?)
@@ -247,16 +253,16 @@ router.post('/adjust', authMiddleware, (req: AuthenticatedRequest, res: Response
           ledgerId,
           reason.trim(),
           req.user?.id || 'SYSTEM',
-          now
+          now,
         ]);
       }
     });
 
-    logAudit(req.user.id, 'STOCK_ADJUSTMENT', 'STOCK', ledgerId, {
+    await logAudit(req.user.id, 'STOCK_ADJUSTMENT', 'STOCK', ledgerId, {
       product: product.name,
       quantity: qtyNum,
       type: adjustment_type,
-      reason
+      reason,
     });
 
     res.json({ success: true });

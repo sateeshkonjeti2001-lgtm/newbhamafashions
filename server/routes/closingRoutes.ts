@@ -1,19 +1,19 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 
 // Get or calculate Daily Closing figures for a date
-router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
+router.get('/calculate', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { date } = req.query;
     const targetDate = (date as string) || new Date().toISOString().split('T')[0];
 
     // Check if closing already saved
-    const existing = dbQueryOne<any>('SELECT * FROM daily_closings WHERE closing_date = ?', [targetDate]);
+    const existing = await dbQueryOne<any>('SELECT * FROM daily_closings WHERE closing_date = ?', [targetDate]);
 
     // 1. Opening Cash:
     // If not existing or opening_cash not set, look up previous day's actual counted cash
@@ -21,7 +21,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
     if (existing && existing.opening_cash !== undefined) {
       openingCash = existing.opening_cash;
     } else {
-      const prevClosing = dbQueryOne<any>(
+      const prevClosing = await dbQueryOne<any>(
         'SELECT actual_counted_cash FROM daily_closings WHERE closing_date < ? ORDER BY closing_date DESC LIMIT 1',
         [targetDate]
       );
@@ -30,7 +30,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
 
     // 2. Automatically calculated transactions for targetDate:
     // Cash Sales (only active/completed sales)
-    const cashSalesRow = dbQueryOne<any>(`
+    const cashSalesRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(cash_paid), 0) as total
       FROM sales
       WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
@@ -38,7 +38,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
     const cashSales = cashSalesRow?.total || 0;
 
     // UPI Sales (only active/completed sales)
-    const upiSalesRow = dbQueryOne<any>(`
+    const upiSalesRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(upi_paid), 0) as total
       FROM sales
       WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
@@ -46,7 +46,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
     const upiSales = upiSalesRow?.total || 0;
 
     // Other Cash In (Customer Dues collected in cash, Owner capital in cash, Loans received in cash, Transfers into cash)
-    const otherCashInRow = dbQueryOne<any>(`
+    const otherCashInRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM financial_transactions
       WHERE date = ? 
@@ -56,7 +56,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
     const cashReceivedOther = otherCashInRow?.total || 0;
 
     // Cash Operating Expenses
-    const cashExpRow = dbQueryOne<any>(`
+    const cashExpRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM financial_transactions
       WHERE date = ? 
@@ -67,7 +67,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
 
     // Other Cash Paid (Supplier payments, Staff payments, Owner withdrawals, Loan repayments, Transfers out, Returns)
     // Note: Exclude same-day void reversals since cashSales already omitted the cancelled sale.
-    const otherCashOutRow = dbQueryOne<any>(`
+    const otherCashOutRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(ft.amount), 0) as total
       FROM financial_transactions ft
       LEFT JOIN sales s ON ft.reference_no = ('VOID-' || s.bill_number)
@@ -82,7 +82,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
     const expectedClosingCash = Math.round((openingCash + cashSales + cashReceivedOther - cashExpenses - cashPaidOther) * 100) / 100;
 
     // UPI movements for the day
-    const otherUpiInRow = dbQueryOne<any>(`
+    const otherUpiInRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM financial_transactions
       WHERE date = ? 
@@ -91,7 +91,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
     `, [targetDate]);
     const upiReceivedOther = otherUpiInRow?.total || 0;
 
-    const upiPaymentsRow = dbQueryOne<any>(`
+    const upiPaymentsRow = await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM financial_transactions
       WHERE date = ? 
@@ -120,7 +120,7 @@ router.get('/calculate', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Submit / Finalize Daily Closing
-router.post('/submit', (req: AuthenticatedRequest, res: Response) => {
+router.post('/submit', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       closing_date,
@@ -144,20 +144,20 @@ router.post('/submit', (req: AuthenticatedRequest, res: Response) => {
     const countedCash = Math.max(0, Number(actual_counted_cash) || 0);
 
     // Compute automatic sums for closing_date
-    const cashSales = dbQueryOne<any>('SELECT COALESCE(SUM(cash_paid), 0) as t FROM sales WHERE DATE(created_at) = ? AND (status IS NULL OR status = \'COMPLETED\')', [closing_date])?.t || 0;
-    const upiSales = dbQueryOne<any>('SELECT COALESCE(SUM(upi_paid), 0) as t FROM sales WHERE DATE(created_at) = ? AND (status IS NULL OR status = \'COMPLETED\')', [closing_date])?.t || 0;
+    const cashSales = (await dbQueryOne<any>('SELECT COALESCE(SUM(cash_paid), 0) as t FROM sales WHERE DATE(created_at) = ? AND (status IS NULL OR status = \'COMPLETED\')', [closing_date]))?.t || 0;
+    const upiSales = (await dbQueryOne<any>('SELECT COALESCE(SUM(upi_paid), 0) as t FROM sales WHERE DATE(created_at) = ? AND (status IS NULL OR status = \'COMPLETED\')', [closing_date]))?.t || 0;
 
-    const cashReceivedOther = dbQueryOne<any>(`
+    const cashReceivedOther = (await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as t FROM financial_transactions 
       WHERE date = ? AND destination_account = 'CASH' AND transaction_type NOT IN ('INCOME')
-    `, [closing_date])?.t || 0;
+    `, [closing_date]))?.t || 0;
 
-    const cashExpenses = dbQueryOne<any>(`
+    const cashExpenses = (await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as t FROM financial_transactions 
       WHERE date = ? AND source_account = 'CASH' AND transaction_type = 'OPERATING_EXPENSE'
-    `, [closing_date])?.t || 0;
+    `, [closing_date]))?.t || 0;
 
-    const cashPaidOther = dbQueryOne<any>(`
+    const cashPaidOther = (await dbQueryOne<any>(`
       SELECT COALESCE(SUM(ft.amount), 0) as t
       FROM financial_transactions ft
       LEFT JOIN sales s ON ft.reference_no = ('VOID-' || s.bill_number)
@@ -165,27 +165,27 @@ router.post('/submit', (req: AuthenticatedRequest, res: Response) => {
         AND ft.source_account = 'CASH' 
         AND ft.transaction_type NOT IN ('OPERATING_EXPENSE')
         AND NOT (ft.category = 'SALE_REVERSAL' AND s.created_at IS NOT NULL AND DATE(s.created_at) = ?)
-    `, [closing_date, closing_date])?.t || 0;
+    `, [closing_date, closing_date]))?.t || 0;
 
     const expectedClosingCash = Math.round((openCash + cashSales + cashReceivedOther - cashExpenses - cashPaidOther) * 100) / 100;
     const difference = Math.round((countedCash - expectedClosingCash) * 100) / 100;
 
-    const upiReceivedOther = dbQueryOne<any>(`
+    const upiReceivedOther = (await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as t FROM financial_transactions 
       WHERE date = ? AND destination_account = 'UPI' AND transaction_type NOT IN ('INCOME')
-    `, [closing_date])?.t || 0;
+    `, [closing_date]))?.t || 0;
 
-    const upiPayments = dbQueryOne<any>(`
+    const upiPayments = (await dbQueryOne<any>(`
       SELECT COALESCE(SUM(amount), 0) as t FROM financial_transactions 
       WHERE date = ? AND source_account = 'UPI'
-    `, [closing_date])?.t || 0;
+    `, [closing_date]))?.t || 0;
 
     const status = finalize ? 'CLOSED' : 'OPEN';
     const now = new Date().toISOString();
     const closingId = 'close_' + closing_date.replace(/-/g, '');
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         INSERT INTO daily_closings (
           id, closing_date, opening_cash, cash_sales, cash_received_other, cash_expenses,
           cash_paid_other, expected_closing_cash, actual_counted_cash, difference_cash,
@@ -230,13 +230,13 @@ router.post('/submit', (req: AuthenticatedRequest, res: Response) => {
 
       // If finalized, lock all sales and manual transactions on that date
       if (finalize) {
-        dbRun('UPDATE sales SET day_closed = 1 WHERE DATE(created_at) = ?', [closing_date]);
-        dbRun('UPDATE financial_transactions SET day_closed = 1 WHERE date = ?', [closing_date]);
-        dbRun('UPDATE expenses SET day_closed = 1 WHERE date = ?', [closing_date]);
+        await dbRun('UPDATE sales SET day_closed = 1 WHERE DATE(created_at) = ?', [closing_date]);
+        await dbRun('UPDATE financial_transactions SET day_closed = 1 WHERE date = ?', [closing_date]);
+        await dbRun('UPDATE expenses SET day_closed = 1 WHERE date = ?', [closing_date]);
       }
     });
 
-    logAudit(req.user?.id || 'USER', finalize ? 'CLOSE_BUSINESS_DAY' : 'UPDATE_DAILY_CLOSING', 'DAILY_CLOSING', closingId, {
+    await logAudit(req.user?.id || 'USER', finalize ? 'CLOSE_BUSINESS_DAY' : 'UPDATE_DAILY_CLOSING', 'DAILY_CLOSING', closingId, {
       date: closing_date,
       expected: expectedClosingCash,
       actual: countedCash,
@@ -261,9 +261,9 @@ router.post('/submit', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // List historical daily closings
-router.get('/history', (req: AuthenticatedRequest, res: Response) => {
+router.get('/history', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const history = dbQueryAll(`
+    const history = await dbQueryAll(`
       SELECT 
         dc.*,
         u.full_name as closed_by_name

@@ -1,21 +1,27 @@
-import { Router, Response } from 'express';
+import { WebRouter as Router, WebRequest as Request, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
+import { randomHex, sha256Hex } from '../cryptoUtil.ts';
+import {
+  getIdempotencyRecord,
+  insertIdempotencyRecord,
+  isIdempotencyConflictError,
+} from '../idempotency.ts';
 
-const router = Router();
+const router = new Router();
 
 // ----------------- Categories -----------------
-router.get('/categories', authMiddleware, (req, res) => {
+router.get('/categories', authMiddleware, async (_req: Request, res: Response) => {
   try {
-    const categories = dbQueryAll('SELECT * FROM categories ORDER BY name ASC');
+    const categories = await dbQueryAll('SELECT * FROM categories ORDER BY name ASC');
     res.json({ categories });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/categories', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.post('/categories', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.role !== 'OWNER') {
       res.status(403).json({ error: 'Only Owner can manage categories' });
@@ -29,12 +35,12 @@ router.post('/categories', authMiddleware, (req: AuthenticatedRequest, res: Resp
 
     const id = 'cat_' + Date.now();
     const schemaStr = attributes_schema ? JSON.stringify(attributes_schema) : null;
-    dbRun(
+    await dbRun(
       'INSERT INTO categories (id, name, code, description, attributes_schema, is_active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)',
       [id, name.trim(), code?.trim() || null, description?.trim() || null, schemaStr, new Date().toISOString()]
     );
 
-    logAudit(req.user.id, 'CREATE_CATEGORY', 'CATEGORY', id, { name });
+    await logAudit(req.user.id, 'CREATE_CATEGORY', 'CATEGORY', id, { name });
     res.json({ success: true, id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -42,16 +48,16 @@ router.post('/categories', authMiddleware, (req: AuthenticatedRequest, res: Resp
 });
 
 // ----------------- Brands -----------------
-router.get('/brands', authMiddleware, (req, res) => {
+router.get('/brands', authMiddleware, async (_req: Request, res: Response) => {
   try {
-    const brands = dbQueryAll('SELECT * FROM brands ORDER BY name ASC');
+    const brands = await dbQueryAll('SELECT * FROM brands ORDER BY name ASC');
     res.json({ brands });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/brands', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.post('/brands', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.role !== 'OWNER') {
       res.status(403).json({ error: 'Only Owner can manage brands' });
@@ -64,13 +70,13 @@ router.post('/brands', authMiddleware, (req: AuthenticatedRequest, res: Response
     }
 
     const id = 'brd_' + Date.now();
-    dbRun('INSERT INTO brands (id, name, is_active, created_at) VALUES (?, ?, 1, ?)', [
+    await dbRun('INSERT INTO brands (id, name, is_active, created_at) VALUES (?, ?, 1, ?)', [
       id,
       name.trim(),
-      new Date().toISOString()
+      new Date().toISOString(),
     ]);
 
-    logAudit(req.user.id, 'CREATE_BRAND', 'BRAND', id, { name });
+    await logAudit(req.user.id, 'CREATE_BRAND', 'BRAND', id, { name });
     res.json({ success: true, id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -78,7 +84,7 @@ router.post('/brands', authMiddleware, (req: AuthenticatedRequest, res: Response
 });
 
 // ----------------- Products -----------------
-router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const { search, category_id, active_only } = req.query;
@@ -117,10 +123,9 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
 
     sql += ' GROUP BY p.id ORDER BY p.name ASC';
 
-    const products = dbQueryAll(sql, params);
+    const products = await dbQueryAll(sql, params);
 
-    // Also attach variants
-    const allVariants = dbQueryAll(`
+    const allVariants = await dbQueryAll(`
       SELECT 
         v.id, v.product_id, v.size, v.color, v.sku, v.barcode, v.mrp, v.selling_price, v.festival_discount, v.is_active
         ${isOwner ? ', v.purchase_cost' : ''}
@@ -139,7 +144,7 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     const result = products.map((p) => ({
       ...p,
       category_attributes: p.category_attributes ? JSON.parse(p.category_attributes) : null,
-      variants: variantsByProduct[p.id] || []
+      variants: variantsByProduct[p.id] || [],
     }));
 
     res.json({ products: result });
@@ -149,12 +154,12 @@ router.get('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Single product details
-router.get('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
     const { id } = req.params;
 
-    const p = dbQueryOne<any>(`
+    const p = await dbQueryOne<any>(`
       SELECT 
         p.*,
         c.name as category_name,
@@ -174,7 +179,7 @@ router.get('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
       return;
     }
 
-    const variants = dbQueryAll(`
+    const variants = await dbQueryAll(`
       SELECT 
         v.id, v.product_id, v.size, v.color, v.sku, v.barcode, v.mrp, v.selling_price, v.festival_discount, v.is_active
         ${isOwner ? ', v.purchase_cost' : ''}
@@ -187,33 +192,18 @@ router.get('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
       product: {
         ...p,
         category_attributes: p.category_attributes ? JSON.parse(p.category_attributes) : null,
-        variants
-      }
+        variants,
+      },
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// In-memory cache for idempotency and duplicate request prevention on retries / timeouts
-interface RecentProductSubmission {
-  productId: string;
-  fingerprint: string;
-  timestamp: number;
-}
-const recentSubmissions = new Map<string, RecentProductSubmission>();
 
-function pruneRecentSubmissions() {
-  const expiry = Date.now() - 60 * 1000; // 60 seconds TTL
-  for (const [key, sub] of recentSubmissions.entries()) {
-    if (sub.timestamp < expiry) {
-      recentSubmissions.delete(key);
-    }
-  }
-}
 
 // Create product (Owner only)
-router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.post('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.role !== 'OWNER') {
       res.status(403).json({ error: 'Only store Owner can add or configure products' });
@@ -236,11 +226,10 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       category_attributes,
       image_url,
       variants,
-      initial_stock, // optional initial stock adjustment if physical stock exists on day 1
-      idempotency_key
+      initial_stock,
+      idempotency_key,
     } = req.body;
 
-    // 1. Basic Field Validation
     if (!name || typeof name !== 'string' || !name.trim()) {
       res.status(400).json({ error: 'Product name is required.' });
       return;
@@ -266,10 +255,9 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    // 2. Validate Category & Brand if provided
     const cleanCategoryId = category_id && typeof category_id === 'string' && category_id.trim() ? category_id.trim() : null;
     if (cleanCategoryId) {
-      const cat = dbQueryOne<{ id: string; is_active: number }>('SELECT id, is_active FROM categories WHERE id = ?', [cleanCategoryId]);
+      const cat = await dbQueryOne<{ id: string; is_active: number }>('SELECT id, is_active FROM categories WHERE id = ?', [cleanCategoryId]);
       if (!cat) {
         res.status(400).json({ error: 'Selected category does not exist.' });
         return;
@@ -282,7 +270,7 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
 
     const cleanBrandId = brand_id && typeof brand_id === 'string' && brand_id.trim() ? brand_id.trim() : null;
     if (cleanBrandId) {
-      const brd = dbQueryOne<{ id: string; is_active: number }>('SELECT id, is_active FROM brands WHERE id = ?', [cleanBrandId]);
+      const brd = await dbQueryOne<{ id: string; is_active: number }>('SELECT id, is_active FROM brands WHERE id = ?', [cleanBrandId]);
       if (!brd) {
         res.status(400).json({ error: 'Selected brand does not exist.' });
         return;
@@ -297,9 +285,9 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     const cleanSku = sku && typeof sku === 'string' && sku.trim() ? sku.trim() : null;
     const cleanBarcode = barcode && typeof barcode === 'string' && barcode.trim() ? barcode.trim() : null;
 
-    // 3. Idempotency & Retry Protection (run BEFORE uniqueness checks so retries return the existing product instead of duplicate constraint failure)
-    pruneRecentSubmissions();
-    const clientKey = (req.headers['x-idempotency-key'] as string) || (typeof idempotency_key === 'string' ? idempotency_key.trim() : null);
+    const rawClientKey =
+      req.headers['x-idempotency-key'] || (typeof idempotency_key === 'string' ? idempotency_key.trim() : '');
+    const clientKey = typeof rawClientKey === 'string' && rawClientKey.trim() ? rawClientKey.trim() : null;
     const fingerprint = [
       name.trim().toLowerCase(),
       cleanCategoryId || '',
@@ -308,31 +296,34 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       cleanSku?.toLowerCase() || '',
       cleanBarcode || '',
       numMrp,
-      numSellingPrice
+      numSellingPrice,
     ].join('::');
 
-    if (clientKey && recentSubmissions.has(clientKey)) {
-      const cached = recentSubmissions.get(clientKey)!;
-      const existingProduct = dbQueryOne('SELECT id FROM products WHERE id = ?', [cached.productId]);
-      if (existingProduct) {
-        res.json({ success: true, id: cached.productId, duplicate_prevented: true, message: 'Product already saved (retry detected)' });
-        return;
-      }
-    }
+    const scopedKey = clientKey ? `prod_create:key:${clientKey}` : null;
+    const fpKey = `prod_create:fp:${await sha256Hex(fingerprint)}`;
 
-    for (const [, sub] of recentSubmissions.entries()) {
-      if (sub.fingerprint === fingerprint && (Date.now() - sub.timestamp) < 20000) {
-        const existingProduct = dbQueryOne('SELECT id FROM products WHERE id = ?', [sub.productId]);
+    if (scopedKey) {
+      const cached = await getIdempotencyRecord<{ id: string }>(scopedKey);
+      if (cached?.id) {
+        const existingProduct = await dbQueryOne('SELECT id FROM products WHERE id = ?', [cached.id]);
         if (existingProduct) {
-          res.json({ success: true, id: sub.productId, duplicate_prevented: true, message: 'Duplicate submission prevented' });
+          res.json({ success: true, id: cached.id, duplicate_prevented: true, message: 'Product already saved (retry detected)' });
           return;
         }
       }
     }
 
-    // 4. Unique Constraints Validation (Code, SKU, Barcode)
+    const recentFp = await getIdempotencyRecord<{ id: string }>(fpKey);
+    if (recentFp?.id) {
+      const existingProduct = await dbQueryOne('SELECT id FROM products WHERE id = ?', [recentFp.id]);
+      if (existingProduct) {
+        res.json({ success: true, id: recentFp.id, duplicate_prevented: true, message: 'Duplicate submission prevented' });
+        return;
+      }
+    }
+
     if (cleanCode) {
-      const existingCode = dbQueryOne<{ id: string; name: string }>(
+      const existingCode = await dbQueryOne<{ id: string; name: string }>(
         'SELECT id, name FROM products WHERE LOWER(code) = LOWER(?)',
         [cleanCode]
       );
@@ -343,7 +334,7 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     }
 
     if (cleanSku) {
-      const existingProductSku = dbQueryOne<{ id: string; name: string }>(
+      const existingProductSku = await dbQueryOne<{ id: string; name: string }>(
         'SELECT id, name FROM products WHERE LOWER(sku) = LOWER(?)',
         [cleanSku]
       );
@@ -352,7 +343,7 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         return;
       }
 
-      const existingVariantSku = dbQueryOne<{ id: string; name: string }>(
+      const existingVariantSku = await dbQueryOne<{ id: string; name: string }>(
         'SELECT v.id, p.name FROM product_variants v JOIN products p ON v.product_id = p.id WHERE LOWER(v.sku) = LOWER(?)',
         [cleanSku]
       );
@@ -363,7 +354,7 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     }
 
     if (cleanBarcode) {
-      const existingProductBarcode = dbQueryOne<{ id: string; name: string }>(
+      const existingProductBarcode = await dbQueryOne<{ id: string; name: string }>(
         'SELECT id, name FROM products WHERE barcode = ?',
         [cleanBarcode]
       );
@@ -372,7 +363,7 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
         return;
       }
 
-      const existingVariantBarcode = dbQueryOne<{ id: string; name: string }>(
+      const existingVariantBarcode = await dbQueryOne<{ id: string; name: string }>(
         'SELECT v.id, p.name FROM product_variants v JOIN products p ON v.product_id = p.id WHERE v.barcode = ?',
         [cleanBarcode]
       );
@@ -382,7 +373,6 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       }
     }
 
-    // 5. Validate Variants if provided
     if (Array.isArray(variants) && variants.length > 0) {
       const seenVariantSkus = new Set<string>();
       const seenVariantBarcodes = new Set<string>();
@@ -399,8 +389,9 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
           }
           seenVariantSkus.add(vSku.toLowerCase());
 
-          const dupSkuDb = dbQueryOne('SELECT id FROM products WHERE LOWER(sku) = LOWER(?)', [vSku])
-            || dbQueryOne('SELECT id FROM product_variants WHERE LOWER(sku) = LOWER(?)', [vSku]);
+          const dupSkuDb =
+            (await dbQueryOne('SELECT id FROM products WHERE LOWER(sku) = LOWER(?)', [vSku])) ||
+            (await dbQueryOne('SELECT id FROM product_variants WHERE LOWER(sku) = LOWER(?)', [vSku]));
           if (dupSkuDb) {
             res.status(400).json({ error: `Variant SKU '${vSku}' is already in use by an existing item.` });
             return;
@@ -414,8 +405,9 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
           }
           seenVariantBarcodes.add(vBarcode);
 
-          const dupBarcodeDb = dbQueryOne('SELECT id FROM products WHERE barcode = ?', [vBarcode])
-            || dbQueryOne('SELECT id FROM product_variants WHERE barcode = ?', [vBarcode]);
+          const dupBarcodeDb =
+            (await dbQueryOne('SELECT id FROM products WHERE barcode = ?', [vBarcode])) ||
+            (await dbQueryOne('SELECT id FROM product_variants WHERE barcode = ?', [vBarcode]));
           if (dupBarcodeDb) {
             res.status(400).json({ error: `Variant barcode '${vBarcode}' is already assigned to an existing item.` });
             return;
@@ -431,125 +423,130 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
       }
     }
 
-    const productId = 'prod_' + Date.now();
+    const productId = 'prod_' + Date.now() + '_' + randomHex(3);
     const now = new Date().toISOString();
 
-    // 6. Atomic Database Writes using robust dbTransaction
-    dbTransaction(() => {
-      dbRun(`
-        INSERT INTO products (
-          id, category_id, brand_id, name, code, sku, barcode, description, tags,
-          mrp, selling_price, purchase_cost, festival_discount, category_attributes, image_url,
-          is_active, sales_channel, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'OFFLINE', ?, ?)
-      `, [
-        productId,
-        cleanCategoryId,
-        cleanBrandId,
-        name.trim(),
-        cleanCode,
-        cleanSku,
-        cleanBarcode,
-        description && typeof description === 'string' ? description.trim() : null,
-        tags && typeof tags === 'string' ? tags.trim() : null,
-        numMrp,
-        numSellingPrice,
-        numPurchaseCost,
-        numFestivalDiscount,
-        category_attributes ? JSON.stringify(category_attributes) : null,
-        image_url && typeof image_url === 'string' ? image_url.trim() : null,
-        now,
-        now
-      ]);
+    try {
+      await dbTransaction(async () => {
+        if (scopedKey) {
+          await insertIdempotencyRecord(scopedKey, 'PRODUCT_CREATE', { id: productId }, 60 * 60 * 1000);
+        }
+        await dbRun('DELETE FROM idempotency_keys WHERE key = ? AND expires_at <= ?', [fpKey, Date.now()]);
+        await insertIdempotencyRecord(fpKey, 'PRODUCT_FINGERPRINT', { id: productId }, 20 * 1000);
 
-      // Add variants if provided
-      if (Array.isArray(variants) && variants.length > 0) {
-        for (const v of variants) {
-          const varId = 'var_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-          dbRun(`
-            INSERT INTO product_variants (
-              id, product_id, size, color, sku, barcode, mrp, selling_price, purchase_cost, festival_discount, is_active, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        await dbRun(`
+          INSERT INTO products (
+            id, category_id, brand_id, name, code, sku, barcode, description, tags,
+            mrp, selling_price, purchase_cost, festival_discount, category_attributes, image_url,
+            is_active, sales_channel, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'OFFLINE', ?, ?)
+        `, [
+          productId,
+          cleanCategoryId,
+          cleanBrandId,
+          name.trim(),
+          cleanCode,
+          cleanSku,
+          cleanBarcode,
+          description && typeof description === 'string' ? description.trim() : null,
+          tags && typeof tags === 'string' ? tags.trim() : null,
+          numMrp,
+          numSellingPrice,
+          numPurchaseCost,
+          numFestivalDiscount,
+          category_attributes ? JSON.stringify(category_attributes) : null,
+          image_url && typeof image_url === 'string' ? image_url.trim() : null,
+          now,
+          now,
+        ]);
+
+        if (Array.isArray(variants) && variants.length > 0) {
+          for (const v of variants) {
+            const varId = 'var_' + Date.now() + '_' + randomHex(3);
+            await dbRun(`
+              INSERT INTO product_variants (
+                id, product_id, size, color, sku, barcode, mrp, selling_price, purchase_cost, festival_discount, is_active, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            `, [
+              varId,
+              productId,
+              v.size?.trim() || null,
+              v.color?.trim() || null,
+              v.sku?.trim() || null,
+              v.barcode?.trim() || null,
+              v.mrp !== undefined ? Number(v.mrp) : numMrp,
+              v.selling_price !== undefined ? Number(v.selling_price) : numSellingPrice,
+              v.purchase_cost !== undefined ? Number(v.purchase_cost) : numPurchaseCost,
+              v.festival_discount !== undefined ? Number(v.festival_discount) : numFestivalDiscount,
+              now,
+            ]);
+          }
+        }
+
+        if (Number(initial_stock) > 0) {
+          const batchId = 'batch_init_' + productId;
+          await dbRun(`
+            INSERT INTO purchase_batches (
+              id, product_id, batch_number, initial_qty, remaining_qty, unit_cost, received_date, is_active, created_at
+            ) VALUES (?, ?, 'INITIAL-OPENING', ?, ?, ?, ?, 1, ?)
           `, [
-            varId,
+            batchId,
             productId,
-            v.size?.trim() || null,
-            v.color?.trim() || null,
-            v.sku?.trim() || null,
-            v.barcode?.trim() || null,
-            v.mrp !== undefined ? Number(v.mrp) : numMrp,
-            v.selling_price !== undefined ? Number(v.selling_price) : numSellingPrice,
-            v.purchase_cost !== undefined ? Number(v.purchase_cost) : numPurchaseCost,
-            v.festival_discount !== undefined ? Number(v.festival_discount) : numFestivalDiscount,
-            now
+            Number(initial_stock),
+            Number(initial_stock),
+            numPurchaseCost,
+            now.split('T')[0],
+            now,
+          ]);
+
+          const stockLedgerId = 'stk_' + Date.now() + '_' + randomHex(3);
+          await dbRun(`
+            INSERT INTO stock_ledger (
+              id, product_id, batch_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
+            ) VALUES (?, ?, ?, 'PURCHASE', ?, ?, 'MANUAL_ADJUSTMENT', ?, 'Initial Store Stock Entry', ?, ?)
+          `, [
+            stockLedgerId,
+            productId,
+            batchId,
+            Number(initial_stock),
+            numPurchaseCost,
+            productId,
+            req.user?.id || 'SYSTEM',
+            now,
           ]);
         }
+      });
+    } catch (txErr: any) {
+      if (isIdempotencyConflictError(txErr)) {
+        const cached = (scopedKey && (await getIdempotencyRecord<{ id: string }>(scopedKey))) ||
+          (await getIdempotencyRecord<{ id: string }>(fpKey));
+        if (cached?.id) {
+          res.json({ success: true, id: cached.id, duplicate_prevented: true, message: 'Duplicate submission prevented' });
+          return;
+        }
       }
+      throw txErr;
+    }
 
-      // If initial real stock is provided (e.g. physical inventory count from store)
-      if (Number(initial_stock) > 0) {
-        const batchId = 'batch_init_' + productId;
-        dbRun(`
-          INSERT INTO purchase_batches (
-            id, product_id, batch_number, initial_qty, remaining_qty, unit_cost, received_date, is_active, created_at
-          ) VALUES (?, ?, 'INITIAL-OPENING', ?, ?, ?, ?, 1, ?)
-        `, [
-          batchId,
-          productId,
-          Number(initial_stock),
-          Number(initial_stock),
-          numPurchaseCost,
-          now.split('T')[0],
-          now
-        ]);
-
-        const stockLedgerId = 'stk_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-        dbRun(`
-          INSERT INTO stock_ledger (
-            id, product_id, batch_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
-          ) VALUES (?, ?, ?, 'PURCHASE', ?, ?, 'MANUAL_ADJUSTMENT', ?, 'Initial Store Stock Entry', ?, ?)
-        `, [
-          stockLedgerId,
-          productId,
-          batchId,
-          Number(initial_stock),
-          numPurchaseCost,
-          productId,
-          req.user?.id || 'SYSTEM',
-          now
-        ]);
-      }
-    });
-
-    // Record submission in recent cache
-    const submissionKey = clientKey || productId;
-    recentSubmissions.set(submissionKey, {
-      productId,
-      fingerprint,
-      timestamp: Date.now()
-    });
-
-    // 7. Audit log and response
-    logAudit(req.user.id, 'CREATE_PRODUCT', 'PRODUCT', productId, {
+    await logAudit(req.user.id, 'CREATE_PRODUCT', 'PRODUCT', productId, {
       name: name.trim(),
       code: cleanCode,
       sku: cleanSku,
       barcode: cleanBarcode,
       mrp: numMrp,
       selling_price: numSellingPrice,
-      initial_stock: Number(initial_stock) || 0
+      initial_stock: Number(initial_stock) || 0,
     });
 
     res.json({ success: true, id: productId });
   } catch (err: any) {
-    // Log server-side diagnostics without leaking secrets or tokens
     console.error('[Product Save Error]', {
       errorMessage: err.message,
       name: req.body?.name,
       sku: req.body?.sku,
       barcode: req.body?.barcode,
       userId: req.user?.id,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
 
     let clientMessage = err.message || 'Failed to save product.';
@@ -566,7 +563,7 @@ router.post('/', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Update product
-router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+router.put('/:id', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (req.user?.role !== 'OWNER') {
       res.status(403).json({ error: 'Only store Owner can edit products' });
@@ -589,10 +586,10 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
       festival_discount,
       category_attributes,
       image_url,
-      is_active
+      is_active,
     } = req.body;
 
-    const existing = dbQueryOne<any>('SELECT * FROM products WHERE id = ?', [id]);
+    const existing = await dbQueryOne<any>('SELECT * FROM products WHERE id = ?', [id]);
     if (!existing) {
       res.status(404).json({ error: 'Product not found' });
       return;
@@ -611,27 +608,24 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
       return;
     }
 
-    // Category check
     if (category_id !== undefined && category_id !== null && category_id !== '') {
-      const cat = dbQueryOne('SELECT id FROM categories WHERE id = ?', [category_id]);
+      const cat = await dbQueryOne('SELECT id FROM categories WHERE id = ?', [category_id]);
       if (!cat) {
         res.status(400).json({ error: 'Selected category does not exist.' });
         return;
       }
     }
 
-    // Brand check
     if (brand_id !== undefined && brand_id !== null && brand_id !== '') {
-      const brd = dbQueryOne('SELECT id FROM brands WHERE id = ?', [brand_id]);
+      const brd = await dbQueryOne('SELECT id FROM brands WHERE id = ?', [brand_id]);
       if (!brd) {
         res.status(400).json({ error: 'Selected brand does not exist.' });
         return;
       }
     }
 
-    // Code check
     if (code && code.trim() && code.trim().toLowerCase() !== (existing.code || '').toLowerCase()) {
-      const existingCode = dbQueryOne<{ id: string; name: string }>(
+      const existingCode = await dbQueryOne<{ id: string; name: string }>(
         'SELECT id, name FROM products WHERE LOWER(code) = LOWER(?) AND id != ?',
         [code.trim(), id]
       );
@@ -641,9 +635,8 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
       }
     }
 
-    // SKU check
     if (sku && sku.trim() && sku.trim().toLowerCase() !== (existing.sku || '').toLowerCase()) {
-      const existingSku = dbQueryOne<{ id: string; name: string }>(
+      const existingSku = await dbQueryOne<{ id: string; name: string }>(
         'SELECT id, name FROM products WHERE LOWER(sku) = LOWER(?) AND id != ?',
         [sku.trim(), id]
       );
@@ -652,7 +645,7 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
         return;
       }
 
-      const existingVariantSku = dbQueryOne<{ id: string; name: string }>(
+      const existingVariantSku = await dbQueryOne<{ id: string; name: string }>(
         'SELECT v.id, p.name FROM product_variants v JOIN products p ON v.product_id = p.id WHERE LOWER(v.sku) = LOWER(?) AND v.product_id != ?',
         [sku.trim(), id]
       );
@@ -662,9 +655,8 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
       }
     }
 
-    // Barcode check
     if (barcode && barcode.trim() && barcode.trim() !== (existing.barcode || '')) {
-      const existingBarcode = dbQueryOne<{ id: string; name: string }>(
+      const existingBarcode = await dbQueryOne<{ id: string; name: string }>(
         'SELECT id, name FROM products WHERE barcode = ? AND id != ?',
         [barcode.trim(), id]
       );
@@ -673,7 +665,7 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
         return;
       }
 
-      const existingVariantBarcode = dbQueryOne<{ id: string; name: string }>(
+      const existingVariantBarcode = await dbQueryOne<{ id: string; name: string }>(
         'SELECT v.id, p.name FROM product_variants v JOIN products p ON v.product_id = p.id WHERE v.barcode = ? AND v.product_id != ?',
         [barcode.trim(), id]
       );
@@ -685,8 +677,8 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
 
     const now = new Date().toISOString();
 
-    dbTransaction(() => {
-      dbRun(`
+    await dbTransaction(async () => {
+      await dbRun(`
         UPDATE products SET
           name = ?,
           category_id = ?,
@@ -707,33 +699,33 @@ router.put('/:id', authMiddleware, (req: AuthenticatedRequest, res: Response) =>
         WHERE id = ?
       `, [
         name ? name.trim() : existing.name,
-        category_id !== undefined ? (category_id || null) : existing.category_id,
-        brand_id !== undefined ? (brand_id || null) : existing.brand_id,
-        code !== undefined ? (code?.trim() || null) : existing.code,
-        sku !== undefined ? (sku?.trim() || null) : existing.sku,
-        barcode !== undefined ? (barcode?.trim() || null) : existing.barcode,
-        description !== undefined ? (description?.trim() || null) : existing.description,
-        tags !== undefined ? (tags?.trim() || null) : existing.tags,
+        category_id !== undefined ? category_id || null : existing.category_id,
+        brand_id !== undefined ? brand_id || null : existing.brand_id,
+        code !== undefined ? code?.trim() || null : existing.code,
+        sku !== undefined ? sku?.trim() || null : existing.sku,
+        barcode !== undefined ? barcode?.trim() || null : existing.barcode,
+        description !== undefined ? description?.trim() || null : existing.description,
+        tags !== undefined ? tags?.trim() || null : existing.tags,
         targetMrp,
         targetSellingPrice,
         purchase_cost !== undefined ? Number(purchase_cost) : existing.purchase_cost,
-        festival_discount !== undefined ? Number(festival_discount) : (existing.festival_discount || 0),
+        festival_discount !== undefined ? Number(festival_discount) : existing.festival_discount || 0,
         category_attributes !== undefined ? JSON.stringify(category_attributes) : existing.category_attributes,
-        image_url !== undefined ? (image_url?.trim() || null) : existing.image_url,
+        image_url !== undefined ? image_url?.trim() || null : existing.image_url,
         is_active !== undefined ? (is_active ? 1 : 0) : existing.is_active,
         now,
-        id
+        id,
       ]);
     });
 
-    logAudit(req.user.id, 'UPDATE_PRODUCT', 'PRODUCT', id, { name, selling_price: targetSellingPrice, mrp: targetMrp });
+    await logAudit(req.user.id, 'UPDATE_PRODUCT', 'PRODUCT', id, { name, selling_price: targetSellingPrice, mrp: targetMrp });
     res.json({ success: true });
   } catch (err: any) {
     console.error('[Product Update Error]', {
       errorMessage: err.message,
       productId: req.params?.id,
       userId: req.user?.id,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
     res.status(400).json({ error: err.message || 'Failed to update product' });
   }

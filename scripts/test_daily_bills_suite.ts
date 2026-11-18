@@ -1,4 +1,5 @@
-import { getDb, dbQueryOne, dbQueryAll } from '../server/db.ts';
+import { dbQueryOne } from '../server/db.ts';
+import { initNodeDatabase } from '../server/dbNode.ts';
 import { generateToken } from '../server/auth.ts';
 
 async function runTestSuite() {
@@ -6,10 +7,10 @@ async function runTestSuite() {
   console.log('NEW BHAMA FASHIONS ERP - DAILY BILLS VERIFICATION SUITE');
   console.log('====================================================\n');
 
-  await getDb();
-  const owner = dbQueryOne<any>('SELECT * FROM users WHERE role = "OWNER"');
+  await initNodeDatabase();
+  const owner = await dbQueryOne<any>('SELECT * FROM users WHERE role = "OWNER"');
   if (!owner) throw new Error('No owner found in database');
-  const token = generateToken(owner.id);
+  const token = await generateToken(owner.id);
   const headers = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${token}`,
@@ -31,7 +32,7 @@ async function runTestSuite() {
   }
 
   // Baseline Inventory Ledger Check
-  const stockBaseline = dbQueryOne<any>('SELECT COUNT(*) as cnt, COALESCE(SUM(quantity), 0) as total_qty FROM stock_ledger');
+  const stockBaseline = await dbQueryOne<any>('SELECT COUNT(*) as cnt, COALESCE(SUM(quantity), 0) as total_qty FROM stock_ledger');
   const baselineCount = stockBaseline.cnt;
   const baselineQty = stockBaseline.total_qty;
   console.log(`Initial Stock Ledger Baseline: ${baselineCount} rows, Total Qty: ${baselineQty}\n`);

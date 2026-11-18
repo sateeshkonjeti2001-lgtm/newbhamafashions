@@ -1,8 +1,8 @@
-import { Router, Response } from 'express';
-import { dbQueryAll, dbQueryOne, dbRun, getDb, saveDb } from '../db.ts';
+import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
+import { dbQueryAll } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
 
-const router = Router();
+const router = new Router();
 router.use(authMiddleware);
 
 // Helper to format ISO date to readable label e.g. '15 Oct'
@@ -69,7 +69,7 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
 
     salesQuery += ` ORDER BY s.created_at ASC `;
 
-    const sales = dbQueryAll<any>(salesQuery, params);
+    const sales = await dbQueryAll<any>(salesQuery, params);
 
     // Fetch returns in range
     let returnsQuery = `
@@ -84,7 +84,7 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
       returnsQuery += ` AND DATE(created_at) >= ? AND DATE(created_at) <= ? `;
       returnParams.push(startDate, endDate);
     }
-    const returns = dbQueryAll<any>(returnsQuery, returnParams);
+    const returns = await dbQueryAll<any>(returnsQuery, returnParams);
 
     const returnsByDate: Record<string, { count: number; totalRefund: number }> = {};
     returns.forEach((r) => {
@@ -255,7 +255,7 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
       ORDER BY total_revenue DESC
       LIMIT 5
     `;
-    const topProducts = dbQueryAll<any>(topProductsQuery, topProdParams);
+    const topProducts = await dbQueryAll<any>(topProductsQuery, topProdParams);
 
     // Business Performance Insights for Owner
     const insights: string[] = [];
@@ -327,5 +327,5 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
     res.status(500).json({ error: err.message || 'Failed to calculate sales trends' });
   }
 });
-export default router;
 
+export default router;

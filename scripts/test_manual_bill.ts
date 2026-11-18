@@ -1,13 +1,14 @@
-import { getDb, dbQueryOne, dbQueryAll } from '../server/db.ts';
+import { dbQueryOne } from '../server/db.ts';
+import { initNodeDatabase } from '../server/dbNode.ts';
 import { generateToken } from '../server/auth.ts';
 
 async function runTests() {
   console.log('=== STARTING MANUAL BILL ENTRY TEST SUITE ===\n');
 
-  await getDb();
-  const owner = dbQueryOne<any>('SELECT * FROM users WHERE role = "OWNER"');
+  await initNodeDatabase();
+  const owner = await dbQueryOne<any>('SELECT * FROM users WHERE role = "OWNER"');
   if (!owner) throw new Error('No owner found');
-  const token = generateToken(owner.id);
+  const token = await generateToken(owner.id);
   const headers = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${token}`,
@@ -25,7 +26,7 @@ async function runTests() {
   }
 
   // 1. Initial Stock Ledger Count for Inventory Non-Deduction Baseline
-  const initialStockRow = dbQueryOne<any>('SELECT COUNT(*) as count, COALESCE(SUM(quantity), 0) as total_qty FROM stock_ledger');
+  const initialStockRow = await dbQueryOne<any>('SELECT COUNT(*) as count, COALESCE(SUM(quantity), 0) as total_qty FROM stock_ledger');
   const initialStockCount = initialStockRow.count;
   const initialStockQty = initialStockRow.total_qty;
   console.log(`Baseline Stock Ledger: ${initialStockCount} entries, total qty ${initialStockQty}`);

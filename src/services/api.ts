@@ -173,9 +173,12 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
-  logout: () => {
-    clearStoredToken();
-    return request<{ success: boolean; message: string }>('/auth/logout', { method: 'POST' });
+  logout: async () => {
+    try {
+      return await request<{ success: boolean; message: string }>('/auth/logout', { method: 'POST' });
+    } finally {
+      clearStoredToken();
+    }
   },
   getMe: () => request<{ user: User }>('/auth/me'),
   getUsers: () => request<{ users: User[] }>('/auth/users'),
@@ -585,6 +588,8 @@ export const api = {
       totalTables: number;
       totalRecords: number;
       tableCounts: Record<string, number>;
+      engine?: 'sqlite-node' | 'cloudflare-d1';
+      downloadExtension?: string;
     }>('/backup/live-info'),
   downloadLiveDatabase: async (): Promise<{
     filename: string;
