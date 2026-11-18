@@ -13,8 +13,6 @@ export interface Env {
   DB: D1Database;
   AUTH_SECRET?: string;
   SESSION_SECRET?: string;
-  ENTRY_PIN_HASH?: string;
-  ENTRY_PIN?: string;
   NODE_ENV?: string;
 }
 
@@ -25,8 +23,6 @@ function buildEnvRecord(env: Env): Record<string, string | undefined> {
     NODE_ENV: env.NODE_ENV || 'production',
     AUTH_SECRET: env.AUTH_SECRET,
     SESSION_SECRET: env.SESSION_SECRET,
-    ENTRY_PIN_HASH: env.ENTRY_PIN_HASH,
-    ENTRY_PIN: env.ENTRY_PIN,
   };
 }
 

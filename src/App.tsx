@@ -8,7 +8,6 @@ import {
 } from 'lucide-react';
 import { api, removeStoredToken } from './services/api.ts';
 import { User } from './types.ts';
-import { EntryGateScreen } from './components/EntryGateScreen.tsx';
 import { Navbar } from './components/Navbar.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
@@ -35,7 +34,6 @@ const LoginScreen = lazy(() =>
 );
 
 export default function App() {
-  const [gateVerified, setGateVerified] = useState<boolean | null>(null);
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeTab, setActiveTab] = useState<string>('dashboard');
@@ -80,10 +78,6 @@ export default function App() {
         removeStoredToken();
       }
     } catch (err: any) {
-      if (err?.status === 403) {
-        setGateVerified(false);
-        return;
-      }
       console.error('App init error:', err);
     } finally {
       setLoading(false);
@@ -91,34 +85,8 @@ export default function App() {
   };
 
   useEffect(() => {
-    let active = true;
-    const checkGateAndBoot = async () => {
-      try {
-        const gateRes = await api.getGateStatus();
-        if (!active) return;
-        if (gateRes.verified) {
-          setGateVerified(true);
-          await initAuth();
-        } else {
-          setGateVerified(false);
-          setLoading(false);
-        }
-      } catch {
-        if (!active) return;
-        setGateVerified(false);
-        setLoading(false);
-      }
-    };
-    checkGateAndBoot();
-    return () => {
-      active = false;
-    };
+    initAuth();
   }, []);
-
-  const handleGateVerified = async () => {
-    setGateVerified(true);
-    await initAuth();
-  };
 
   const handleLogout = async () => {
     try {
@@ -131,16 +99,6 @@ export default function App() {
     setActiveTab('dashboard');
     setMobileMenuOpen(false);
   };
-
-  // Plain background while checking initial entry-gate cookie status on the server
-  if (gateVerified === null) {
-    return <div className="min-h-screen bg-[#F5F2EC]" />;
-  }
-
-  // 0. Private Entry Gate Screen (10 identical circular dots)
-  if (!gateVerified) {
-    return <EntryGateScreen onVerified={handleGateVerified} />;
-  }
 
   if (loading) {
     return (

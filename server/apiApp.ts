@@ -1,7 +1,6 @@
 import { WebRouter } from './webRouter.ts';
 import { getDbEngine } from './db.ts';
 
-import gateRoutes from './routes/gateRoutes.ts';
 import authRoutes from './routes/authRoutes.ts';
 import dashboardRoutes from './routes/dashboardRoutes.ts';
 import productRoutes from './routes/productRoutes.ts';
@@ -30,7 +29,6 @@ export function createApiRouter(): WebRouter {
     });
   });
 
-  api.use('/api/gate', gateRoutes);
   api.use('/api/auth', authRoutes);
   api.use('/api/dashboard', dashboardRoutes);
   api.use('/api/products', productRoutes);

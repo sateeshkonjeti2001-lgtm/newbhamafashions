@@ -2,8 +2,6 @@ import { User, BackupRecord, BackupHealth, BackupSettings, DryRunRestoreReport, 
 
 const BASE_URL = '/api';
 
-const ENTRY_GATE_STORAGE_KEY = 'nbf_entry_gate_token';
-
 export function getStoredToken(): string | null {
   return localStorage.getItem('nbf_auth_token');
 }
@@ -18,33 +16,8 @@ export function clearStoredToken(): void {
 
 export const removeStoredToken = clearStoredToken;
 
-export function getStoredGateToken(): string | null {
-  try {
-    return sessionStorage.getItem(ENTRY_GATE_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setStoredGateToken(token: string): void {
-  try {
-    sessionStorage.setItem(ENTRY_GATE_STORAGE_KEY, token);
-  } catch {
-    // Ignore storage errors in restricted contexts
-  }
-}
-
-export function clearStoredGateToken(): void {
-  try {
-    sessionStorage.removeItem(ENTRY_GATE_STORAGE_KEY);
-  } catch {
-    // Ignore storage errors
-  }
-}
-
 async function request<T>(endpoint: string, options: RequestInit = {}, retries = 1): Promise<T> {
   const token = getStoredToken();
-  const gateToken = getStoredGateToken();
   const headers: Record<string, string> = {
     'Accept': 'application/json',
     'Content-Type': 'application/json',
@@ -53,9 +26,6 @@ async function request<T>(endpoint: string, options: RequestInit = {}, retries =
 
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
-  }
-  if (gateToken) {
-    headers['X-Entry-Gate-Token'] = gateToken;
   }
 
   let res: Response;
@@ -97,9 +67,6 @@ async function request<T>(endpoint: string, options: RequestInit = {}, retries =
     if (res.status === 401) {
       clearStoredToken();
     }
-    if (res.status === 403 && endpoint.startsWith('/auth/')) {
-      clearStoredGateToken();
-    }
 
     const err: any = new Error(errorMsg);
     err.status = res.status;
@@ -123,32 +90,6 @@ async function request<T>(endpoint: string, options: RequestInit = {}, retries =
 }
 
 export const api = {
-  // Entry Gate (Pre-login PIN verification)
-  getGateStatus: () => request<{ verified: boolean }>('/gate/status'),
-  verifyGatePin: async (pin: string): Promise<{ verified: boolean }> => {
-    try {
-      const res = await fetch(`${BASE_URL}/gate/verify`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ pin }),
-      });
-      if (!res.ok) {
-        return { verified: false };
-      }
-      const data = await res.json();
-      if (data?.verified && typeof data?.gateToken === 'string') {
-        setStoredGateToken(data.gateToken);
-      }
-      return { verified: Boolean(data?.verified) };
-    } catch {
-      return { verified: false };
-    }
-  },
-
   // Auth
   getAuthStatus: () => request<{
     initialized: boolean;

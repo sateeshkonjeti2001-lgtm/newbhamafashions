@@ -12,7 +12,6 @@ import {
   authMiddleware,
   AuthenticatedRequest,
 } from '../auth.ts';
-import { entryGateMiddleware } from '../gate.ts';
 import { logAudit } from '../audit.ts';
 
 const router = new Router();
@@ -53,7 +52,7 @@ function clearSessionCookie(req: Request, res: Response) {
 }
 
 // Check if store is initialized (supports both /status and /setup-status)
-router.get(['/status', '/setup-status'], entryGateMiddleware, async (req: Request, res: Response) => {
+router.get(['/status', '/setup-status'], async (req: Request, res: Response) => {
   try {
     const userCountRow = await dbQueryOne<{ count: number }>('SELECT COUNT(*) as count FROM users');
     const isInitialized = (userCountRow?.count || 0) > 0;
@@ -85,7 +84,7 @@ router.get(['/status', '/setup-status'], entryGateMiddleware, async (req: Reques
 });
 
 // Setup initial OWNER account (only allowed when 0 users exist)
-router.post('/setup', entryGateMiddleware, async (req: Request, res: Response) => {
+router.post('/setup', async (req: Request, res: Response) => {
   try {
     const userCountRow = await dbQueryOne<{ count: number }>('SELECT COUNT(*) as count FROM users');
     if ((userCountRow?.count || 0) > 0) {
@@ -196,8 +195,8 @@ router.post('/setup', entryGateMiddleware, async (req: Request, res: Response) =
   }
 });
 
-// Login (rate limited: 5 attempts per 15 min per IP; requires verified entry gate)
-router.post('/login', entryGateMiddleware, loginLimiter, async (req: Request, res: Response) => {
+// Login (rate limited: 5 attempts per 15 min per IP)
+router.post('/login', loginLimiter, async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
