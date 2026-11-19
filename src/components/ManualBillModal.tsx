@@ -22,6 +22,7 @@ import { saveManualBillToFirestore } from '../services/firebase.ts';
 
 export interface ManualBillItem {
   id: string;
+  product_id?: string;
   itemName: string;
   quantity: number;
   rate: number;
@@ -30,14 +31,17 @@ export interface ManualBillItem {
 interface ManualBillModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onBillSaved: (savedBill: any) => void;
+  onBillSaved: (savedBill: any, mode?: 'create' | 'edit') => void;
+  editBill?: { sale: any; items: any[] } | null;
 }
 
 export const ManualBillModal: React.FC<ManualBillModalProps> = ({
   isOpen,
   onClose,
   onBillSaved,
+  editBill = null,
 }) => {
+  const isEditMode = Boolean(editBill?.sale?.id);
   const todayStr = new Date().toISOString().split('T')[0];
 
   // Bill Details
@@ -60,15 +64,68 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
   const [customerName, setCustomerName] = useState<string>('');
   const [customerPhone, setCustomerPhone] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
+  const [editReason, setEditReason] = useState<string>('');
 
   // Form State
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [firestoreStatus, setFirestoreStatus] = useState<string | null>(null);
+  const [confirmingEdit, setConfirmingEdit] = useState<boolean>(false);
 
-  // Reset form when modal opens
+  // Reset or prefill form when modal opens
   useEffect(() => {
-    if (isOpen) {
+    if (!isOpen) {
+      setConfirmingEdit(false);
+      return;
+    }
+
+    if (editBill?.sale) {
+      const s = editBill.sale;
+      const existingDate = String(s.created_at || todayStr).split('T')[0];
+      setBillDate(existingDate);
+      setBillNumber(s.bill_number || '');
+      setBillNumberWarning(null);
+
+      const loadedItems: ManualBillItem[] =
+        Array.isArray(editBill.items) && editBill.items.length > 0
+          ? editBill.items.map((it: any, idx: number) => ({
+              id: it.id || `edit_${idx}_${Date.now()}`,
+              product_id: it.product_id || undefined,
+              itemName: it.product_name || it.item_name || '',
+              quantity: Math.max(1, Number(it.quantity) || 1),
+              rate: Number(it.unit_price !== undefined ? it.unit_price : it.rate) || 0,
+            }))
+          : [{ id: Date.now().toString(), itemName: '', quantity: 1, rate: 0 }];
+
+      setItems(loadedItems);
+
+      const pm = (s.payment_method || 'CASH') as 'CASH' | 'UPI' | 'CARD' | 'SPLIT' | 'CREDIT';
+      setPaymentMethod(pm);
+      if (pm === 'SPLIT') {
+        setCashAmount(Number(s.cash_paid) || 0);
+        setUpiAmount(Number(s.upi_paid) || 0);
+      } else {
+        setCashAmount('');
+        setUpiAmount('');
+      }
+
+      setCustomerName(s.customer_name || '');
+      setCustomerPhone(s.customer_phone || '');
+
+      const rawNotes = String(s.notes || '');
+      if (rawNotes === 'Handwritten Bill Entry') {
+        setNotes('');
+      } else if (rawNotes.startsWith('Handwritten Bill: ')) {
+        setNotes(rawNotes.slice('Handwritten Bill: '.length));
+      } else {
+        setNotes(rawNotes);
+      }
+
+      setEditReason('');
+      setFormError(null);
+      setFirestoreStatus(null);
+      setConfirmingEdit(false);
+    } else {
       setBillDate(new Date().toISOString().split('T')[0]);
       setBillNumber('');
       setBillNumberWarning(null);
@@ -79,14 +136,16 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
       setCustomerName('');
       setCustomerPhone('');
       setNotes('');
+      setEditReason('');
       setFormError(null);
       setFirestoreStatus(null);
+      setConfirmingEdit(false);
     }
-  }, [isOpen]);
+  }, [isOpen, editBill]);
 
-  // Check duplicate bill number with debounce
+  // Check duplicate bill number with debounce (create mode only)
   useEffect(() => {
-    if (!billNumber.trim()) {
+    if (isEditMode || !billNumber.trim()) {
       setBillNumberWarning(null);
       return;
     }
@@ -113,7 +172,7 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
     }, 400);
 
     return () => clearTimeout(timer);
-  }, [billNumber, billDate]);
+  }, [billNumber, billDate, isEditMode]);
 
   // Calculate bill total
   const calculatedTotal = items.reduce((sum, item) => {
@@ -158,52 +217,52 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
     );
   };
 
-  // Submit Handler
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const validateForm = (): boolean => {
     setFormError(null);
 
-    // 1. Validate Bill Number
     if (!billNumber.trim()) {
       setFormError('Please enter the original handwritten bill number.');
-      return;
+      return false;
     }
 
-    if (billNumberWarning) {
+    if (isEditMode && billDate !== todayStr) {
+      setFormError(`Same-day restriction: Bill date must remain today (${todayStr}) when editing.`);
+      return false;
+    }
+
+    if (!isEditMode && billNumberWarning) {
       setFormError(
         `Duplicate bill number: Bill #${billNumber.trim()} already exists for ${billDate}. Please verify the handwritten bill number to avoid duplicates.`
       );
-      return;
+      return false;
     }
 
-    // 2. Validate Items
     if (items.length === 0) {
       setFormError('Please add at least one item.');
-      return;
+      return false;
     }
 
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       if (!it.itemName.trim()) {
         setFormError(`Item #${i + 1} is missing an item name.`);
-        return;
+        return false;
       }
       if (Number(it.quantity) < 1) {
         setFormError(`Item "${it.itemName}" must have quantity of at least 1.`);
-        return;
+        return false;
       }
       if (Number(it.rate) <= 0) {
         setFormError(`Item "${it.itemName}" must have a valid rate greater than ₹0.`);
-        return;
+        return false;
       }
     }
 
     if (calculatedTotal <= 0) {
       setFormError('Total bill amount must be greater than ₹0.');
-      return;
+      return false;
     }
 
-    // 3. Validate Split payment amounts
     const cashVal = Number(cashAmount) || 0;
     const upiVal = Number(upiAmount) || 0;
 
@@ -213,24 +272,43 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
         setFormError(
           `Split amounts do not match Total Bill. Cash (₹${cashVal}) + UPI (₹${upiVal}) = ₹${splitTotal}, but Total is ₹${calculatedTotal}.`
         );
-        return;
+        return false;
       }
     }
 
-    // 4. Validate Credit payment
     if (paymentMethod === 'CREDIT' && !customerName.trim()) {
       setFormError('Customer Name is required for Credit / Due bills.');
+      return false;
+    }
+
+    return true;
+  };
+
+  // Submit Handler (Create directly; Edit opens confirmation step first)
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!validateForm()) return;
+
+    if (isEditMode && !confirmingEdit) {
+      setConfirmingEdit(true);
       return;
     }
 
+    await performSave();
+  };
+
+  const performSave = async () => {
+    const cashVal = Number(cashAmount) || 0;
+    const upiVal = Number(upiAmount) || 0;
     setSubmitting(true);
+    setFormError(null);
 
     try {
-      // Step A: Save to local ERP database (SQLite)
       const payload = {
         bill_number: billNumber.trim(),
         bill_date: billDate,
         items: items.map((it) => ({
+          ...(it.product_id ? { product_id: it.product_id } : {}),
           item_name: it.itemName.trim(),
           quantity: Number(it.quantity),
           rate: Number(it.rate),
@@ -242,11 +320,21 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
         customer_name: customerName.trim() || undefined,
         customer_phone: customerPhone.trim() || undefined,
         notes: notes.trim() || undefined,
+        ...(isEditMode && editReason.trim() ? { edit_reason: editReason.trim() } : {}),
       };
 
+      if (isEditMode && editBill?.sale?.id) {
+        const res = await api.updateManualBill(editBill.sale.id, payload);
+        setConfirmingEdit(false);
+        onBillSaved(res.sale, 'edit');
+        onClose();
+        return;
+      }
+
+      // Step A: Save to local ERP database
       const res = await api.createManualBill(payload);
 
-      // Step B: Save to Firebase Firestore database in collection `manual_bills`
+      // Step B: Save to Firebase Firestore database in collection `manual_bills` (best-effort)
       try {
         const firestorePayload = {
           billNumber: billNumber.trim(),
@@ -277,10 +365,11 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
         console.warn('Firestore write warning:', fErr);
       }
 
-      onBillSaved(res.sale);
+      onBillSaved(res.sale, 'create');
       onClose();
     } catch (err: any) {
       console.error('Error saving manual bill:', err);
+      setConfirmingEdit(false);
       setFormError(err.message || 'Failed to save manual bill');
     } finally {
       setSubmitting(false);
@@ -299,14 +388,16 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-base font-bold text-[#1C1917] tracking-tight">
-                  Manual Bill Entry
+                  {isEditMode ? `Edit Manual Bill #${billNumber}` : 'Manual Bill Entry'}
                 </h2>
                 <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 font-semibold">
-                  Handwritten Bill Record
+                  {isEditMode ? 'Same-Day Direct Edit' : 'Handwritten Bill Record'}
                 </span>
               </div>
               <p className="text-xs text-[#6F6962] mt-0.5">
-                Record customer handwritten bills for day sales without deducting POS inventory stock
+                {isEditMode
+                  ? 'Update today’s handwritten bill items, totals, or payment method without creating a duplicate bill'
+                  : 'Record customer handwritten bills for day sales without deducting POS inventory stock'}
               </p>
             </div>
           </div>
@@ -344,6 +435,7 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                   <input
                     type="date"
                     value={billDate}
+                    min={isEditMode ? todayStr : undefined}
                     max={todayStr}
                     onChange={(e) => setBillDate(e.target.value)}
                     required
@@ -351,7 +443,9 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                   />
                 </div>
                 <span className="text-[11px] text-[#6F6962] mt-1 block">
-                  Select the actual date written on the physical handwritten bill
+                  {isEditMode
+                    ? `Same-day edit applies only to today's date (${todayStr})`
+                    : 'Select the actual date written on the physical handwritten bill'}
                 </span>
               </div>
 
@@ -362,12 +456,21 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                 <input
                   type="text"
                   value={billNumber}
-                  onChange={(e) => setBillNumber(e.target.value)}
+                  onChange={(e) => !isEditMode && setBillNumber(e.target.value)}
+                  readOnly={isEditMode}
                   placeholder="Enter bill number"
                   required
-                  className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-xs text-[#1C1917] font-medium focus:outline-none focus:border-[#A67C52]"
+                  className={`w-full px-3 py-2 border border-[#D4CDC2] rounded-xl text-xs font-medium focus:outline-none ${
+                    isEditMode
+                      ? 'bg-[#F0EDE6] text-[#6F6962] cursor-not-allowed font-mono'
+                      : 'bg-[#FAF8F4] text-[#1C1917] focus:border-[#A67C52]'
+                  }`}
                 />
-                {checkingNumber ? (
+                {isEditMode ? (
+                  <span className="text-[11px] text-[#3F6B50] font-medium mt-1 block">
+                    Original bill number is preserved on edit (no duplicate bill created)
+                  </span>
+                ) : checkingNumber ? (
                   <span className="text-[11px] text-[#6F6962] mt-1 block">Checking bill number...</span>
                 ) : billNumberWarning ? (
                   <div className="flex items-center gap-1.5 text-[11px] text-amber-700 font-medium mt-1">
@@ -724,34 +827,116 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                 className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-xs text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
               />
             </div>
+
+            {isEditMode && (
+              <div>
+                <label className="block text-xs font-semibold text-[#1C1917] mb-1">
+                  Reason for Editing (Optional — saved to Edit History)
+                </label>
+                <input
+                  type="text"
+                  value={editReason}
+                  onChange={(e) => setEditReason(e.target.value)}
+                  placeholder="e.g. Corrected quantity, rate, or payment mode"
+                  className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-xs text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
+                />
+              </div>
+            )}
           </div>
+
+          {/* Pre-save Confirmation Summary (Edit Mode) */}
+          {isEditMode && confirmingEdit && (
+            <div className="p-4 bg-[#FBF5EE] border-2 border-[#A67C52] rounded-xl space-y-3">
+              <div className="flex items-center gap-2 text-xs font-bold text-[#1C1917]">
+                <AlertCircle className="w-4 h-4 text-[#A67C52]" />
+                <span>Confirm Bill Changes for #{billNumber}</span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs bg-white border border-[#E3DED5] rounded-lg p-3">
+                <div>
+                  <span className="text-[10px] text-[#9A938B] block uppercase font-semibold">Previous Total</span>
+                  <span className="font-mono font-semibold text-[#6F6962] line-through">
+                    ₹{(Number(editBill?.sale?.total_amount) || 0).toLocaleString('en-IN')}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-[#9A938B] block uppercase font-semibold">Updated Total</span>
+                  <span className="font-mono font-bold text-[#1C1917]">
+                    ₹{calculatedTotal.toLocaleString('en-IN')}
+                  </span>
+                </div>
+                <div className="col-span-2 sm:col-span-1">
+                  <span className="text-[10px] text-[#9A938B] block uppercase font-semibold">Payment Method</span>
+                  <span className="font-semibold text-[#1C1917]">
+                    {editBill?.sale?.payment_method} → {paymentMethod}
+                  </span>
+                </div>
+              </div>
+              <p className="text-[11px] text-[#6F6962]">
+                Saving will update this existing bill, recalculate Cash/UPI/Customer Dues totals atomically, and append an entry to Edit History.
+              </p>
+            </div>
+          )}
         </form>
 
         {/* Modal Footer */}
         <div className="px-5 py-4 border-t border-[#E3DED5] bg-[#FAF8F4] flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2 text-xs text-[#6F6962] self-start sm:self-auto">
             <Cloud className="w-4 h-4 text-emerald-600" />
-            <span>Saves to Day Sales &amp; Firebase Firestore (0 Inventory Deduction)</span>
+            <span>
+              {isEditMode
+                ? 'Updates existing bill atomically & preserves audit trail'
+                : 'Saves to Day Sales & Firebase Firestore (0 Inventory Deduction)'}
+            </span>
           </div>
 
           <div className="flex items-center gap-2.5 w-full sm:w-auto">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={submitting}
-              className="flex-1 sm:flex-none px-4 py-2 border border-[#D4CDC2] text-[#1C1917] hover:bg-[#F0EDE6] rounded-xl text-xs font-semibold transition"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={handleSubmit}
-              disabled={submitting || calculatedTotal <= 0}
-              className="flex-1 sm:flex-none px-5 py-2.5 bg-[#A67C52] hover:bg-[#8C653E] disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition"
-            >
-              <CheckCircle className="w-4 h-4" />
-              <span>{submitting ? 'Saving Manual Bill...' : `Save Bill (₹${calculatedTotal.toLocaleString('en-IN')})`}</span>
-            </button>
+            {isEditMode && confirmingEdit ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setConfirmingEdit(false)}
+                  disabled={submitting}
+                  className="flex-1 sm:flex-none px-4 py-2 border border-[#D4CDC2] text-[#1C1917] hover:bg-[#F0EDE6] rounded-xl text-xs font-semibold transition cursor-pointer"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  onClick={performSave}
+                  disabled={submitting}
+                  className="flex-1 sm:flex-none px-5 py-2.5 bg-[#3F6B50] hover:bg-[#31553E] disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition cursor-pointer"
+                >
+                  <CheckCircle className="w-4 h-4" />
+                  <span>{submitting ? 'Saving Changes...' : 'Confirm & Save Changes'}</span>
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={onClose}
+                  disabled={submitting}
+                  className="flex-1 sm:flex-none px-4 py-2 border border-[#D4CDC2] text-[#1C1917] hover:bg-[#F0EDE6] rounded-xl text-xs font-semibold transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSubmit}
+                  disabled={submitting || calculatedTotal <= 0}
+                  className="flex-1 sm:flex-none px-5 py-2.5 bg-[#A67C52] hover:bg-[#8C653E] disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition cursor-pointer"
+                >
+                  <CheckCircle className="w-4 h-4" />
+                  <span>
+                    {submitting
+                      ? 'Saving...'
+                      : isEditMode
+                      ? `Save Changes (₹${calculatedTotal.toLocaleString('en-IN')})`
+                      : `Save Bill (₹${calculatedTotal.toLocaleString('en-IN')})`}
+                  </span>
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>

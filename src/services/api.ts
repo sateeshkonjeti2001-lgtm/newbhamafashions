@@ -227,7 +227,8 @@ export const api = {
   getDailyBills: (params?: { search?: string; date?: string; start_date?: string; end_date?: string; status?: string; limit?: number; offset?: number }) => {
     return api.getBills({ ...params, channel: 'MANUAL' });
   },
-  getBillDetail: (id: string) => request<{ sale: any; items: any[]; returns: any[]; customerDue?: any }>(`/pos/bills/${id}`),
+  getBillDetail: (id: string) =>
+    request<{ sale: any; items: any[]; returns: any[]; customerDue?: any; editHistory?: any[] }>(`/pos/bills/${id}`),
   cancelBill: (id: string, data: { reason: string; notes?: string }) => request<{ success: boolean; message: string; sale: any }>(`/pos/bills/${id}/cancel`, {
     method: 'POST',
     body: JSON.stringify(data),
@@ -240,6 +241,15 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  updateManualBill: (id: string, data: any) => request<{ success: boolean; message: string; sale: any }>(`/pos/manual-bills/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  }),
+  addManualBillCorrectionNote: (id: string, data: { note: string; reason?: string }) =>
+    request<{ success: boolean; message: string; correctionNote: any }>(`/pos/manual-bills/${id}/correction-note`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   checkBillNumber: (params: { billNumber: string; date?: string }) => {
     const query = new URLSearchParams();
     if (params.billNumber) query.set('billNumber', params.billNumber);

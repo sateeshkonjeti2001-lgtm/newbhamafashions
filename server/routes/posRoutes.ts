@@ -1209,6 +1209,774 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
   }
 });
 
+// Edit an existing same-day Manual Bill atomically (preserves bill_number, updates existing record & adjusts financial/due/stock totals)
+router.put(
+  '/manual-bills/:id',
+  authMiddleware,
+  requireRole(['OWNER', 'CASHIER']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const {
+        bill_number,
+        bill_date,
+        items,
+        payment_method,
+        cash_amount = 0,
+        upi_amount = 0,
+        customer_name,
+        customer_phone,
+        notes,
+        edit_reason,
+      } = req.body;
+
+      // 1. Fetch existing bill strictly by ID
+      const existingSale = await dbQueryOne<any>('SELECT * FROM sales WHERE id = ?', [id]);
+      if (!existingSale) {
+        res.status(404).json({ error: 'Manual bill not found.' });
+        return;
+      }
+
+      if (existingSale.channel !== 'MANUAL') {
+        res.status(400).json({ error: 'Only handwritten manual bills can be edited from this section.' });
+        return;
+      }
+
+      if (existingSale.status === 'CANCELLED') {
+        res.status(400).json({ error: 'Cancelled bills cannot be edited.' });
+        return;
+      }
+
+      // 2. Enforce same-day editing restriction and closed-day protection
+      const now = new Date().toISOString();
+      const todayStr = now.split('T')[0];
+      const originalBillDate = String(existingSale.created_at || '').split('T')[0];
+
+      const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [
+        originalBillDate,
+      ]);
+      const isDayClosed = Number(existingSale.day_closed) === 1 || closingRecord?.status === 'CLOSED';
+
+      if (originalBillDate !== todayStr) {
+        res.status(403).json({
+          error:
+            'Bills from previous dates cannot be directly edited. Please add a Correction Note instead.',
+        });
+        return;
+      }
+
+      if (isDayClosed) {
+        res.status(403).json({
+          error:
+            'Direct editing is not allowed after the business day has been closed. Please add a Correction Note instead.',
+        });
+        return;
+      }
+
+      if (bill_date && typeof bill_date === 'string' && bill_date.trim()) {
+        const requestedDate = bill_date.trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+          res.status(400).json({ error: 'Invalid bill date format. Expected YYYY-MM-DD.' });
+          return;
+        }
+        if (requestedDate !== todayStr) {
+          res.status(400).json({
+            error: `Same-day restriction: Bill date must remain today (${todayStr}) when editing.`,
+          });
+          return;
+        }
+      }
+
+      // 3. Preserve original bill number (disallow changing bill_number)
+      if (bill_number !== undefined && String(bill_number).trim() !== String(existingSale.bill_number).trim()) {
+        res.status(400).json({
+          error: `Original bill number (#${existingSale.bill_number}) must be preserved and cannot be changed.`,
+        });
+        return;
+      }
+
+      // 4. Validate and recalculate items authoritatively
+      if (!Array.isArray(items) || items.length === 0) {
+        res.status(400).json({ error: 'Please keep at least one item row on the bill.' });
+        return;
+      }
+
+      const validatedItems: Array<{
+        product_id: string;
+        item_name: string;
+        quantity: number;
+        rate: number;
+        item_total: number;
+      }> = [];
+
+      let calculatedTotal = 0;
+
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const name = String(it.item_name || it.product_name || it.name || '').trim();
+        if (!name) {
+          res.status(400).json({ error: `Item #${i + 1} must have an item name.` });
+          return;
+        }
+        const qty = parseInt(it.quantity, 10);
+        if (isNaN(qty) || qty < 1) {
+          res.status(400).json({ error: `Item "${name}" has invalid quantity. Must be at least 1.` });
+          return;
+        }
+        const rate = Number(it.rate !== undefined ? it.rate : it.unit_price);
+        if (!Number.isFinite(rate) || rate < 0) {
+          res.status(400).json({ error: `Item "${name}" has invalid rate. Rate cannot be negative.` });
+          return;
+        }
+        const itemTotal = Math.round(qty * rate);
+        calculatedTotal += itemTotal;
+        const prodId =
+          typeof it.product_id === 'string' && it.product_id.trim() ? it.product_id.trim() : 'prod_manual_billing';
+        validatedItems.push({
+          product_id: prodId,
+          item_name: name,
+          quantity: qty,
+          rate,
+          item_total: itemTotal,
+        });
+      }
+
+      if (calculatedTotal <= 0) {
+        res.status(400).json({ error: 'Total bill amount must be greater than ₹0.' });
+        return;
+      }
+
+      // 5. Validate payment method and split breakdown
+      const validMethods = ['CASH', 'UPI', 'CARD', 'SPLIT', 'CREDIT'];
+      if (!validMethods.includes(payment_method)) {
+        res.status(400).json({ error: `Invalid payment method. Must be one of: ${validMethods.join(', ')}` });
+        return;
+      }
+
+      let cashPaid = 0;
+      let upiPaid = 0;
+      let cardPaid = 0;
+      let balanceDue = 0;
+
+      if (payment_method === 'CASH') {
+        cashPaid = calculatedTotal;
+      } else if (payment_method === 'UPI') {
+        upiPaid = calculatedTotal;
+      } else if (payment_method === 'CARD') {
+        cardPaid = calculatedTotal;
+      } else if (payment_method === 'SPLIT') {
+        const cashNum = Math.max(0, Number(cash_amount) || 0);
+        const upiNum = Math.max(0, Number(upi_amount) || 0);
+        const splitSum = cashNum + upiNum;
+        if (Math.abs(splitSum - calculatedTotal) > 0.01) {
+          res.status(400).json({
+            error: `Split amounts (Cash ₹${cashNum} + UPI ₹${upiNum} = ₹${splitSum}) must equal the total bill amount ₹${calculatedTotal}.`,
+          });
+          return;
+        }
+        cashPaid = cashNum;
+        upiPaid = upiNum;
+      } else if (payment_method === 'CREDIT') {
+        balanceDue = calculatedTotal;
+        if (!customer_name || !String(customer_name).trim()) {
+          res.status(400).json({
+            error: 'Customer Name is required when recording a handwritten bill on Credit/Due.',
+          });
+          return;
+        }
+      }
+
+      // 6. Pre-fetch all dependent records BEFORE dbTransaction (D1-safe: no read-after-write inside transaction)
+      const existingItems = await dbQueryAll<any>('SELECT * FROM sale_items WHERE sale_id = ?', [existingSale.id]);
+      const existingDue = await dbQueryOne<any>('SELECT * FROM customer_dues WHERE sale_id = ?', [existingSale.id]);
+      const existingStockRows = await dbQueryAll<any>(
+        "SELECT * FROM stock_ledger WHERE reference_type = 'SALE' AND reference_id = ?",
+        [existingSale.id]
+      );
+      const existingFinTxs = await dbQueryAll<any>(
+        `SELECT * FROM financial_transactions
+         WHERE reference_no = ?
+           AND date = ?
+           AND transaction_type = 'INCOME'
+           AND category = 'SALES'
+           AND is_system_generated = 1
+           AND is_reversed = 0`,
+        [existingSale.bill_number, originalBillDate]
+      );
+
+      // Customer resolution
+      const cleanCustName = customer_name ? String(customer_name).trim() : '';
+      const cleanCustPhone = customer_phone ? String(customer_phone).trim() : '';
+      const oldCustomerId: string | null = existingSale.customer_id || null;
+      let newCustomerId: string | null = null;
+      let isNewCustomer = false;
+
+      if (cleanCustName) {
+        if (
+          oldCustomerId &&
+          existingSale.customer_name &&
+          existingSale.customer_name.trim().toLowerCase() === cleanCustName.toLowerCase() &&
+          (existingSale.customer_phone || '') === cleanCustPhone
+        ) {
+          newCustomerId = oldCustomerId;
+        } else {
+          const existingCust = cleanCustPhone
+            ? await dbQueryOne<any>('SELECT id FROM customers WHERE phone = ?', [cleanCustPhone])
+            : await dbQueryOne<any>('SELECT id FROM customers WHERE LOWER(name) = LOWER(?)', [cleanCustName]);
+          if (existingCust) {
+            newCustomerId = existingCust.id;
+          } else {
+            newCustomerId = 'cust_' + Date.now() + '_' + randomHex(4);
+            isNewCustomer = true;
+          }
+        }
+      }
+
+      // Guard customer dues if repayments were already collected against this bill
+      const alreadyPaidOnDue = existingDue ? Math.round(Number(existingDue.amount_paid || 0) * 100) / 100 : 0;
+      if (alreadyPaidOnDue > 0) {
+        if (newCustomerId !== existingDue.customer_id) {
+          res.status(400).json({
+            error: `Cannot change customer after ₹${alreadyPaidOnDue} has already been collected against this bill's credit due.`,
+          });
+          return;
+        }
+        if (payment_method !== 'CREDIT' || balanceDue < alreadyPaidOnDue) {
+          res.status(400).json({
+            error: `₹${alreadyPaidOnDue} has already been collected against this bill's credit due. Updated credit total must be at least ₹${alreadyPaidOnDue}.`,
+          });
+          return;
+        }
+      }
+
+      const finalDueBalance = existingDue
+        ? Math.max(0, Math.round((balanceDue - alreadyPaidOnDue) * 100) / 100)
+        : balanceDue;
+      const salesAmountPaid =
+        payment_method === 'CREDIT' ? alreadyPaidOnDue : calculatedTotal - balanceDue;
+      const salesBalanceDue = payment_method === 'CREDIT' ? finalDueBalance : 0;
+      const paymentStatus =
+        salesBalanceDue === 0 ? 'PAID' : salesAmountPaid > 0 ? 'PARTIAL' : 'UNPAID';
+
+      // Pre-compute stock reconciliation if bill had inventory-linked items or new inventory-linked items
+      const oldQtyByProd = new Map<string, number>();
+      for (const sr of existingStockRows) {
+        const pid = sr.product_id;
+        // SALE rows store negative quantity, edit restorations store positive quantity; net sold = -SUM(quantity)
+        const netSoldDelta = -Number(sr.quantity || 0);
+        oldQtyByProd.set(pid, (oldQtyByProd.get(pid) || 0) + netSoldDelta);
+      }
+      for (const [pid, qty] of oldQtyByProd.entries()) {
+        if (qty <= 0) {
+          oldQtyByProd.delete(pid);
+        }
+      }
+
+      const newQtyByProd = new Map<string, number>();
+      for (const it of validatedItems) {
+        if (it.product_id !== 'prod_manual_billing') {
+          newQtyByProd.set(it.product_id, (newQtyByProd.get(it.product_id) || 0) + it.quantity);
+        }
+      }
+
+      const stockDeltas: Array<{
+        productId: string;
+        deltaStock: number; // positive restores stock, negative deducts additional stock
+        unitCost: number;
+      }> = [];
+
+      const affectedStockProdIds = Array.from(new Set([...oldQtyByProd.keys(), ...newQtyByProd.keys()]));
+      const batchUpdatesForEdit: Array<{ id: string; remaining_qty: number; is_active: number }> = [];
+
+      if (affectedStockProdIds.length > 0) {
+        for (const pid of affectedStockProdIds) {
+          const oldSold = oldQtyByProd.get(pid) || 0;
+          const newSold = newQtyByProd.get(pid) || 0;
+          const stockRow = await dbQueryOne<{ stock: number }>(
+            'SELECT COALESCE(SUM(quantity), 0) as stock FROM stock_ledger WHERE product_id = ?',
+            [pid]
+          );
+          const prodRow = await dbQueryOne<any>('SELECT id, name, purchase_cost FROM products WHERE id = ?', [pid]);
+          const currentAvailable = Number(stockRow?.stock || 0);
+          const effectiveAvailable = currentAvailable + oldSold;
+          if (newSold > effectiveAvailable) {
+            res.status(400).json({
+              error: `Insufficient stock for '${prodRow?.name || pid}'. Available after bill adjustment: ${effectiveAvailable}, Requested: ${newSold}`,
+            });
+            return;
+          }
+
+          const diff = oldSold - newSold; // >0 restores inventory, <0 deducts more inventory
+          if (diff !== 0) {
+            stockDeltas.push({
+              productId: pid,
+              deltaStock: diff,
+              unitCost: Number(prodRow?.purchase_cost || 0),
+            });
+
+            if (diff < 0) {
+              // Deduct additional units from active FIFO purchase batches
+              let toTake = -diff;
+              const activeBatches = await dbQueryAll<any>(
+                'SELECT * FROM purchase_batches WHERE product_id = ? AND remaining_qty > 0 ORDER BY received_date ASC, created_at ASC',
+                [pid]
+              );
+              for (const b of activeBatches) {
+                if (toTake <= 0) break;
+                const take = Math.min(b.remaining_qty, toTake);
+                const rem = b.remaining_qty - take;
+                batchUpdatesForEdit.push({ id: b.id, remaining_qty: rem, is_active: rem > 0 ? 1 : 0 });
+                toTake -= take;
+              }
+            } else {
+              // Restore reduced units to latest depleted purchase batch
+              let toRestore = diff;
+              const partialBatches = await dbQueryAll<any>(
+                'SELECT * FROM purchase_batches WHERE product_id = ? AND remaining_qty < initial_qty ORDER BY received_date DESC, created_at DESC',
+                [pid]
+              );
+              for (const b of partialBatches) {
+                if (toRestore <= 0) break;
+                const space = b.initial_qty - b.remaining_qty;
+                if (space <= 0) continue;
+                const add = Math.min(space, toRestore);
+                batchUpdatesForEdit.push({ id: b.id, remaining_qty: b.remaining_qty + add, is_active: 1 });
+                toRestore -= add;
+              }
+            }
+          }
+        }
+      }
+
+      // Categorize existing financial_transactions for this bill so we update/delete/insert cleanly without duplicates
+      const cashTxRows = existingFinTxs.filter((tx) => tx.destination_account === 'CASH');
+      const upiTxRows = existingFinTxs.filter((tx) => tx.destination_account === 'UPI');
+      const cardTxRows = existingFinTxs.filter((tx) => tx.destination_account === 'BANK');
+
+      const trimmedNotes = notes !== undefined ? String(notes).trim() : '';
+      const formattedNotes = trimmedNotes
+        ? trimmedNotes.startsWith('Handwritten Bill:')
+          ? trimmedNotes
+          : `Handwritten Bill: ${trimmedNotes}`
+        : 'Handwritten Bill Entry';
+
+      const personEntityName = cleanCustName || 'Walk-in Customer';
+      const editedById = req.user?.id || 'STAFF';
+      const editedByName = req.user?.full_name || req.user?.username || 'Staff';
+      const cleanReason = edit_reason && String(edit_reason).trim() ? String(edit_reason).trim() : null;
+
+      const auditDetails = {
+        message: `Edited manual bill #${existingSale.bill_number} (₹${existingSale.total_amount} -> ₹${calculatedTotal}, ${existingSale.payment_method} -> ${payment_method})`,
+        bill_number: existingSale.bill_number,
+        bill_date: originalBillDate,
+        reason: cleanReason,
+        edited_by: editedById,
+        edited_by_name: editedByName,
+        edited_at: now,
+        before: {
+          bill_date: originalBillDate,
+          customer_name: existingSale.customer_name || null,
+          customer_phone: existingSale.customer_phone || null,
+          payment_method: existingSale.payment_method,
+          cash_paid: Number(existingSale.cash_paid) || 0,
+          upi_paid: Number(existingSale.upi_paid) || 0,
+          card_paid: Number(existingSale.card_paid) || 0,
+          balance_due: Number(existingSale.balance_due) || 0,
+          total_amount: Number(existingSale.total_amount) || 0,
+          notes: existingSale.notes || null,
+          items: existingItems.map((it) => ({
+            item_name: it.product_name,
+            quantity: Number(it.quantity),
+            rate: Number(it.unit_price),
+            item_total: Number(it.total_price),
+          })),
+        },
+        after: {
+          bill_date: originalBillDate,
+          customer_name: cleanCustName || null,
+          customer_phone: cleanCustPhone || null,
+          payment_method,
+          cash_paid: cashPaid,
+          upi_paid: upiPaid,
+          card_paid: cardPaid,
+          balance_due: salesBalanceDue,
+          total_amount: calculatedTotal,
+          notes: formattedNotes,
+          items: validatedItems.map((it) => ({
+            item_name: it.item_name,
+            quantity: it.quantity,
+            rate: it.rate,
+            item_total: it.item_total,
+          })),
+        },
+      };
+
+      // 7. Execute all updates atomically in a single transaction / D1 batch
+      await dbTransaction(async () => {
+        // Ensure fallback system product exists
+        await dbRun(
+          `INSERT OR IGNORE INTO products (
+            id, name, code, sku, barcode, category_id, mrp, selling_price, is_active, created_at, updated_at
+          ) VALUES (
+            'prod_manual_billing', 'Handwritten Bill Item', 'MANUAL-HW', 'SKU-MANUAL-HW', '000000000000', NULL, 0, 0, 0, ?, ?
+          )`,
+          [now, now]
+        );
+
+        // A. Customer creation / purchase totals update
+        if (oldCustomerId && oldCustomerId === newCustomerId) {
+          const totalDelta = calculatedTotal - Number(existingSale.total_amount || 0);
+          await dbRun(
+            'UPDATE customers SET total_purchases = MAX(0, total_purchases + ?), name = ?, phone = ? WHERE id = ?',
+            [totalDelta, cleanCustName || existingSale.customer_name, cleanCustPhone || null, oldCustomerId]
+          );
+        } else {
+          if (oldCustomerId) {
+            await dbRun('UPDATE customers SET total_purchases = MAX(0, total_purchases - ?) WHERE id = ?', [
+              Number(existingSale.total_amount || 0),
+              oldCustomerId,
+            ]);
+          }
+          if (newCustomerId) {
+            if (isNewCustomer) {
+              await dbRun(
+                'INSERT INTO customers (id, name, phone, address, notes, total_purchases, total_dues, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [
+                  newCustomerId,
+                  cleanCustName,
+                  cleanCustPhone || null,
+                  null,
+                  'Added via manual bill edit',
+                  calculatedTotal,
+                  salesBalanceDue,
+                  now,
+                ]
+              );
+            } else {
+              await dbRun('UPDATE customers SET total_purchases = total_purchases + ? WHERE id = ?', [
+                calculatedTotal,
+                newCustomerId,
+              ]);
+            }
+          }
+        }
+
+        // B. Update existing sales record (never insert duplicate or change bill_number/created_at date)
+        await dbRun(
+          `UPDATE sales SET
+            customer_id = ?,
+            customer_name = ?,
+            customer_phone = ?,
+            total_mrp = ?,
+            subtotal = ?,
+            total_amount = ?,
+            amount_paid = ?,
+            balance_due = ?,
+            payment_status = ?,
+            payment_method = ?,
+            cash_paid = ?,
+            upi_paid = ?,
+            card_paid = ?,
+            notes = ?
+          WHERE id = ?`,
+          [
+            newCustomerId,
+            cleanCustName || null,
+            cleanCustPhone || null,
+            calculatedTotal,
+            calculatedTotal,
+            calculatedTotal,
+            salesAmountPaid,
+            salesBalanceDue,
+            paymentStatus,
+            payment_method,
+            cashPaid,
+            upiPaid,
+            cardPaid,
+            formattedNotes,
+            existingSale.id,
+          ]
+        );
+
+        // C. Replace line items for this sale cleanly
+        await dbRun('DELETE FROM sale_items WHERE sale_id = ?', [existingSale.id]);
+        for (let idx = 0; idx < validatedItems.length; idx++) {
+          const it = validatedItems[idx];
+          const itemId = `si_manual_${Date.now()}_${idx}_${randomHex(3)}`;
+          await dbRun(
+            `INSERT INTO sale_items (
+              id, sale_id, product_id, product_name, quantity, mrp,
+              unit_price, festival_discount, special_discount, discount,
+              total_price, cogs, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, 0, ?)`,
+            [
+              itemId,
+              existingSale.id,
+              it.product_id,
+              it.item_name,
+              it.quantity,
+              it.rate,
+              it.rate,
+              it.item_total,
+              existingSale.created_at,
+            ]
+          );
+        }
+
+        // D. Adjust stock batches & stock_ledger ONLY if this bill had or now has real inventory products
+        for (const bu of batchUpdatesForEdit) {
+          await dbRun('UPDATE purchase_batches SET remaining_qty = ?, is_active = ? WHERE id = ?', [
+            bu.remaining_qty,
+            bu.is_active,
+            bu.id,
+          ]);
+        }
+        for (const sd of stockDeltas) {
+          await dbRun(
+            `INSERT INTO stock_ledger (
+              id, product_id, variant_id, movement_type, quantity, unit_cost, reference_type, reference_id, reason, created_by, created_at
+            ) VALUES (?, ?, NULL, ?, ?, ?, 'SALE', ?, ?, ?, ?)`,
+            [
+              'stk_edit_' + Date.now() + '_' + randomHex(4),
+              sd.productId,
+              sd.deltaStock > 0 ? 'ADJUSTMENT' : 'SALE',
+              sd.deltaStock,
+              sd.unitCost,
+              existingSale.id,
+              `Manual Bill #${existingSale.bill_number} Edit Adjustment`,
+              editedById,
+              now,
+            ]
+          );
+        }
+
+        // E. Update / insert / remove customer_dues cleanly
+        if (existingDue) {
+          if (payment_method === 'CREDIT' && newCustomerId) {
+            await dbRun(
+              `UPDATE customer_dues SET
+                customer_id = ?,
+                original_due = ?,
+                balance_due = ?,
+                status = ?,
+                notes = ?,
+                updated_at = ?
+              WHERE id = ?`,
+              [
+                newCustomerId,
+                balanceDue,
+                finalDueBalance,
+                finalDueBalance === 0 ? 'CLEARED' : 'PENDING',
+                `Outstanding balance on handwritten bill #${existingSale.bill_number} (Edited)`,
+                now,
+                existingDue.id,
+              ]
+            );
+          } else {
+            // Safe to remove only when amount_paid == 0 (already guarded above)
+            await dbRun('DELETE FROM customer_dues WHERE id = ?', [existingDue.id]);
+          }
+        } else if (payment_method === 'CREDIT' && balanceDue > 0 && newCustomerId) {
+          const dueId = 'due_' + Date.now() + '_' + randomHex(4);
+          await dbRun(
+            `INSERT INTO customer_dues (
+              id, customer_id, sale_id, original_due, amount_paid, balance_due, due_date, status, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, 'PENDING', ?, ?, ?)`,
+            [
+              dueId,
+              newCustomerId,
+              existingSale.id,
+              balanceDue,
+              balanceDue,
+              new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+              `Outstanding balance on handwritten bill #${existingSale.bill_number}`,
+              existingSale.created_at,
+              now,
+            ]
+          );
+        }
+
+        if (oldCustomerId && oldCustomerId !== newCustomerId) {
+          await dbRun(SYNC_CUSTOMER_DUES_SQL, [oldCustomerId, oldCustomerId]);
+        }
+        if (newCustomerId) {
+          await dbRun(SYNC_CUSTOMER_DUES_SQL, [newCustomerId, newCustomerId]);
+        }
+
+        // F. Reconcile Cash / UPI / Card financial_transactions in-place without creating duplicates
+        const reconcileChannelTx = async (
+          existingRows: any[],
+          newAmount: number,
+          destAccount: 'CASH' | 'UPI' | 'BANK',
+          payMethodLabel: 'CASH' | 'UPI' | 'CARD',
+          idPrefix: string
+        ) => {
+          if (newAmount > 0) {
+            if (existingRows.length > 0) {
+              const primary = existingRows[0];
+              await dbRun(
+                'UPDATE financial_transactions SET amount = ?, person_entity = ?, updated_at = ? WHERE id = ?',
+                [newAmount, personEntityName, now, primary.id]
+              );
+              for (let i = 1; i < existingRows.length; i++) {
+                await dbRun('DELETE FROM financial_transactions WHERE id = ?', [existingRows[i].id]);
+              }
+            } else {
+              const txId = `${idPrefix}_${Date.now()}_${randomHex(4)}`;
+              await dbRun(
+                `INSERT INTO financial_transactions (
+                  id, date, amount, source_account, destination_account, transaction_type,
+                  person_entity, category, purpose, payment_method, reference_no,
+                  is_system_generated, user_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'INCOME', ?, 'SALES', ?, ?, ?, 1, ?, ?, ?)`,
+                [
+                  txId,
+                  originalBillDate,
+                  newAmount,
+                  destAccount,
+                  personEntityName,
+                  `Manual Bill #${existingSale.bill_number}`,
+                  payMethodLabel,
+                  existingSale.bill_number,
+                  editedById,
+                  existingSale.created_at,
+                  now,
+                ]
+              );
+            }
+          } else {
+            for (const row of existingRows) {
+              await dbRun('DELETE FROM financial_transactions WHERE id = ?', [row.id]);
+            }
+          }
+        };
+
+        await reconcileChannelTx(cashTxRows, cashPaid, 'CASH', 'CASH', 'ftx_manual_cash');
+        await reconcileChannelTx(upiTxRows, upiPaid, 'UPI', 'UPI', 'ftx_manual_upi');
+        await reconcileChannelTx(cardTxRows, cardPaid, 'BANK', 'CARD', 'ftx_manual_card');
+
+        // G. Record immutable Edit History entry atomically in audit_logs
+        await dbRun(
+          'INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [
+            'aud_' + Date.now() + '_' + randomHex(4),
+            editedById,
+            'EDIT_MANUAL_BILL',
+            'sales',
+            existingSale.id,
+            JSON.stringify(auditDetails),
+            now,
+          ]
+        );
+      });
+
+      saveDb(true);
+
+      res.json({
+        success: true,
+        message: `Manual bill #${existingSale.bill_number} updated successfully.`,
+        sale: {
+          ...existingSale,
+          customer_id: newCustomerId,
+          customer_name: cleanCustName || null,
+          customer_phone: cleanCustPhone || null,
+          total_mrp: calculatedTotal,
+          subtotal: calculatedTotal,
+          total_amount: calculatedTotal,
+          amount_paid: salesAmountPaid,
+          balance_due: salesBalanceDue,
+          payment_status: paymentStatus,
+          payment_method,
+          cash_paid: cashPaid,
+          upi_paid: upiPaid,
+          card_paid: cardPaid,
+          notes: formattedNotes,
+          items: validatedItems,
+        },
+      });
+    } catch (err: any) {
+      console.error('Error editing manual bill:', err);
+      res.status(500).json({ error: err.message || 'Failed to update manual bill' });
+    }
+  }
+);
+
+// Add a Correction Note to a Manual Bill (designed for previous-date or closed bills where direct edit is restricted)
+router.post(
+  '/manual-bills/:id/correction-note',
+  authMiddleware,
+  requireRole(['OWNER', 'CASHIER']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { note, reason } = req.body;
+
+      if (!note || typeof note !== 'string' || note.trim().length < 3) {
+        res.status(400).json({ error: 'Please enter a clear correction note (at least 3 characters).' });
+        return;
+      }
+
+      const sale = await dbQueryOne<any>('SELECT * FROM sales WHERE id = ?', [id]);
+      if (!sale) {
+        res.status(404).json({ error: 'Manual bill not found.' });
+        return;
+      }
+
+      if (sale.channel !== 'MANUAL') {
+        res.status(400).json({ error: 'Correction notes can only be added to handwritten manual bills.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const addedById = req.user?.id || 'STAFF';
+      const addedByName = req.user?.full_name || req.user?.username || 'Staff';
+      const cleanNote = note.trim();
+      const cleanReason = reason && String(reason).trim() ? String(reason).trim() : null;
+      const billDate = String(sale.created_at || '').split('T')[0];
+
+      const noteDetails = {
+        message: `Correction note added to bill #${sale.bill_number}: ${cleanNote}`,
+        bill_number: sale.bill_number,
+        bill_date: billDate,
+        note: cleanNote,
+        reason: cleanReason,
+        added_by: addedById,
+        added_by_name: addedByName,
+        added_at: now,
+        total_amount_at_time: Number(sale.total_amount) || 0,
+        payment_method_at_time: sale.payment_method,
+      };
+
+      const logId = 'aud_' + Date.now() + '_' + randomHex(4);
+      await dbTransaction(async () => {
+        await dbRun(
+          'INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [logId, addedById, 'ADD_MANUAL_BILL_CORRECTION_NOTE', 'sales', sale.id, JSON.stringify(noteDetails), now]
+        );
+      });
+
+      saveDb(true);
+
+      res.json({
+        success: true,
+        message: `Correction note saved for Bill #${sale.bill_number}.`,
+        correctionNote: {
+          id: logId,
+          action: 'ADD_MANUAL_BILL_CORRECTION_NOTE',
+          user_id: addedById,
+          user_name: addedByName,
+          user_role: req.user?.role,
+          created_at: now,
+          details: noteDetails,
+        },
+      });
+    } catch (err: any) {
+      console.error('Error adding correction note:', err);
+      res.status(500).json({ error: err.message || 'Failed to save correction note' });
+    }
+  }
+);
+
 // Recent sales list for POS view
 router.get('/recent', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
   try {
@@ -1243,7 +2011,7 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
         s.id, s.bill_number, s.customer_id, s.customer_name, s.customer_phone,
         s.total_mrp, s.subtotal, s.festival_discount, s.special_discount,
         s.discount_amount, s.total_amount, s.amount_paid, s.balance_due,
-        s.payment_status, s.payment_method, s.cash_paid, s.upi_paid,
+        s.payment_status, s.payment_method, s.cash_paid, s.upi_paid, s.card_paid,
         s.channel, s.notes, s.cashier_id, s.day_closed, s.created_at,
         COALESCE(s.status, 'COMPLETED') as status,
         s.cancelled_at, s.cancelled_by, s.cancelled_by_name, s.cancelled_reason,
@@ -1252,7 +2020,9 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
         COALESCE(SUM(si.quantity), 0) as total_items,
         GROUP_CONCAT(si.product_name || ' (' || si.quantity || ')', ', ') as items_summary,
         COALESCE(r.total_refunded, 0) as total_refunded_amount,
-        COALESCE(r.return_count, 0) as return_count
+        COALESCE(r.return_count, 0) as return_count,
+        COALESCE(ah.edit_count, 0) as edit_count,
+        COALESCE(ah.correction_note_count, 0) as correction_note_count
       FROM sales s
       LEFT JOIN users u ON s.cashier_id = u.id
       LEFT JOIN sale_items si ON s.id = si.sale_id
@@ -1261,6 +2031,15 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
         FROM sale_returns
         GROUP BY sale_id
       ) r ON s.id = r.sale_id
+      LEFT JOIN (
+        SELECT
+          entity_id,
+          SUM(CASE WHEN action = 'EDIT_MANUAL_BILL' THEN 1 ELSE 0 END) as edit_count,
+          SUM(CASE WHEN action = 'ADD_MANUAL_BILL_CORRECTION_NOTE' THEN 1 ELSE 0 END) as correction_note_count
+        FROM audit_logs
+        WHERE action IN ('EDIT_MANUAL_BILL', 'ADD_MANUAL_BILL_CORRECTION_NOTE')
+        GROUP BY entity_id
+      ) ah ON s.id = ah.entity_id
       WHERE 1=1
     `;
     const params: any[] = [];
@@ -1363,11 +2142,39 @@ router.get('/bills/:id', authMiddleware, async (req: AuthenticatedRequest, res: 
 
     const customerDue = await dbQueryOne<any>('SELECT * FROM customer_dues WHERE sale_id = ?', [sale.id]);
 
+    const rawAuditHistory = await dbQueryAll<any>(
+      `SELECT
+        a.id, a.user_id, a.action, a.details, a.created_at,
+        COALESCE(u.full_name, u.username, 'Store Staff') as user_name,
+        u.username,
+        u.role as user_role
+      FROM audit_logs a
+      LEFT JOIN users u ON a.user_id = u.id
+      WHERE a.entity_id = ?
+        AND a.action IN ('EDIT_MANUAL_BILL', 'ADD_MANUAL_BILL_CORRECTION_NOTE')
+      ORDER BY a.created_at DESC`,
+      [sale.id]
+    );
+
+    const editHistory = rawAuditHistory.map((row) => {
+      let parsedDetails: any = null;
+      try {
+        parsedDetails = row.details ? JSON.parse(row.details) : null;
+      } catch {
+        parsedDetails = null;
+      }
+      return {
+        ...row,
+        details: parsedDetails,
+      };
+    });
+
     res.json({
       sale,
       items,
       returns,
-      customerDue
+      customerDue,
+      editHistory,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

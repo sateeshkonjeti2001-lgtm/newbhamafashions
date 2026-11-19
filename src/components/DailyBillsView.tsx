@@ -25,6 +25,9 @@ import {
   TrendingUp,
   Receipt,
   RotateCcw,
+  Pencil,
+  MessageSquarePlus,
+  History,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { UserRole } from '../types.ts';
@@ -70,12 +73,29 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
   const [cancelling, setCancelling] = useState<boolean>(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
 
+  // Post-Save Edit & Correction Note States
+  const [editingBillDetail, setEditingBillDetail] = useState<{ sale: any; items: any[] } | null>(null);
+  const [loadingEditId, setLoadingEditId] = useState<string | null>(null);
+  const [correctionNoteBill, setCorrectionNoteBill] = useState<any | null>(null);
+  const [correctionNoteText, setCorrectionNoteText] = useState<string>('');
+  const [correctionReason, setCorrectionReason] = useState<string>('');
+  const [savingCorrectionNote, setSavingCorrectionNote] = useState<boolean>(false);
+  const [correctionNoteError, setCorrectionNoteError] = useState<string | null>(null);
+
   // Success Feedback Toast
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 4000);
+  };
+
+  const isEligibleForDirectEdit = (bill: any): boolean => {
+    if (!bill || bill.status === 'CANCELLED' || Number(bill.day_closed) === 1) {
+      return false;
+    }
+    const billDate = String(bill.created_at || '').split('T')[0];
+    return billDate === todayStr;
   };
 
   // Compute date filter arguments based on dateMode
@@ -154,6 +174,64 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
       showToast(`Could not load bill details: ${err.message}`);
     } finally {
       setLoadingDetail(false);
+    }
+  };
+
+  // Start Editing Eligible Same-Day Manual Bill
+  const handleStartEditBill = async (bill: any) => {
+    if (!bill?.id) return;
+    setLoadingEditId(bill.id);
+    try {
+      const detail = await api.getBillDetail(bill.id);
+      setEditingBillDetail({
+        sale: detail.sale || bill,
+        items: detail.items || [],
+      });
+      setShowAddModal(true);
+    } catch (err: any) {
+      showToast(`Could not load bill for editing: ${err.message}`);
+    } finally {
+      setLoadingEditId(null);
+    }
+  };
+
+  // Open Correction Note Modal (Previous-Date / Day-Closed Bills)
+  const handleOpenCorrectionNote = (bill: any) => {
+    setCorrectionNoteBill(bill);
+    setCorrectionNoteText('');
+    setCorrectionReason('');
+    setCorrectionNoteError(null);
+  };
+
+  const handleSaveCorrectionNote = async () => {
+    if (!correctionNoteBill) return;
+    if (correctionNoteText.trim().length < 3) {
+      setCorrectionNoteError('Please enter a clear correction note (at least 3 characters).');
+      return;
+    }
+
+    setSavingCorrectionNote(true);
+    setCorrectionNoteError(null);
+    try {
+      await api.addManualBillCorrectionNote(correctionNoteBill.id, {
+        note: correctionNoteText.trim(),
+        reason: correctionReason.trim() || undefined,
+      });
+
+      const billNumber = correctionNoteBill.bill_number;
+      const targetId = correctionNoteBill.id;
+      setCorrectionNoteBill(null);
+      setCorrectionNoteText('');
+      setCorrectionReason('');
+      showToast(`Correction note saved for Bill #${billNumber}.`);
+      fetchDailyBills();
+      if (selectedBillDetail?.sale?.id === targetId) {
+        handleViewBill(targetId);
+      }
+    } catch (err: any) {
+      setCorrectionNoteError(err.message || 'Failed to save correction note');
+    } finally {
+      setSavingCorrectionNote(false);
     }
   };
 
@@ -241,6 +319,21 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
     }
   };
 
+  const formatDateTime = (isoStr: string) => {
+    if (!isoStr) return '-';
+    try {
+      return new Date(isoStr).toLocaleString('en-IN', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return isoStr;
+    }
+  };
+
   return (
     <div className="space-y-5">
       {/* Toast Feedback */}
@@ -282,7 +375,10 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
             </button>
 
             <button
-              onClick={() => setShowAddModal(true)}
+              onClick={() => {
+                setEditingBillDetail(null);
+                setShowAddModal(true);
+              }}
               className="px-4 py-2.5 bg-[#A67C52] hover:bg-[#8C653E] active:scale-98 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-sm border border-[#8C653E] transition cursor-pointer"
             >
               <Plus className="w-4 h-4 text-white" />
@@ -540,7 +636,10 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
               </p>
             </div>
             <button
-              onClick={() => setShowAddModal(true)}
+              onClick={() => {
+                setEditingBillDetail(null);
+                setShowAddModal(true);
+              }}
               className="px-4 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 transition shadow-xs"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -549,7 +648,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-xs text-left">
+            <table className="hidden sm:table w-full text-xs text-left">
               <thead className="bg-[#FAF8F4] border-b border-[#E3DED5] text-[#6F6962] font-semibold uppercase tracking-wider text-[11px]">
                 <tr>
                   <th className="py-3 px-4">Date</th>
@@ -585,13 +684,29 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
 
                       {/* Bill Number */}
                       <td className="py-3.5 px-4 whitespace-nowrap">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-mono font-bold text-[#1C1917] px-2 py-0.5 bg-[#FAF8F4] border border-[#D4CDC2] rounded-md">
                             #{bill.bill_number}
                           </span>
                           <span className="text-[10px] text-[#A67C52] font-semibold bg-[#FBF5EE] border border-[#E8DFC9] px-1.5 py-0.5 rounded">
                             Slip
                           </span>
+                          {Number(bill.edit_count) > 0 && (
+                            <span
+                              title={`Edited ${bill.edit_count} time(s)`}
+                              className="text-[10px] text-[#526B7A] font-semibold bg-[#EEF2F5] border border-[#CDD8DF] px-1.5 py-0.5 rounded"
+                            >
+                              Edited ({bill.edit_count})
+                            </span>
+                          )}
+                          {Number(bill.correction_note_count) > 0 && (
+                            <span
+                              title={`${bill.correction_note_count} correction note(s)`}
+                              className="text-[10px] text-[#7C481A] font-semibold bg-[#FAF1E8] border border-[#ECD9C5] px-1.5 py-0.5 rounded"
+                            >
+                              Note ({bill.correction_note_count})
+                            </span>
+                          )}
                         </div>
                         {bill.customer_name && (
                           <div className="text-[11px] text-[#6F6962] mt-0.5 flex items-center gap-1">
@@ -686,10 +801,34 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       {/* Actions */}
                       <td className="py-3.5 px-4 text-right whitespace-nowrap">
                         <div className="flex items-center justify-end gap-1.5">
+                          {/* Edit (Same-day non-cancelled & day open) OR Correction Note (Previous-date / closed) */}
+                          {isEligibleForDirectEdit(bill) ? (
+                            <button
+                              onClick={() => handleStartEditBill(bill)}
+                              disabled={loadingEditId === bill.id}
+                              title="Edit today's manual bill"
+                              className="px-2.5 py-1.5 bg-[#FBF5EE] hover:bg-[#F3E7D7] text-[#8C653E] border border-[#E8DFC9] rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                              <span>{loadingEditId === bill.id ? 'Loading...' : 'Edit'}</span>
+                            </button>
+                          ) : (
+                            !isCancelled && (
+                              <button
+                                onClick={() => handleOpenCorrectionNote(bill)}
+                                title="Previous-date bills cannot be edited directly — add a correction note"
+                                className="px-2.5 py-1.5 bg-[#FAF8F4] hover:bg-[#F0EDE6] text-[#6F6962] hover:text-[#1C1917] border border-[#D4CDC2] rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 transition cursor-pointer"
+                              >
+                                <MessageSquarePlus className="w-3.5 h-3.5 text-[#A67C52]" />
+                                <span>Note</span>
+                              </button>
+                            )
+                          )}
+
                           {/* View Bill Details */}
                           <button
                             onClick={() => handleViewBill(bill.id)}
-                            title="View handwritten bill details"
+                            title="View handwritten bill details & edit history"
                             className="p-1.5 text-[#6F6962] hover:text-[#1C1917] hover:bg-[#FAF8F4] border border-transparent hover:border-[#D4CDC2] rounded-lg transition cursor-pointer"
                           >
                             <Eye className="w-4 h-4" />
@@ -743,13 +882,23 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                   >
                     {/* Header Row: Bill Number, Slip Tag, Date */}
                     <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="font-mono font-bold text-sm text-[#1C1917] px-2 py-0.5 bg-[#FAF8F4] border border-[#D4CDC2] rounded-md">
                           #{bill.bill_number}
                         </span>
                         <span className="text-[10px] text-[#A67C52] font-semibold bg-[#FBF5EE] border border-[#E8DFC9] px-1.5 py-0.5 rounded">
                           Slip
                         </span>
+                        {Number(bill.edit_count) > 0 && (
+                          <span className="text-[10px] text-[#526B7A] font-semibold bg-[#EEF2F5] border border-[#CDD8DF] px-1.5 py-0.5 rounded">
+                            Edited ({bill.edit_count})
+                          </span>
+                        )}
+                        {Number(bill.correction_note_count) > 0 && (
+                          <span className="text-[10px] text-[#7C481A] font-semibold bg-[#FAF1E8] border border-[#ECD9C5] px-1.5 py-0.5 rounded">
+                            Note ({bill.correction_note_count})
+                          </span>
+                        )}
                       </div>
                       <span className="text-xs text-[#6F6962] font-medium">
                         {formatDate(bill.created_at)}
@@ -846,6 +995,27 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
 
                     {/* Touch-Friendly Action Buttons (min 44px touch targets) */}
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1">
+                      {isEligibleForDirectEdit(bill) ? (
+                        <button
+                          onClick={() => handleStartEditBill(bill)}
+                          disabled={loadingEditId === bill.id}
+                          className="min-h-[44px] px-3 py-2 bg-[#FBF5EE] hover:bg-[#F3E7D7] border border-[#E8DFC9] text-[#8C653E] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                        >
+                          <Pencil className="w-4 h-4" />
+                          <span>{loadingEditId === bill.id ? 'Loading...' : 'Edit Bill'}</span>
+                        </button>
+                      ) : (
+                        !isCancelled && (
+                          <button
+                            onClick={() => handleOpenCorrectionNote(bill)}
+                            className="min-h-[44px] px-3 py-2 bg-[#FAF8F4] hover:bg-[#F0EDE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                          >
+                            <MessageSquarePlus className="w-4 h-4 text-[#A67C52]" />
+                            <span>Correction Note</span>
+                          </button>
+                        )
+                      )}
+
                       <button
                         onClick={() => handleViewBill(bill.id)}
                         className="min-h-[44px] px-3 py-2 bg-[#FAF8F4] hover:bg-[#F0EDE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
@@ -870,7 +1040,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                             setCancelNotes('');
                             setCancelError(null);
                           }}
-                          className="col-span-2 sm:col-span-1 min-h-[44px] px-3 py-2 bg-[#FDF5F5] hover:bg-[#FCE8E8] border border-[#F0CCCC] text-[#A34F4F] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                          className="min-h-[44px] px-3 py-2 bg-[#FDF5F5] hover:bg-[#FCE8E8] border border-[#F0CCCC] text-[#A34F4F] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
                         >
                           <Ban className="w-4 h-4" />
                           <span>Cancel Bill</span>
@@ -885,13 +1055,33 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
         )}
       </div>
 
-      {/* 5. Add Daily Bill Modal (ManualBillModal) */}
+      {/* 5. Add / Edit Daily Bill Modal (ManualBillModal) */}
       <ManualBillModal
         isOpen={showAddModal}
-        onClose={() => setShowAddModal(false)}
-        onBillSaved={(savedBill) => {
-          showToast(`Daily Bill #${savedBill.bill_number} recorded successfully!`);
+        editBill={editingBillDetail}
+        onClose={() => {
+          setShowAddModal(false);
+          setEditingBillDetail(null);
+        }}
+        onBillSaved={(savedBill, mode) => {
+          setEditingBillDetail(null);
+          if (mode === 'edit') {
+            showToast(`Manual Bill #${savedBill.bill_number} updated successfully!`);
+          } else {
+            showToast(`Daily Bill #${savedBill.bill_number} recorded successfully!`);
+            if (
+              dateMode !== 'TODAY' &&
+              dateMode !== 'ALL' &&
+              String(savedBill.created_at || '').split('T')[0] === todayStr
+            ) {
+              setDateMode('TODAY');
+              setSelectedDate(todayStr);
+            }
+          }
           fetchDailyBills();
+          if (selectedBillDetail?.sale?.id === savedBill.id) {
+            handleViewBill(savedBill.id);
+          }
         }}
       />
 
@@ -1058,25 +1248,175 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                   <span>{selectedBillDetail.sale.notes}</span>
                 </div>
               )}
+
+              {/* Previous-Date / Day-Closed Restriction Info */}
+              {selectedBillDetail.sale?.status !== 'CANCELLED' &&
+                !isEligibleForDirectEdit(selectedBillDetail.sale) && (
+                  <div className="p-3.5 bg-[#FAF8F4] border border-[#E8DFC9] rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-0.5">
+                      <span className="font-bold text-[#1C1917] block">
+                        Direct Editing Locked (Previous Date or Closed Day)
+                      </span>
+                      <p className="text-[11px] text-[#6F6962]">
+                        Bills from previous dates or closed business days cannot be modified directly. Add an audit correction note instead.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenCorrectionNote(selectedBillDetail.sale)}
+                      className="px-3 py-2 bg-white hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 cursor-pointer transition"
+                    >
+                      <MessageSquarePlus className="w-3.5 h-3.5 text-[#A67C52]" />
+                      <span>Add Correction Note</span>
+                    </button>
+                  </div>
+                )}
+
+              {/* Edit History & Correction Notes */}
+              <div className="space-y-2.5 pt-2 border-t border-[#E3DED5]">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-[#1C1917] uppercase tracking-wider flex items-center gap-1.5">
+                    <History className="w-3.5 h-3.5 text-[#A67C52]" />
+                    <span>Edit History &amp; Correction Notes ({selectedBillDetail.editHistory?.length || 0})</span>
+                  </h3>
+                </div>
+
+                {!selectedBillDetail.editHistory || selectedBillDetail.editHistory.length === 0 ? (
+                  <p className="text-xs text-[#9A938B] bg-[#FAF8F4] border border-[#E3DED5] rounded-xl p-3">
+                    No edits or correction notes have been recorded for this bill.
+                  </p>
+                ) : (
+                  <div className="space-y-2.5">
+                    {selectedBillDetail.editHistory.map((entry: any) => {
+                      const isNote = entry.action === 'ADD_MANUAL_BILL_CORRECTION_NOTE';
+                      const d = entry.details || {};
+                      return (
+                        <div
+                          key={entry.id}
+                          className="p-3.5 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl text-xs space-y-2"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                                  isNote
+                                    ? 'bg-[#FAF1E8] text-[#7C481A] border-[#ECD9C5]'
+                                    : 'bg-[#EEF2F5] text-[#2E4758] border-[#CDD8DF]'
+                                }`}
+                              >
+                                {isNote ? 'Correction Note' : 'Bill Edited'}
+                              </span>
+                              <span className="font-semibold text-[#1C1917]">
+                                {entry.user_name || d.edited_by_name || d.added_by_name || 'Staff'}
+                              </span>
+                              {entry.user_role && (
+                                <span className="text-[10px] text-[#9A938B] font-mono">
+                                  ({entry.user_role})
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[11px] text-[#6F6962]">
+                              {formatDateTime(entry.created_at)}
+                            </span>
+                          </div>
+
+                          {d.reason && (
+                            <div className="text-[11px] text-[#4A443D]">
+                              <strong className="text-[#1C1917]">Reason:</strong> {d.reason}
+                            </div>
+                          )}
+
+                          {isNote ? (
+                            <div className="p-2.5 bg-white border border-[#E3DED5] rounded-lg text-xs text-[#1C1917]">
+                              {d.note || d.message}
+                            </div>
+                          ) : (
+                            d.before &&
+                            d.after && (
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+                                <div className="p-2.5 bg-white border border-[#E3DED5] rounded-lg space-y-1">
+                                  <span className="text-[10px] font-bold uppercase text-[#9A938B] block">
+                                    Original Values
+                                  </span>
+                                  <div className="font-mono font-semibold text-[#6F6962]">
+                                    Total: ₹{(Number(d.before.total_amount) || 0).toLocaleString('en-IN')} &bull;{' '}
+                                    {d.before.payment_method}
+                                  </div>
+                                  {Array.isArray(d.before.items) && (
+                                    <div className="text-[#6F6962]">
+                                      {d.before.items
+                                        .map((it: any) => `${it.item_name} × ${it.quantity} (₹${it.rate})`)
+                                        .join(', ')}
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="p-2.5 bg-white border border-[#CDE1D3] rounded-lg space-y-1">
+                                  <span className="text-[10px] font-bold uppercase text-[#3F6B50] block">
+                                    Updated Values
+                                  </span>
+                                  <div className="font-mono font-bold text-[#1C1917]">
+                                    Total: ₹{(Number(d.after.total_amount) || 0).toLocaleString('en-IN')} &bull;{' '}
+                                    {d.after.payment_method}
+                                  </div>
+                                  {Array.isArray(d.after.items) && (
+                                    <div className="text-[#1C1917]">
+                                      {d.after.items
+                                        .map((it: any) => `${it.item_name} × ${it.quantity} (₹${it.rate})`)
+                                        .join(', ')}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Footer */}
-            <div className="px-5 py-4 border-t border-[#E3DED5] bg-[#FAF8F4] flex items-center justify-between gap-3 shrink-0">
+            <div className="px-5 py-4 border-t border-[#E3DED5] bg-[#FAF8F4] flex flex-wrap items-center justify-between gap-3 shrink-0">
               <button
                 type="button"
                 onClick={() => setSelectedBillDetail(null)}
-                className="px-4 py-2 border border-[#D4CDC2] text-[#1C1917] hover:bg-[#F0EDE6] rounded-xl text-xs font-semibold transition"
+                className="px-4 py-2 border border-[#D4CDC2] text-[#1C1917] hover:bg-[#F0EDE6] rounded-xl text-xs font-semibold transition cursor-pointer"
               >
                 Close
               </button>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {isEligibleForDirectEdit(selectedBillDetail.sale) ? (
+                  <button
+                    type="button"
+                    onClick={() => handleStartEditBill(selectedBillDetail.sale)}
+                    disabled={loadingEditId === selectedBillDetail.sale?.id}
+                    className="px-4 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-2xs transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                    <span>{loadingEditId === selectedBillDetail.sale?.id ? 'Loading...' : 'Edit Bill'}</span>
+                  </button>
+                ) : (
+                  selectedBillDetail.sale?.status !== 'CANCELLED' && (
+                    <button
+                      type="button"
+                      onClick={() => handleOpenCorrectionNote(selectedBillDetail.sale)}
+                      className="px-4 py-2 bg-[#FBF5EE] hover:bg-[#F3E7D7] border border-[#E8DFC9] text-[#8C653E] rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
+                    >
+                      <MessageSquarePlus className="w-3.5 h-3.5" />
+                      <span>Correction Note</span>
+                    </button>
+                  )
+                )}
+
                 <button
                   type="button"
                   onClick={() => {
                     setReceiptBill(selectedBillDetail.sale);
                   }}
-                  className="px-4 py-2 bg-[#FAF8F4] hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-2xs transition"
+                  className="px-4 py-2 bg-[#FAF8F4] hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
                 >
                   <Printer className="w-3.5 h-3.5 text-[#A67C52]" />
                   <span>Print Slip</span>
@@ -1091,13 +1431,100 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       setCancelNotes('');
                       setCancelError(null);
                     }}
-                    className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition"
+                    className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
                   >
                     <Ban className="w-3.5 h-3.5 text-white" />
                     <span>Cancel Bill</span>
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 6B. Correction Note Modal for Previous-Date / Closed Bills */}
+      {correctionNoteBill && (
+        <div className="fixed inset-0 z-50 bg-[#171513]/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white border border-[#E3DED5] rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl my-6 flex flex-col">
+            <div className="px-5 py-4 border-b border-[#E3DED5] bg-[#FAF8F4] flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2 text-[#1C1917]">
+                <MessageSquarePlus className="w-5 h-5 text-[#A67C52]" />
+                <div>
+                  <h3 className="font-bold text-sm">
+                    Correction Note for Bill #{correctionNoteBill.bill_number}
+                  </h3>
+                  <p className="text-[11px] text-[#6F6962]">
+                    Date: {formatDate(correctionNoteBill.created_at)} &bull; Recorded Total: ₹
+                    {(Number(correctionNoteBill.total_amount) || 0).toLocaleString('en-IN')}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setCorrectionNoteBill(null)}
+                disabled={savingCorrectionNote}
+                className="text-[#6F6962] hover:text-[#1C1917] p-1 rounded-md"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 text-xs">
+              {correctionNoteError && (
+                <div className="p-3 bg-red-50 border border-red-200 text-red-800 rounded-xl font-medium">
+                  {correctionNoteError}
+                </div>
+              )}
+
+              <div className="p-3 bg-[#FBF5EE] border border-[#E8DFC9] rounded-xl text-[11px] text-[#7C481A]">
+                Bills from previous dates or closed business days cannot be directly edited. Add a correction note here to document any discrepancy in the audit log without altering past day-closing figures.
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-[#1C1917] mb-1">
+                  Reason / Category (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={correctionReason}
+                  onChange={(e) => setCorrectionReason(e.target.value)}
+                  placeholder="e.g. Quantity mismatch on slip, payment mode clarification"
+                  className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-xs text-[#1C1917] focus:outline-hidden focus:border-[#A67C52]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-[#1C1917] mb-1">
+                  Correction Note <span className="text-red-500">*</span>
+                </label>
+                <textarea
+                  rows={3}
+                  value={correctionNoteText}
+                  onChange={(e) => setCorrectionNoteText(e.target.value)}
+                  placeholder="Describe the exact correction or discrepancy noted..."
+                  className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-xs text-[#1C1917] focus:outline-hidden focus:border-[#A67C52]"
+                />
+              </div>
+            </div>
+
+            <div className="px-5 py-4 border-t border-[#E3DED5] bg-[#FAF8F4] flex items-center justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setCorrectionNoteBill(null)}
+                disabled={savingCorrectionNote}
+                className="px-4 py-2 border border-[#D4CDC2] text-[#1C1917] hover:bg-[#F0EDE6] rounded-xl text-xs font-semibold transition cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveCorrectionNote}
+                disabled={savingCorrectionNote}
+                className="px-5 py-2 bg-[#A67C52] hover:bg-[#8C653E] disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition shadow-xs cursor-pointer"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>{savingCorrectionNote ? 'Saving Note...' : 'Save Correction Note'}</span>
+              </button>
             </div>
           </div>
         </div>
