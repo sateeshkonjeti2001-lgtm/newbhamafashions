@@ -1250,7 +1250,7 @@ router.put(
       // 2. Enforce same-day editing restriction and closed-day protection
       const now = new Date().toISOString();
       const todayStr = now.split('T')[0];
-      const originalBillDate = String(existingSale.created_at || '').split('T')[0];
+      const originalBillDate = String(existingSale.created_at || '').slice(0, 10);
 
       const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [
         originalBillDate,

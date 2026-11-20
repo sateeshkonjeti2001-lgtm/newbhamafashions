@@ -81,7 +81,7 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
 
     if (editBill?.sale) {
       const s = editBill.sale;
-      const existingDate = String(s.created_at || todayStr).split('T')[0];
+      const existingDate = String(s.created_at || s.bill_date || todayStr).slice(0, 10);
       setBillDate(existingDate);
       setBillNumber(s.bill_number || '');
       setBillNumberWarning(null);

@@ -82,8 +82,9 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
   const [savingCorrectionNote, setSavingCorrectionNote] = useState<boolean>(false);
   const [correctionNoteError, setCorrectionNoteError] = useState<string | null>(null);
 
-  // Success Feedback Toast
+  // Success Feedback Toast & Post-Save Quick Edit Banner
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [lastSavedBill, setLastSavedBill] = useState<any | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -94,7 +95,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
     if (!bill || bill.status === 'CANCELLED' || Number(bill.day_closed) === 1) {
       return false;
     }
-    const billDate = String(bill.created_at || '').split('T')[0];
+    const billDate = String(bill.created_at || bill.bill_date || '').slice(0, 10);
     return billDate === todayStr;
   };
 
@@ -604,6 +605,63 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
         </div>
       </div>
 
+      {/* Post-Save Quick Action Banner (immediately shows Edit option after saving) */}
+      {lastSavedBill && lastSavedBill.status !== 'CANCELLED' && (
+        <div className="bg-[#FBF5EE] border border-[#E8DFC9] rounded-xl p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-start sm:items-center gap-2.5">
+            <CheckCircle2 className="w-5 h-5 text-[#3F6B50] shrink-0 mt-0.5 sm:mt-0" />
+            <div className="text-xs">
+              <span className="font-bold text-[#1C1917] block">
+                Bill #{lastSavedBill.bill_number} saved (₹{(Number(lastSavedBill.total_amount) || 0).toLocaleString('en-IN')} &bull; {lastSavedBill.payment_method})
+              </span>
+              <span className="text-[11px] text-[#6F6962]">
+                {isEligibleForDirectEdit(lastSavedBill)
+                  ? 'Need to adjust an item, quantity, rate, or payment method? You can edit this bill directly.'
+                  : 'This bill is dated for a previous day — you can view details or attach a correction note.'}
+              </span>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {isEligibleForDirectEdit(lastSavedBill) ? (
+              <button
+                type="button"
+                onClick={() => handleStartEditBill(lastSavedBill)}
+                disabled={loadingEditId === lastSavedBill.id}
+                className="px-3.5 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 shadow-xs transition cursor-pointer disabled:opacity-50"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                <span>{loadingEditId === lastSavedBill.id ? 'Loading...' : 'Edit Saved Bill'}</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => handleOpenCorrectionNote(lastSavedBill)}
+                className="px-3.5 py-2 bg-white hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-bold inline-flex items-center gap-1.5 transition cursor-pointer"
+              >
+                <MessageSquarePlus className="w-3.5 h-3.5 text-[#A67C52]" />
+                <span>Add Correction Note</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => handleViewBill(lastSavedBill.id)}
+              className="px-3 py-2 bg-white hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition cursor-pointer"
+            >
+              <Eye className="w-3.5 h-3.5 text-[#6F6962]" />
+              <span>View Details</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setLastSavedBill(null)}
+              title="Dismiss"
+              className="p-1.5 text-[#6F6962] hover:text-[#1C1917] hover:bg-white/70 rounded-lg transition cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 4. Daily Bills Table */}
       <div className="bg-white border border-[#E3DED5] rounded-2xl overflow-hidden shadow-[0_2px_10px_rgba(23,21,19,0.03)]">
         {loading ? (
@@ -648,16 +706,16 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="hidden sm:table w-full text-xs text-left">
+            <table className="hidden xl:table w-full text-xs text-left">
               <thead className="bg-[#FAF8F4] border-b border-[#E3DED5] text-[#6F6962] font-semibold uppercase tracking-wider text-[11px]">
                 <tr>
-                  <th className="py-3 px-4">Date</th>
-                  <th className="py-3 px-4">Bill Number</th>
-                  <th className="py-3 px-4 min-w-[200px]">Item Summary</th>
-                  <th className="py-3 px-4 text-right">Total Bill (₹)</th>
-                  <th className="py-3 px-4 text-center">Payment Method</th>
-                  <th className="py-3 px-4 text-center">Status / Dues</th>
-                  <th className="py-3 px-4 text-right">Actions</th>
+                  <th className="py-3 px-3">Date</th>
+                  <th className="py-3 px-3">Bill Number</th>
+                  <th className="py-3 px-3 max-w-[200px]">Item Summary</th>
+                  <th className="py-3 px-3 text-right">Total Bill (₹)</th>
+                  <th className="py-3 px-3 text-center">Payment Method</th>
+                  <th className="py-3 px-3 text-center">Status / Dues</th>
+                  <th className="py-3 px-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E3DED5]">
@@ -676,14 +734,14 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       }`}
                     >
                       {/* Date */}
-                      <td className="py-3.5 px-4 font-medium text-[#1C1917] whitespace-nowrap">
+                      <td className="py-3.5 px-3 font-medium text-[#1C1917] whitespace-nowrap">
                         <div className="flex items-center gap-1.5">
                           <span>{formatDate(bill.created_at)}</span>
                         </div>
                       </td>
 
                       {/* Bill Number */}
-                      <td className="py-3.5 px-4 whitespace-nowrap">
+                      <td className="py-3.5 px-3 whitespace-nowrap">
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-mono font-bold text-[#1C1917] px-2 py-0.5 bg-[#FAF8F4] border border-[#D4CDC2] rounded-md">
                             #{bill.bill_number}
@@ -717,7 +775,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       </td>
 
                       {/* Item Summary */}
-                      <td className="py-3.5 px-4">
+                      <td className="py-3.5 px-3 max-w-[220px]">
                         <div className="text-xs text-[#1C1917] line-clamp-1 font-medium" title={itemSummary}>
                           {itemSummary}
                         </div>
@@ -727,7 +785,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       </td>
 
                       {/* Total Bill Amount */}
-                      <td className="py-3.5 px-4 text-right whitespace-nowrap font-mono tabular-nums">
+                      <td className="py-3.5 px-3 text-right whitespace-nowrap font-mono tabular-nums">
                         <span
                           className={`text-sm font-bold ${
                             isCancelled
@@ -745,7 +803,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       </td>
 
                       {/* Payment Method Badge */}
-                      <td className="py-3.5 px-4 text-center whitespace-nowrap">
+                      <td className="py-3.5 px-3 text-center whitespace-nowrap">
                         {bill.payment_method === 'CASH' && (
                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#2D5A3C] bg-[#EBF3ED] px-2 py-0.5 rounded-md border border-[#CDE1D3]">
                             <Coins className="w-3 h-3" />
@@ -779,7 +837,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       </td>
 
                       {/* Payment / Due Status */}
-                      <td className="py-3.5 px-4 text-center whitespace-nowrap">
+                      <td className="py-3.5 px-3 text-center whitespace-nowrap">
                         {isCancelled ? (
                           <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[#A34F4F] bg-[#FDF5F5] px-2 py-0.5 rounded-md border border-[#F0CCCC]">
                             <Ban className="w-3 h-3" />
@@ -799,7 +857,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       </td>
 
                       {/* Actions */}
-                      <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                      <td className="py-3.5 px-3 text-right whitespace-nowrap">
                         <div className="flex items-center justify-end gap-1.5">
                           {/* Edit (Same-day non-cancelled & day open) OR Correction Note (Previous-date / closed) */}
                           {isEligibleForDirectEdit(bill) ? (
@@ -866,8 +924,8 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
               </tbody>
             </table>
 
-            {/* Mobile Stacked Card View (< sm) */}
-            <div className="sm:hidden divide-y divide-[#E3DED5]">
+            {/* Mobile & Compact Tablet/Laptop Stacked Card View (< xl) */}
+            <div className="xl:hidden grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:gap-3 md:p-3 divide-[#E3DED5]">
               {bills.map((bill) => {
                 const isCancelled = bill.status === 'CANCELLED';
                 const isCredit = bill.payment_method === 'CREDIT' || bill.balance_due > 0;
@@ -876,7 +934,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                 return (
                   <div
                     key={bill.id}
-                    className={`p-4 space-y-3 transition-colors ${
+                    className={`p-4 space-y-3 transition-colors md:rounded-xl md:border md:border-[#E3DED5] ${
                       isCancelled ? 'bg-[#FDF7F7] opacity-80' : 'bg-white hover:bg-[#FAF8F4]/50'
                     }`}
                   >
@@ -1065,20 +1123,35 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
         }}
         onBillSaved={(savedBill, mode) => {
           setEditingBillDetail(null);
+          const normalizedSaved = {
+            ...savedBill,
+            created_at: savedBill.created_at || (savedBill.bill_date ? `${savedBill.bill_date}T12:00:00.000Z` : new Date().toISOString()),
+            day_closed: savedBill.day_closed ?? 0,
+            status: savedBill.status || 'COMPLETED',
+          };
+          setLastSavedBill(normalizedSaved);
+
           if (mode === 'edit') {
             showToast(`Manual Bill #${savedBill.bill_number} updated successfully!`);
+            fetchDailyBills();
           } else {
             showToast(`Daily Bill #${savedBill.bill_number} recorded successfully!`);
-            if (
-              dateMode !== 'TODAY' &&
-              dateMode !== 'ALL' &&
-              String(savedBill.created_at || '').split('T')[0] === todayStr
-            ) {
+            const savedDate = String(normalizedSaved.created_at || '').slice(0, 10);
+            let filterChanged = false;
+            if (savedDate === todayStr && dateMode !== 'TODAY' && dateMode !== 'ALL' && dateMode !== 'MONTH') {
               setDateMode('TODAY');
               setSelectedDate(todayStr);
+              filterChanged = true;
+            } else if (savedDate && savedDate !== todayStr && dateMode === 'TODAY') {
+              setSelectedDate(savedDate);
+              setDateMode('CUSTOM');
+              filterChanged = true;
+            }
+            if (!filterChanged) {
+              fetchDailyBills();
             }
           }
-          fetchDailyBills();
+
           if (selectedBillDetail?.sale?.id === savedBill.id) {
             handleViewBill(savedBill.id);
           }
