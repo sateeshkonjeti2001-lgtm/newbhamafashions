@@ -9,6 +9,7 @@ import {
   CORE_ERP_TABLES,
 } from './schemaSql.ts';
 import { DbProvider, registerDbProvider } from './db.ts';
+import { toISTDateString } from './dateUtil.ts';
 
 let dbInstance: Database | null = null;
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -160,7 +161,7 @@ function migrateDualOwnerIfPresent(db: Database) {
 function syncManualSalesFinancialTransactions(db: Database) {
   try {
     const stmt = db.prepare(`
-      SELECT s.id, s.bill_number, s.customer_name, s.cash_paid, s.upi_paid, s.created_at, s.cashier_id
+      SELECT s.id, s.bill_number, s.customer_name, s.cash_paid, s.upi_paid, s.bill_date, s.created_at, s.cashier_id
       FROM sales s
       WHERE s.channel = 'MANUAL'
         AND (s.status IS NULL OR s.status = 'COMPLETED')
@@ -173,7 +174,7 @@ function syncManualSalesFinancialTransactions(db: Database) {
     stmt.free();
 
     for (const sale of manualSales) {
-      const dateStr = (sale.created_at || '').split('T')[0] || new Date().toISOString().split('T')[0];
+      const dateStr = sale.bill_date || toISTDateString(sale.created_at);
       const customerName = sale.customer_name || 'Walk-in Customer';
 
       if (sale.cash_paid > 0) {

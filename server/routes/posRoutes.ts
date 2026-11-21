@@ -8,6 +8,16 @@ import {
   insertIdempotencyRecord,
   isIdempotencyConflictError,
 } from '../idempotency.ts';
+import {
+  getTodayIST,
+  addDaysIST,
+  toISTDateString,
+  isValidDateString,
+  getISTCalendarDayDiff,
+  sqlEffectiveSaleDate,
+} from '../dateUtil.ts';
+import { verifyOwnerPasswordOverride } from '../ownerOverride.ts';
+import { isBusinessDayClosed, reconcileAffectedDayClosings } from '../closingSync.ts';
 
 const router = new Router();
 
@@ -170,7 +180,7 @@ async function allocateDailySequence(
   sourceColumn: 'bill_number' | 'return_number'
 ): Promise<string> {
   const now = new Date().toISOString();
-  const today = now.split('T')[0].replace(/-/g, '');
+  const today = getTodayIST().replace(/-/g, '');
   const fullPrefix = `${prefixBase}-${today}-`;
   const seqKey = `${seqNamespace}:${today}`;
 
@@ -409,6 +419,8 @@ router.post('/checkout', authMiddleware, async (req: AuthenticatedRequest, res: 
     const saleId = 'sale_' + Date.now() + '_' + randomHex(4);
     const billNumber = await getNextBillNumber();
     const now = new Date().toISOString();
+    const todayIST = getTodayIST();
+    const todayClosing = await isBusinessDayClosed(todayIST);
 
     let customerId: string | null = null;
     let isNewCustomer = false;
@@ -576,8 +588,8 @@ router.post('/checkout', authMiddleware, async (req: AuthenticatedRequest, res: 
             id, bill_number, customer_id, customer_name, customer_phone, total_mrp, subtotal,
             festival_discount, special_discount, discount_amount, discount_type, total_amount,
             amount_paid, balance_due, payment_status, payment_method, cash_paid, upi_paid,
-            channel, notes, cashier_id, day_closed, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OFFLINE', ?, ?, 0, ?)
+            channel, notes, cashier_id, day_closed, bill_date, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OFFLINE', ?, ?, ?, ?, ?)
         `,
           [
             saleId,
@@ -600,6 +612,8 @@ router.post('/checkout', authMiddleware, async (req: AuthenticatedRequest, res: 
             actualUpiCollected,
             notes?.trim() || null,
             req.user?.id || 'CASHIER',
+            todayClosing.isClosed ? 1 : 0,
+            todayIST,
             now,
           ]
         );
@@ -699,7 +713,7 @@ router.post('/checkout', authMiddleware, async (req: AuthenticatedRequest, res: 
           `,
             [
               txId,
-              now.split('T')[0],
+              todayIST,
               actualCashCollected,
               customerNameStr,
               `Sale Bill #${billNumber}`,
@@ -723,7 +737,7 @@ router.post('/checkout', authMiddleware, async (req: AuthenticatedRequest, res: 
           `,
             [
               txId,
-              now.split('T')[0],
+              todayIST,
               actualUpiCollected,
               customerNameStr,
               `Sale Bill #${billNumber}`,
@@ -766,6 +780,15 @@ router.post('/checkout', authMiddleware, async (req: AuthenticatedRequest, res: 
       });
     }
 
+    if (todayClosing.isClosed) {
+      await reconcileAffectedDayClosings(
+        [todayIST],
+        req.user?.full_name || req.user?.username || 'Staff',
+        `POS Sale Bill #${billNumber} recorded after day close`,
+        now
+      );
+    }
+
     saveDb(true);
     res.json(checkoutResponse);
   } catch (err: any) {
@@ -782,10 +805,10 @@ router.get('/check-bill-number', authMiddleware, async (req: AuthenticatedReques
       res.json({ exists: false });
       return;
     }
-    let query = 'SELECT id, bill_number, created_at, total_amount, channel FROM sales WHERE bill_number = ?';
+    let query = `SELECT id, bill_number, bill_date, created_at, total_amount, channel FROM sales WHERE bill_number = ? AND (status IS NULL OR status = 'COMPLETED')`;
     const params: any[] = [billNumber];
     if (date) {
-      query += ' AND DATE(created_at) = ?';
+      query += ` AND ${sqlEffectiveSaleDate()} = ?`;
       params.push(date);
     }
     const match = await dbQueryOne<any>(query, params);
@@ -813,7 +836,8 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
       upi_amount = 0,
       customer_name,
       customer_phone,
-      notes
+      notes,
+      owner_password,
     } = req.body;
 
     // 1. Validate Bill Number
@@ -823,16 +847,41 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
     }
     const cleanBillNumber = bill_number.trim();
 
-    // 2. Validate Bill Date
-    const todayStr = new Date().toISOString().split('T')[0];
-    const targetDate =
-      bill_date && typeof bill_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(bill_date.trim())
-        ? bill_date.trim()
-        : todayStr;
+    // 2. Validate Bill Date in IST (Asia/Kolkata)
+    const todayStr = getTodayIST();
+    let targetDate = todayStr;
+    if (bill_date !== undefined && bill_date !== null && String(bill_date).trim() !== '') {
+      const trimmedDate = String(bill_date).trim();
+      if (!isValidDateString(trimmedDate)) {
+        res.status(400).json({ error: 'Invalid bill date format. Expected valid YYYY-MM-DD date.' });
+        return;
+      }
+      targetDate = trimmedDate;
+    }
 
-    // Check duplicate bill number for the same date
+    // Check if targetDate is CLOSED
+    const targetDayClosing = await isBusinessDayClosed(targetDate);
+    let overrideOwner: { id: string; username: string; full_name: string } | null = null;
+    if (targetDayClosing.isClosed) {
+      const override = await verifyOwnerPasswordOverride(
+        owner_password,
+        `Business day ${targetDate} is CLOSED. Owner password verification is required to record a bill for this date.`
+      );
+      if (!override.ok) {
+        res.status(override.status).json({
+          error: override.error,
+          code: override.code,
+          requires_owner_password: true,
+          closed_date: targetDate,
+        });
+        return;
+      }
+      overrideOwner = override.owner;
+    }
+
+    // Check duplicate bill number for the same business date
     const existingBill = await dbQueryOne<any>(
-      'SELECT id, bill_number FROM sales WHERE bill_number = ? AND DATE(created_at) = ?',
+      `SELECT id, bill_number FROM sales WHERE bill_number = ? AND ${sqlEffectiveSaleDate()} = ? AND (status IS NULL OR status = 'COMPLETED')`,
       [cleanBillNumber, targetDate]
     );
     if (existingBill) {
@@ -945,8 +994,8 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
 
     const paymentStatus = balanceDue === 0 ? 'PAID' : 'UNPAID';
     const saleId = 'sale_manual_' + Date.now() + '_' + randomHex(3);
-    const timePortion = new Date().toTimeString().split(' ')[0] || '12:00:00';
-    const createdAt = `${targetDate}T${timePortion}.000Z`;
+    // Genuine creation instant (used for 3-calendar-day IST window). Business date is stored separately in sales.bill_date.
+    const createdAt = new Date().toISOString();
 
     let customerId: string | null = null;
     let isNewManualCust = false;
@@ -1011,8 +1060,8 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
           total_mrp, subtotal, festival_discount, special_discount, discount_amount,
           discount_type, total_amount, amount_paid, balance_due, payment_status,
           payment_method, cash_paid, upi_paid, card_paid, channel, notes, cashier_id,
-          day_closed, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          day_closed, status, bill_date, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
         [
           saleId,
@@ -1037,8 +1086,9 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
           'MANUAL',
           notes ? `Handwritten Bill: ${notes.trim()}` : 'Handwritten Bill Entry',
           req.user?.id || 'usr_cashier',
-          0,
+          targetDayClosing.isClosed ? 1 : 0,
           'COMPLETED',
+          targetDate,
           createdAt,
         ]
       );
@@ -1089,7 +1139,7 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
             balanceDue,
             0,
             balanceDue,
-            new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+            addDaysIST(targetDate, 15),
             'PENDING',
             `Outstanding balance on handwritten bill #${cleanBillNumber}`,
             createdAt,
@@ -1172,6 +1222,15 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
       }
     });
 
+    if (targetDayClosing.isClosed) {
+      await reconcileAffectedDayClosings(
+        [targetDate],
+        overrideOwner?.full_name || req.user?.full_name || req.user?.username || 'Owner',
+        `Added Manual Bill #${cleanBillNumber} (₹${calculatedTotal}) on closed day ${targetDate}`,
+        createdAt
+      );
+    }
+
     await logAudit(req.user?.id || 'usr_unknown', 'CREATE_MANUAL_BILL', 'sales', saleId, {
       message: `Created handwritten manual bill #${cleanBillNumber} for ₹${calculatedTotal} (${payment_method}) dated ${targetDate}`,
       bill_number: cleanBillNumber,
@@ -1181,6 +1240,9 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
       payment_method,
       channel: 'MANUAL',
       inventory_deducted: false,
+      override_used: Boolean(overrideOwner),
+      override_authorized_by: overrideOwner?.full_name || null,
+      post_day_closing: targetDayClosing.isClosed,
     });
 
     saveDb();
@@ -1200,6 +1262,7 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
         balance_due: balanceDue,
         items: validatedItems,
         channel: 'MANUAL',
+        day_closed: targetDayClosing.isClosed ? 1 : 0,
         created_at: createdAt
       }
     });
@@ -1209,7 +1272,7 @@ router.post('/manual-bill', authMiddleware, async (req: AuthenticatedRequest, re
   }
 });
 
-// Edit an existing same-day Manual Bill atomically (preserves bill_number, updates existing record & adjusts financial/due/stock totals)
+// Edit an existing Manual Bill atomically (3-calendar-day IST window; Owner password override beyond 3 days or on closed days; editable bill_date; preserves bill_number & created_at)
 router.put(
   '/manual-bills/:id',
   authMiddleware,
@@ -1228,6 +1291,7 @@ router.put(
         customer_phone,
         notes,
         edit_reason,
+        owner_password,
       } = req.body;
 
       // 1. Fetch existing bill strictly by ID
@@ -1247,44 +1311,85 @@ router.put(
         return;
       }
 
-      // 2. Enforce same-day editing restriction and closed-day protection
+      // 2. Calculate 3-calendar-day IST editing window STRICTLY from original created_at timestamp
+      // Changing bill_date must never extend or reset this editing window.
       const now = new Date().toISOString();
-      const todayStr = now.split('T')[0];
-      const originalBillDate = String(existingSale.created_at || '').slice(0, 10);
+      const oldBillDate = existingSale.bill_date || toISTDateString(existingSale.created_at);
+      const daysSinceCreated = getISTCalendarDayDiff(existingSale.created_at);
 
-      const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [
-        originalBillDate,
-      ]);
-      const isDayClosed = Number(existingSale.day_closed) === 1 || closingRecord?.status === 'CLOSED';
-
-      if (originalBillDate !== todayStr) {
-        res.status(403).json({
-          error:
-            'Bills from previous dates cannot be directly edited. Please add a Correction Note instead.',
-        });
-        return;
-      }
-
-      if (isDayClosed) {
-        res.status(403).json({
-          error:
-            'Direct editing is not allowed after the business day has been closed. Please add a Correction Note instead.',
-        });
-        return;
-      }
-
-      if (bill_date && typeof bill_date === 'string' && bill_date.trim()) {
-        const requestedDate = bill_date.trim();
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
-          res.status(400).json({ error: 'Invalid bill date format. Expected YYYY-MM-DD.' });
+      let newBillDate = oldBillDate;
+      if (bill_date !== undefined && bill_date !== null && String(bill_date).trim() !== '') {
+        const requestedDate = String(bill_date).trim();
+        if (!isValidDateString(requestedDate)) {
+          res.status(400).json({ error: 'Invalid bill date format. Expected valid YYYY-MM-DD date.' });
           return;
         }
-        if (requestedDate !== todayStr) {
-          res.status(400).json({
-            error: `Same-day restriction: Bill date must remain today (${todayStr}) when editing.`,
+        newBillDate = requestedDate;
+      }
+
+      // Check duplicate bill number if bill_date moved to another date
+      if (newBillDate !== oldBillDate) {
+        const conflict = await dbQueryOne<any>(
+          `SELECT id FROM sales WHERE bill_number = ? AND ${sqlEffectiveSaleDate()} = ? AND id != ? AND (status IS NULL OR status = 'COMPLETED')`,
+          [existingSale.bill_number, newBillDate, existingSale.id]
+        );
+        if (conflict) {
+          res.status(409).json({
+            error: `Duplicate bill number: Another active bill #${existingSale.bill_number} already exists on ${newBillDate}.`,
           });
           return;
         }
+      }
+
+      // Check closed business day status for BOTH old and new bill dates
+      const oldClosing = await isBusinessDayClosed(oldBillDate);
+      const newClosing = newBillDate !== oldBillDate ? await isBusinessDayClosed(newBillDate) : oldClosing;
+      const oldDayClosed = Number(existingSale.day_closed) === 1 || oldClosing.isClosed;
+      const newDayClosed = newClosing.isClosed;
+
+      const windowExpired = daysSinceCreated > 2;
+      const requiresOwnerPassword = windowExpired || oldDayClosed || newDayClosed;
+      const cleanReason = edit_reason && String(edit_reason).trim() ? String(edit_reason).trim() : null;
+
+      let overrideOwner: { id: string; username: string; full_name: string } | null = null;
+      if (requiresOwnerPassword) {
+        if (!cleanReason) {
+          res.status(400).json({
+            error:
+              'A mandatory edit reason is required when editing a bill after 3 calendar days or on a closed business day.',
+            requires_owner_password: true,
+          });
+          return;
+        }
+
+        const reasonSummary = [
+          windowExpired ? `bill is ${daysSinceCreated + 1} IST days old (beyond 3-day window)` : null,
+          oldDayClosed ? `original date ${oldBillDate} is CLOSED` : null,
+          newDayClosed && newBillDate !== oldBillDate ? `target date ${newBillDate} is CLOSED` : null,
+        ]
+          .filter(Boolean)
+          .join(' and ');
+
+        const override = await verifyOwnerPasswordOverride(
+          owner_password,
+          `Owner password verification is required because ${reasonSummary}.`
+        );
+
+        if (!override.ok) {
+          res.status(override.status).json({
+            error: override.error,
+            code: override.code,
+            requires_owner_password: true,
+            reasons: {
+              windowExpired,
+              oldDayClosed,
+              newDayClosed,
+              daysSinceCreated,
+            },
+          });
+          return;
+        }
+        overrideOwner = override.owner;
       }
 
       // 3. Preserve original bill number (disallow changing bill_number)
@@ -1396,12 +1501,11 @@ router.put(
       const existingFinTxs = await dbQueryAll<any>(
         `SELECT * FROM financial_transactions
          WHERE reference_no = ?
-           AND date = ?
            AND transaction_type = 'INCOME'
            AND category = 'SALES'
            AND is_system_generated = 1
            AND is_reversed = 0`,
-        [existingSale.bill_number, originalBillDate]
+        [existingSale.bill_number]
       );
 
       // Customer resolution
@@ -1563,18 +1667,26 @@ router.put(
       const personEntityName = cleanCustName || 'Walk-in Customer';
       const editedById = req.user?.id || 'STAFF';
       const editedByName = req.user?.full_name || req.user?.username || 'Staff';
-      const cleanReason = edit_reason && String(edit_reason).trim() ? String(edit_reason).trim() : null;
 
+      const auditAction = overrideOwner ? 'OWNER_OVERRIDE_EDIT_MANUAL_BILL' : 'EDIT_MANUAL_BILL';
       const auditDetails = {
-        message: `Edited manual bill #${existingSale.bill_number} (₹${existingSale.total_amount} -> ₹${calculatedTotal}, ${existingSale.payment_method} -> ${payment_method})`,
+        message: `Edited manual bill #${existingSale.bill_number} (₹${existingSale.total_amount} -> ₹${calculatedTotal}, ${existingSale.payment_method} -> ${payment_method}${oldBillDate !== newBillDate ? `, date ${oldBillDate} -> ${newBillDate}` : ''})`,
         bill_number: existingSale.bill_number,
-        bill_date: originalBillDate,
+        bill_date: newBillDate,
+        original_bill_date: oldBillDate,
+        new_bill_date: newBillDate,
+        original_created_at: existingSale.created_at,
+        days_since_created: daysSinceCreated,
         reason: cleanReason,
         edited_by: editedById,
         edited_by_name: editedByName,
         edited_at: now,
+        override_used: Boolean(overrideOwner),
+        override_authorized_by: overrideOwner?.full_name || null,
+        override_authorized_by_id: overrideOwner?.id || null,
+        post_day_closing: oldDayClosed || newDayClosed,
         before: {
-          bill_date: originalBillDate,
+          bill_date: oldBillDate,
           customer_name: existingSale.customer_name || null,
           customer_phone: existingSale.customer_phone || null,
           payment_method: existingSale.payment_method,
@@ -1592,7 +1704,7 @@ router.put(
           })),
         },
         after: {
-          bill_date: originalBillDate,
+          bill_date: newBillDate,
           customer_name: cleanCustName || null,
           customer_phone: cleanCustPhone || null,
           payment_method,
@@ -1661,7 +1773,7 @@ router.put(
           }
         }
 
-        // B. Update existing sales record (never insert duplicate or change bill_number/created_at date)
+        // B. Update existing sales record (never insert duplicate or change bill_number/created_at timestamp)
         await dbRun(
           `UPDATE sales SET
             customer_id = ?,
@@ -1677,7 +1789,9 @@ router.put(
             cash_paid = ?,
             upi_paid = ?,
             card_paid = ?,
-            notes = ?
+            notes = ?,
+            bill_date = ?,
+            day_closed = ?
           WHERE id = ?`,
           [
             newCustomerId,
@@ -1694,6 +1808,8 @@ router.put(
             upiPaid,
             cardPaid,
             formattedNotes,
+            newBillDate,
+            newDayClosed ? 1 : 0,
             existingSale.id,
           ]
         );
@@ -1788,7 +1904,7 @@ router.put(
               existingSale.id,
               balanceDue,
               balanceDue,
-              new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+              addDaysIST(newBillDate, 15),
               `Outstanding balance on handwritten bill #${existingSale.bill_number}`,
               existingSale.created_at,
               now,
@@ -1815,8 +1931,8 @@ router.put(
             if (existingRows.length > 0) {
               const primary = existingRows[0];
               await dbRun(
-                'UPDATE financial_transactions SET amount = ?, person_entity = ?, updated_at = ? WHERE id = ?',
-                [newAmount, personEntityName, now, primary.id]
+                'UPDATE financial_transactions SET date = ?, amount = ?, person_entity = ?, day_closed = ?, updated_at = ? WHERE id = ?',
+                [newBillDate, newAmount, personEntityName, newDayClosed ? 1 : 0, now, primary.id]
               );
               for (let i = 1; i < existingRows.length; i++) {
                 await dbRun('DELETE FROM financial_transactions WHERE id = ?', [existingRows[i].id]);
@@ -1827,17 +1943,18 @@ router.put(
                 `INSERT INTO financial_transactions (
                   id, date, amount, source_account, destination_account, transaction_type,
                   person_entity, category, purpose, payment_method, reference_no,
-                  is_system_generated, user_id, created_at, updated_at
-                ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'INCOME', ?, 'SALES', ?, ?, ?, 1, ?, ?, ?)`,
+                  is_system_generated, day_closed, user_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'INCOME', ?, 'SALES', ?, ?, ?, 1, ?, ?, ?, ?)`,
                 [
                   txId,
-                  originalBillDate,
+                  newBillDate,
                   newAmount,
                   destAccount,
                   personEntityName,
                   `Manual Bill #${existingSale.bill_number}`,
                   payMethodLabel,
                   existingSale.bill_number,
+                  newDayClosed ? 1 : 0,
                   editedById,
                   existingSale.created_at,
                   now,
@@ -1861,7 +1978,7 @@ router.put(
           [
             'aud_' + Date.now() + '_' + randomHex(4),
             editedById,
-            'EDIT_MANUAL_BILL',
+            auditAction,
             'sales',
             existingSale.id,
             JSON.stringify(auditDetails),
@@ -1870,11 +1987,19 @@ router.put(
         );
       });
 
+      const modifiedClosedDates = await reconcileAffectedDayClosings(
+        [oldBillDate, newBillDate],
+        overrideOwner?.full_name || editedByName,
+        `Manual Bill #${existingSale.bill_number} edited (${oldBillDate !== newBillDate ? `date ${oldBillDate} -> ${newBillDate}, ` : ''}₹${existingSale.total_amount} -> ₹${calculatedTotal})${cleanReason ? ` - ${cleanReason}` : ''}`,
+        now
+      );
+
       saveDb(true);
 
       res.json({
         success: true,
-        message: `Manual bill #${existingSale.bill_number} updated successfully.`,
+        message: `Manual bill #${existingSale.bill_number} updated successfully.${modifiedClosedDates.length > 0 ? ` Closed day(s) reconciled & flagged: ${modifiedClosedDates.join(', ')}.` : ''}`,
+        modified_closed_dates: modifiedClosedDates,
         sale: {
           ...existingSale,
           customer_id: newCustomerId,
@@ -1891,6 +2016,8 @@ router.put(
           upi_paid: upiPaid,
           card_paid: cardPaid,
           notes: formattedNotes,
+          bill_date: newBillDate,
+          day_closed: newDayClosed ? 1 : 0,
           items: validatedItems,
         },
       });
@@ -1932,7 +2059,7 @@ router.post(
       const addedByName = req.user?.full_name || req.user?.username || 'Staff';
       const cleanNote = note.trim();
       const cleanReason = reason && String(reason).trim() ? String(reason).trim() : null;
-      const billDate = String(sale.created_at || '').split('T')[0];
+      const billDate = sale.bill_date || toISTDateString(sale.created_at);
 
       const noteDetails = {
         message: `Correction note added to bill #${sale.bill_number}: ${cleanNote}`,
@@ -1980,17 +2107,17 @@ router.post(
 // Recent sales list for POS view
 router.get('/recent', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayIST();
     const sales = await dbQueryAll(`
       SELECT 
         s.id, s.bill_number, s.customer_name, s.customer_phone,
         s.total_mrp, s.subtotal, s.festival_discount, s.special_discount,
         s.discount_amount, s.total_amount, s.amount_paid, s.balance_due,
-        s.payment_status, s.payment_method, s.created_at,
+        s.payment_status, s.payment_method, s.bill_date, s.created_at,
         u.full_name as cashier_name
       FROM sales s
       LEFT JOIN users u ON s.cashier_id = u.id
-      WHERE DATE(s.created_at) = ?
+      WHERE ${sqlEffectiveSaleDate('s.')} = ?
       ORDER BY s.created_at DESC
       LIMIT 20
     `, [today]);
@@ -2013,9 +2140,12 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
         s.discount_amount, s.total_amount, s.amount_paid, s.balance_due,
         s.payment_status, s.payment_method, s.cash_paid, s.upi_paid, s.card_paid,
         s.channel, s.notes, s.cashier_id, s.day_closed, s.created_at,
+        COALESCE(s.bill_date, DATE(s.created_at, '+330 minutes')) as bill_date,
         COALESCE(s.status, 'COMPLETED') as status,
         s.cancelled_at, s.cancelled_by, s.cancelled_by_name, s.cancelled_reason,
         u.full_name as cashier_name,
+        dc.status as closing_status,
+        COALESCE(dc.modified_after_close, 0) as day_modified_after_close,
         COUNT(DISTINCT si.id) as product_count,
         COALESCE(SUM(si.quantity), 0) as total_items,
         GROUP_CONCAT(si.product_name || ' (' || si.quantity || ')', ', ') as items_summary,
@@ -2025,6 +2155,7 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
         COALESCE(ah.correction_note_count, 0) as correction_note_count
       FROM sales s
       LEFT JOIN users u ON s.cashier_id = u.id
+      LEFT JOIN daily_closings dc ON COALESCE(s.bill_date, DATE(s.created_at, '+330 minutes')) = dc.closing_date
       LEFT JOIN sale_items si ON s.id = si.sale_id
       LEFT JOIN (
         SELECT sale_id, COUNT(*) as return_count, SUM(refund_amount) as total_refunded
@@ -2034,10 +2165,10 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
       LEFT JOIN (
         SELECT
           entity_id,
-          SUM(CASE WHEN action = 'EDIT_MANUAL_BILL' THEN 1 ELSE 0 END) as edit_count,
+          SUM(CASE WHEN action IN ('EDIT_MANUAL_BILL', 'OWNER_OVERRIDE_EDIT_MANUAL_BILL') THEN 1 ELSE 0 END) as edit_count,
           SUM(CASE WHEN action = 'ADD_MANUAL_BILL_CORRECTION_NOTE' THEN 1 ELSE 0 END) as correction_note_count
         FROM audit_logs
-        WHERE action IN ('EDIT_MANUAL_BILL', 'ADD_MANUAL_BILL_CORRECTION_NOTE')
+        WHERE action IN ('EDIT_MANUAL_BILL', 'OWNER_OVERRIDE_EDIT_MANUAL_BILL', 'ADD_MANUAL_BILL_CORRECTION_NOTE')
         GROUP BY entity_id
       ) ah ON s.id = ah.entity_id
       WHERE 1=1
@@ -2051,15 +2182,15 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
     }
 
     if (date && typeof date === 'string' && date.trim()) {
-      sql += ` AND DATE(s.created_at) = ?`;
+      sql += ` AND ${sqlEffectiveSaleDate('s.')} = ?`;
       params.push(date.trim());
     } else {
       if (start_date && typeof start_date === 'string' && start_date.trim()) {
-        sql += ` AND DATE(s.created_at) >= ?`;
+        sql += ` AND ${sqlEffectiveSaleDate('s.')} >= ?`;
         params.push(start_date.trim());
       }
       if (end_date && typeof end_date === 'string' && end_date.trim()) {
-        sql += ` AND DATE(s.created_at) <= ?`;
+        sql += ` AND ${sqlEffectiveSaleDate('s.')} <= ?`;
         params.push(end_date.trim());
       }
     }
@@ -2077,10 +2208,21 @@ router.get('/bills', authMiddleware, async (req: AuthenticatedRequest, res: Resp
       }
     }
 
-    sql += ` GROUP BY s.id ORDER BY s.created_at DESC LIMIT ? OFFSET ?`;
+    sql += ` GROUP BY s.id ORDER BY COALESCE(s.bill_date, DATE(s.created_at, '+330 minutes')) DESC, s.created_at DESC LIMIT ? OFFSET ?`;
     params.push(Number(limit) || 50, Number(offset) || 0);
 
-    const bills = await dbQueryAll(sql, params);
+    const rawBills = await dbQueryAll<any>(sql, params);
+    const bills = rawBills.map((b) => {
+      const daysSince = getISTCalendarDayDiff(b.created_at);
+      const isClosed = Number(b.day_closed) === 1 || b.closing_status === 'CLOSED';
+      return {
+        ...b,
+        day_closed: isClosed ? 1 : 0,
+        days_since_created: daysSince,
+        normal_edit_window_active: daysSince <= 2 && !isClosed,
+        requires_owner_password: daysSince > 2 || isClosed,
+      };
+    });
     res.json({ bills });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2151,7 +2293,7 @@ router.get('/bills/:id', authMiddleware, async (req: AuthenticatedRequest, res: 
       FROM audit_logs a
       LEFT JOIN users u ON a.user_id = u.id
       WHERE a.entity_id = ?
-        AND a.action IN ('EDIT_MANUAL_BILL', 'ADD_MANUAL_BILL_CORRECTION_NOTE')
+        AND a.action IN ('EDIT_MANUAL_BILL', 'OWNER_OVERRIDE_EDIT_MANUAL_BILL', 'ADD_MANUAL_BILL_CORRECTION_NOTE', 'BILL_VOIDED')
       ORDER BY a.created_at DESC`,
       [sale.id]
     );
@@ -2169,6 +2311,19 @@ router.get('/bills/:id', authMiddleware, async (req: AuthenticatedRequest, res: 
       };
     });
 
+    const effectiveBillDate = sale.bill_date || toISTDateString(sale.created_at);
+    const closingInfo = await isBusinessDayClosed(effectiveBillDate);
+    const isClosed = Number(sale.day_closed) === 1 || closingInfo.isClosed;
+    const daysSince = getISTCalendarDayDiff(sale.created_at);
+
+    sale.bill_date = effectiveBillDate;
+    sale.day_closed = isClosed ? 1 : 0;
+    sale.closing_status = closingInfo.record?.status || null;
+    sale.day_modified_after_close = Number(closingInfo.record?.modified_after_close || 0) === 1;
+    sale.days_since_created = daysSince;
+    sale.normal_edit_window_active = daysSince <= 2 && !isClosed;
+    sale.requires_owner_password = daysSince > 2 || isClosed;
+
     res.json({
       sale,
       items,
@@ -2181,11 +2336,11 @@ router.get('/bills/:id', authMiddleware, async (req: AuthenticatedRequest, res: 
   }
 });
 
-// Cancel / Void a completed bill (OWNER-only)
+// Cancel / Void a completed bill (OWNER-only, requires Owner password verification on closed business days)
 router.post('/bills/:id/cancel', authMiddleware, requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { reason, notes } = req.body;
+    const { reason, notes, owner_password } = req.body;
 
     if (!reason || !reason.trim()) {
       res.status(400).json({ error: 'A valid cancellation reason is required.' });
@@ -2213,16 +2368,34 @@ router.post('/bills/:id/cancel', authMiddleware, requireRole(['OWNER']), async (
     }
 
     const now = new Date().toISOString();
-    const todayStr = now.split('T')[0];
-    const saleDate = sale.created_at.split('T')[0];
+    const todayStr = getTodayIST();
+    const saleDate = sale.bill_date || toISTDateString(sale.created_at);
 
     // Check if business day of the sale is already closed
-    const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [saleDate]);
-    const isDayClosed = sale.day_closed === 1 || (closingRecord && closingRecord.status === 'CLOSED') || saleDate < todayStr;
+    const closingInfo = await isBusinessDayClosed(saleDate);
+    const isDayClosed = Number(sale.day_closed) === 1 || closingInfo.isClosed;
     const reversalTxDate = isDayClosed ? todayStr : saleDate;
 
+    let overrideOwner: { id: string; username: string; full_name: string } | null = null;
+    if (isDayClosed) {
+      const override = await verifyOwnerPasswordOverride(
+        owner_password,
+        `Business day ${saleDate} is CLOSED. Owner password verification is required to void/cancel Bill #${sale.bill_number}.`
+      );
+      if (!override.ok) {
+        res.status(override.status).json({
+          error: override.error,
+          code: override.code,
+          requires_owner_password: true,
+          closed_date: saleDate,
+        });
+        return;
+      }
+      overrideOwner = override.owner;
+    }
+
     const fullReason = reason.trim() + (notes && notes.trim() ? ` - ${notes.trim()}` : '');
-    const cancelledByName = req.user?.full_name || req.user?.username || 'Owner';
+    const cancelledByName = overrideOwner?.full_name || req.user?.full_name || req.user?.username || 'Owner';
 
     // Pre-fetch all data needed for atomic batch reversal BEFORE entering dbTransaction
     const saleItems =
@@ -2466,20 +2639,32 @@ router.post('/bills/:id/cancel', authMiddleware, requireRole(['OWNER']), async (
       }
     });
 
+    const modifiedClosedDates = await reconcileAffectedDayClosings(
+      [saleDate, reversalTxDate],
+      cancelledByName,
+      `Voided Bill #${sale.bill_number} (₹${sale.total_amount}): ${fullReason}`,
+      now
+    );
+
     saveDb(true);
 
     await logAudit(req.user?.id || 'OWNER', 'BILL_VOIDED', 'SALE', sale.id, {
       bill_number: sale.bill_number,
+      bill_date: saleDate,
       original_amount: sale.total_amount,
       payment_method: sale.payment_method,
       cancelled_by: cancelledByName,
+      override_authorized_by: overrideOwner?.full_name || null,
+      post_day_closing: isDayClosed,
+      modified_closed_dates: modifiedClosedDates,
       reason: fullReason,
       timestamp: now
     });
 
     res.json({
       success: true,
-      message: `Bill #${sale.bill_number} successfully cancelled and reversed.`,
+      message: `Bill #${sale.bill_number} successfully cancelled and reversed.${modifiedClosedDates.length > 0 ? ` Closed day reconciled & flagged: ${modifiedClosedDates.join(', ')}.` : ''}`,
+      modified_closed_dates: modifiedClosedDates,
       sale: {
         ...sale,
         status: 'CANCELLED',
@@ -2570,10 +2755,10 @@ router.post('/bills/:id/return', authMiddleware, async (req: AuthenticatedReques
     const returnNumber = await getNextReturnNumber();
     const returnId = 'ret_' + Date.now();
     const now = new Date().toISOString();
-    const todayStr = now.split('T')[0];
-    const saleDate = sale.created_at.split('T')[0];
-    const closingRecord = await dbQueryOne<any>('SELECT status FROM daily_closings WHERE closing_date = ?', [saleDate]);
-    const isDayClosed = sale.day_closed === 1 || (closingRecord && closingRecord.status === 'CLOSED') || saleDate < todayStr;
+    const todayStr = getTodayIST();
+    const saleDate = sale.bill_date || toISTDateString(sale.created_at);
+    const closingInfo = await isBusinessDayClosed(saleDate);
+    const isDayClosed = Number(sale.day_closed) === 1 || closingInfo.isClosed;
     const reversalTxDate = isDayClosed ? todayStr : saleDate;
 
     const fullReason = reason.trim() + (notes && notes.trim() ? ` - ${notes.trim()}` : '');
@@ -2781,6 +2966,13 @@ router.post('/bills/:id/return', authMiddleware, async (req: AuthenticatedReques
         ]);
       }
     });
+
+    await reconcileAffectedDayClosings(
+      [saleDate, reversalTxDate],
+      returnedByName,
+      `Customer Return #${returnNumber} on Bill #${sale.bill_number} (₹${totalRefundAmount})`,
+      now
+    );
 
     saveDb(true);
 

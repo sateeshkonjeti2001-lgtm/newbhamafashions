@@ -1,6 +1,6 @@
 import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll, dbQueryOne, dbRun, dbTransaction, saveDb } from '../db.ts';
-import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
+import { authMiddleware, requireRole, AuthenticatedRequest } from '../auth.ts';
 import { logAudit } from '../audit.ts';
 import { randomHex } from '../cryptoUtil.ts';
 import {
@@ -8,6 +8,9 @@ import {
   insertIdempotencyRecord,
   isIdempotencyConflictError,
 } from '../idempotency.ts';
+import { getTodayIST, isValidDateString, toISTDateString } from '../dateUtil.ts';
+import { verifyOwnerPasswordOverride } from '../ownerOverride.ts';
+import { isBusinessDayClosed, reconcileAffectedDayClosings } from '../closingSync.ts';
 
 const router = new Router();
 router.use(authMiddleware);
@@ -156,7 +159,7 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
 router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { amount, payment_method = 'CASH', notes, idempotency_key } = req.body;
+    const { amount, payment_method = 'CASH', notes, idempotency_key, owner_password } = req.body;
 
     const rawClientKey =
       req.headers['x-idempotency-key'] || (typeof idempotency_key === 'string' ? idempotency_key.trim() : '');
@@ -204,7 +207,25 @@ router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const now = new Date().toISOString();
-    const today = now.split('T')[0];
+    const today = getTodayIST();
+
+    const todayClosing = await isBusinessDayClosed(today);
+    let overrideOwner: { id: string; username: string; full_name: string } | null = null;
+    if (todayClosing.isClosed) {
+      const override = await verifyOwnerPasswordOverride(
+        owner_password,
+        `Business day ${today} is CLOSED. Owner password verification is required to record a customer due collection on a closed day.`
+      );
+      if (!override.ok) {
+        res.status(override.status).json({
+          error: override.error,
+          code: override.code,
+          requires_owner_password: true,
+        });
+        return;
+      }
+      overrideOwner = override.owner;
+    }
 
     const paymentId = 'cdp_' + Date.now() + '_' + randomHex(4);
     const ftxId = 'ftx_due_' + Date.now() + '_' + randomHex(4);
@@ -275,8 +296,8 @@ router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
           INSERT INTO financial_transactions (
             id, date, amount, source_account, destination_account, transaction_type,
             person_entity, category, purpose, payment_method, reference_no,
-            is_system_generated, user_id, created_at, updated_at
-          ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'CUSTOMER_DUE_COLLECTION', ?, 'CUSTOMER_DUES', ?, ?, ?, 1, ?, ?, ?)
+            is_system_generated, day_closed, user_id, created_at, updated_at
+          ) VALUES (?, ?, ?, 'EXTERNAL', ?, 'CUSTOMER_DUE_COLLECTION', ?, 'CUSTOMER_DUES', ?, ?, ?, 1, ?, ?, ?, ?)
         `, [
           ftxId,
           today,
@@ -286,6 +307,7 @@ router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
           `Customer Due Collected: ${due.customer_name} (Bill #${due.bill_number || id})`,
           payment_method,
           `DUE-${id.slice(-6)}`,
+          todayClosing.isClosed ? 1 : 0,
           req.user?.id || 'STAFF',
           now,
           now,
@@ -342,6 +364,15 @@ router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
       payment_id: paymentId,
     };
 
+    if (todayClosing.isClosed) {
+      await reconcileAffectedDayClosings(
+        [today],
+        overrideOwner?.full_name || req.user?.full_name || 'Owner',
+        `Collected ₹${payNum} (${payment_method}) from ${due.customer_name} on closed day`,
+        now
+      );
+    }
+
     saveDb(true);
 
     await logAudit(req.user?.id || 'USER', 'COLLECT_CUSTOMER_DUE', 'CUSTOMER_DUE', id, {
@@ -349,6 +380,7 @@ router.post('/:id/pay', async (req: AuthenticatedRequest, res: Response) => {
       amount: payNum,
       balance_remaining: updatedBalance,
       method: payment_method,
+      override_authorized_by: overrideOwner?.full_name || null,
     });
 
     res.json(payResponse);
@@ -440,6 +472,7 @@ router.get('/customers/:id/ledger', async (req: AuthenticatedRequest, res: Respo
     });
 
     payments.forEach((p) => {
+      if (p.is_reversed) return;
       rawEvents.push({
         id: `pay_${p.id}`,
         date: p.created_at,
@@ -523,6 +556,249 @@ router.post('/customers', async (req: AuthenticatedRequest, res: Response) => {
     saveDb(true);
     await logAudit(req.user?.id || 'USER', 'CREATE_CUSTOMER', 'CUSTOMER', id, { name });
     res.json({ success: true, id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Owner Edit Customer Due (original_due / due_date / notes) with Closed-Day Protection
+router.put('/:id', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { original_due, due_date, notes, reason, owner_password } = req.body;
+
+    if (!reason || !String(reason).trim()) {
+      res.status(400).json({ error: 'Mandatory reason is required to edit a customer due record.' });
+      return;
+    }
+
+    const due = await dbQueryOne<any>(
+      `SELECT cd.*, c.name as customer_name, s.bill_number, COALESCE(s.bill_date, '') as sale_bill_date, s.created_at as sale_created_at
+       FROM customer_dues cd
+       JOIN customers c ON cd.customer_id = c.id
+       LEFT JOIN sales s ON cd.sale_id = s.id
+       WHERE cd.id = ?`,
+      [id]
+    );
+    if (!due) {
+      res.status(404).json({ error: 'Due record not found.' });
+      return;
+    }
+
+    const newOriginalDue =
+      original_due !== undefined ? Math.round(Number(original_due) * 100) / 100 : Number(due.original_due);
+    if (!Number.isFinite(newOriginalDue) || newOriginalDue < 0) {
+      res.status(400).json({ error: 'Original due amount must be a valid non-negative number.' });
+      return;
+    }
+    const alreadyPaid = Math.round(Number(due.amount_paid || 0) * 100) / 100;
+    if (newOriginalDue < alreadyPaid) {
+      res.status(400).json({
+        error: `Original due (₹${newOriginalDue}) cannot be less than already collected payments (₹${alreadyPaid}). Reverse a payment first if needed.`,
+      });
+      return;
+    }
+
+    const cleanDueDate =
+      due_date === null || due_date === ''
+        ? null
+        : typeof due_date === 'string' && isValidDateString(due_date)
+          ? due_date.trim()
+          : due.due_date || null;
+
+    const affectedDate = due.sale_bill_date || (due.sale_created_at ? toISTDateString(due.sale_created_at) : toISTDateString(due.created_at));
+    const dayClosing = await isBusinessDayClosed(affectedDate);
+    let overrideOwner: { id: string; username: string; full_name: string } | null = null;
+    if (dayClosing.isClosed) {
+      const override = await verifyOwnerPasswordOverride(
+        owner_password,
+        `Due record belongs to CLOSED business day (${affectedDate}). Owner password verification is required.`
+      );
+      if (!override.ok) {
+        res.status(override.status).json({
+          error: override.error,
+          code: override.code,
+          requires_owner_password: true,
+        });
+        return;
+      }
+      overrideOwner = override.owner;
+    }
+
+    const newBalanceDue = Math.max(0, Math.round((newOriginalDue - alreadyPaid) * 100) / 100);
+    const newStatus: 'PENDING' | 'CLEARED' = newBalanceDue <= 0 ? 'CLEARED' : 'PENDING';
+    const now = new Date().toISOString();
+    const cleanReason = String(reason).trim();
+
+    await dbTransaction(async () => {
+      await dbRun(
+        `UPDATE customer_dues SET
+          original_due = ?,
+          balance_due = ?,
+          due_date = ?,
+          status = ?,
+          notes = ?,
+          updated_at = ?
+         WHERE id = ?`,
+        [
+          newOriginalDue,
+          newBalanceDue,
+          cleanDueDate,
+          newStatus,
+          notes !== undefined ? notes?.trim() || null : due.notes,
+          now,
+          id,
+        ]
+      );
+      await dbRun(SYNC_CUSTOMER_DUES_SQL, [due.customer_id, due.customer_id]);
+    });
+
+    if (dayClosing.isClosed) {
+      await reconcileAffectedDayClosings(
+        [affectedDate],
+        overrideOwner?.full_name || req.user?.full_name || 'Owner',
+        `Customer due edited for ${due.customer_name} (₹${due.original_due} -> ₹${newOriginalDue}): ${cleanReason}`,
+        now
+      );
+    }
+
+    saveDb(true);
+
+    await logAudit(req.user?.id || 'OWNER', 'EDIT_CUSTOMER_DUE', 'CUSTOMER_DUE', id, {
+      customer: due.customer_name,
+      reason: cleanReason,
+      override_authorized_by: overrideOwner?.full_name || null,
+      before: {
+        original_due: due.original_due,
+        balance_due: due.balance_due,
+        due_date: due.due_date,
+        status: due.status,
+      },
+      after: {
+        original_due: newOriginalDue,
+        balance_due: newBalanceDue,
+        due_date: cleanDueDate,
+        status: newStatus,
+      },
+    });
+
+    res.json({ success: true, balance_due: newBalanceDue, status: newStatus });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Owner Safe Reversal of a Customer Due Repayment
+router.post('/payments/:paymentId/reverse', requireRole(['OWNER']), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { paymentId } = req.params;
+    const { reason, owner_password } = req.body;
+
+    if (!reason || !String(reason).trim()) {
+      res.status(400).json({ error: 'Mandatory reason is required to reverse a customer due repayment.' });
+      return;
+    }
+
+    const payment = await dbQueryOne<any>(
+      `SELECT cdp.*, c.name as customer_name, cd.original_due, cd.amount_paid, cd.balance_due, cd.status as due_status
+       FROM customer_due_payments cdp
+       JOIN customer_dues cd ON cdp.customer_due_id = cd.id
+       JOIN customers c ON cdp.customer_id = c.id
+       WHERE cdp.id = ?`,
+      [paymentId]
+    );
+    if (!payment) {
+      res.status(404).json({ error: 'Repayment record not found.' });
+      return;
+    }
+
+    if (payment.is_reversed) {
+      res.status(400).json({ error: 'This repayment has already been reversed.' });
+      return;
+    }
+
+    const ftx = payment.financial_tx_id
+      ? await dbQueryOne<any>('SELECT * FROM financial_transactions WHERE id = ?', [payment.financial_tx_id])
+      : null;
+
+    const payDate = ftx?.date || toISTDateString(payment.created_at);
+    const dayClosing = await isBusinessDayClosed(payDate);
+    let overrideOwner: { id: string; username: string; full_name: string } | null = null;
+    if (dayClosing.isClosed) {
+      const override = await verifyOwnerPasswordOverride(
+        owner_password,
+        `Repayment was recorded on a CLOSED business day (${payDate}). Owner password verification is required to reverse it.`
+      );
+      if (!override.ok) {
+        res.status(override.status).json({
+          error: override.error,
+          code: override.code,
+          requires_owner_password: true,
+        });
+        return;
+      }
+      overrideOwner = override.owner;
+    }
+
+    const payAmt = Math.round(Number(payment.amount || 0) * 100) / 100;
+    const now = new Date().toISOString();
+    const cleanReason = String(reason).trim();
+
+    await dbTransaction(async () => {
+      await dbRun(
+        `UPDATE customer_due_payments SET
+          is_reversed = 1,
+          reversed_reason = ?,
+          reversed_at = ?,
+          reversed_by = ?
+         WHERE id = ?`,
+        [cleanReason, now, req.user?.id || 'OWNER', paymentId]
+      );
+
+      await dbRun(
+        `UPDATE customer_dues SET
+          amount_paid = ROUND(MAX(0, amount_paid - ?), 2),
+          balance_due = ROUND(balance_due + ?, 2),
+          status = CASE WHEN ROUND(balance_due + ?, 2) > 0 THEN 'PENDING' ELSE 'CLEARED' END,
+          updated_at = ?
+         WHERE id = ?`,
+        [payAmt, payAmt, payAmt, now, payment.customer_due_id]
+      );
+
+      await dbRun(SYNC_CUSTOMER_DUES_SQL, [payment.customer_id, payment.customer_id]);
+
+      if (payment.financial_tx_id) {
+        await dbRun(
+          `UPDATE financial_transactions SET
+            is_reversed = 1,
+            notes = COALESCE(notes || ' | ', '') || ?,
+            updated_at = ?
+           WHERE id = ?`,
+          [`[REVERSED Due Receipt: ${cleanReason}]`, now, payment.financial_tx_id]
+        );
+      }
+    });
+
+    const modifiedClosedDates = await reconcileAffectedDayClosings(
+      [payDate],
+      overrideOwner?.full_name || req.user?.full_name || 'Owner',
+      `Reversed customer repayment ₹${payAmt} (${payment.payment_method}) for ${payment.customer_name}: ${cleanReason}`,
+      now
+    );
+
+    saveDb(true);
+
+    await logAudit(req.user?.id || 'OWNER', 'REVERSE_CUSTOMER_DUE_PAYMENT', 'CUSTOMER_DUE_PAYMENT', paymentId, {
+      customer_due_id: payment.customer_due_id,
+      customer: payment.customer_name,
+      amount: payAmt,
+      payment_method: payment.payment_method,
+      reason: cleanReason,
+      override_authorized_by: overrideOwner?.full_name || null,
+      modified_closed_dates: modifiedClosedDates,
+    });
+
+    res.json({ success: true, modified_closed_dates: modifiedClosedDates });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -24,7 +24,9 @@ router.get('/sales', async (_req: AuthenticatedRequest, res: Response) => {
     const sales = await dbQueryAll(`
       SELECT 
         s.bill_number as 'Bill Number',
-        s.created_at as 'Date & Time',
+        COALESCE(s.bill_date, DATE(s.created_at, '+330 minutes')) as 'Bill Date (IST)',
+        s.created_at as 'Created Timestamp',
+        COALESCE(s.status, 'COMPLETED') as 'Bill Status',
         s.customer_name as 'Customer Name',
         s.customer_phone as 'Customer Phone',
         s.subtotal as 'Subtotal (₹)',
@@ -39,7 +41,7 @@ router.get('/sales', async (_req: AuthenticatedRequest, res: Response) => {
         u.full_name as 'Cashier'
       FROM sales s
       LEFT JOIN users u ON s.cashier_id = u.id
-      ORDER BY s.created_at DESC
+      ORDER BY COALESCE(s.bill_date, DATE(s.created_at, '+330 minutes')) DESC, s.created_at DESC
     `);
     sendExcelBuffer(res, sales, 'Sales', `NBF_Sales_${Date.now()}`);
   } catch (err: any) {
@@ -96,6 +98,8 @@ router.get('/daily-closings', async (_req: AuthenticatedRequest, res: Response) 
         dc.upi_received_other as 'Other UPI In (₹)',
         dc.upi_payments as 'UPI Paid Out (₹)',
         dc.status as 'Status',
+        CASE WHEN dc.modified_after_close = 1 THEN 'YES' ELSE 'NO' END as 'Modified After Close',
+        dc.last_modification_summary as 'Post-Close Audit Note',
         u.full_name as 'Closed By',
         dc.closed_at as 'Closed At',
         dc.closing_notes as 'Notes'
@@ -148,6 +152,7 @@ router.get('/purchases', requireRole(['OWNER']), async (_req: AuthenticatedReque
         p.balance_due as 'Balance Due (₹)',
         p.payment_status as 'Payment Status',
         p.payment_method as 'Payment Method',
+        CASE WHEN COALESCE(p.is_reversed, 0) = 1 THEN 'REVERSED' ELSE 'ACTIVE' END as 'Record Status',
         p.notes as 'Notes'
       FROM purchases p
       JOIN suppliers s ON p.supplier_id = s.id

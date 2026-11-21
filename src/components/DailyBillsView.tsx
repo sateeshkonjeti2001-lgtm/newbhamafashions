@@ -28,11 +28,21 @@ import {
   Pencil,
   MessageSquarePlus,
   History,
+  Lock,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { UserRole } from '../types.ts';
+import {
+  getTodayIST,
+  getYesterdayIST,
+  toISTDateString,
+  getISTCalendarDayDiff,
+  formatDateIST,
+  formatDateTimeIST,
+} from '../utils/date.ts';
 import { ManualBillModal } from './ManualBillModal.tsx';
 import { ReceiptModal } from './ReceiptModal.tsx';
+import { OwnerOverridePrompt } from './OwnerOverridePrompt.tsx';
 
 interface DailyBillsViewProps {
   role: UserRole;
@@ -46,7 +56,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
   initialDate,
 }) => {
   const isOwner = role === 'OWNER';
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayIST();
 
   // Filters
   const [selectedDate, setSelectedDate] = useState<string>(initialDate || todayStr);
@@ -66,12 +76,15 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
   const [loadingDetail, setLoadingDetail] = useState<boolean>(false);
   const [receiptBill, setReceiptBill] = useState<any | null>(null);
 
-  // Cancellation Modal (Owner Only)
+  // Cancellation Modal (Owner Only) + Closed-day Override
   const [billToCancel, setBillToCancel] = useState<any | null>(null);
   const [cancelReason, setCancelReason] = useState<string>('Customer returned goods / handwritten error');
   const [cancelNotes, setCancelNotes] = useState<string>('');
   const [cancelling, setCancelling] = useState<boolean>(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const [showCancelOwnerPrompt, setShowCancelOwnerPrompt] = useState<boolean>(false);
+  const [cancelOwnerDesc, setCancelOwnerDesc] = useState<string>('');
+  const [cancelOwnerErr, setCancelOwnerErr] = useState<string | null>(null);
 
   // Post-Save Edit & Correction Note States
   const [editingBillDetail, setEditingBillDetail] = useState<{ sale: any; items: any[] } | null>(null);
@@ -91,12 +104,24 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
     setTimeout(() => setToastMessage(null), 4000);
   };
 
-  const isEligibleForDirectEdit = (bill: any): boolean => {
-    if (!bill || bill.status === 'CANCELLED' || Number(bill.day_closed) === 1) {
-      return false;
+  const getEditStatus = (bill: any) => {
+    if (!bill || bill.status === 'CANCELLED') {
+      return { editable: false, requiresOverride: false, isClosed: false, daysSince: 0, label: 'Cancelled' };
     }
-    const billDate = String(bill.created_at || bill.bill_date || '').slice(0, 10);
-    return billDate === todayStr;
+    const isClosed = Number(bill.day_closed) === 1 || bill.closing_status === 'CLOSED';
+    const daysSince =
+      typeof bill.days_since_created === 'number'
+        ? bill.days_since_created
+        : bill.created_at
+        ? getISTCalendarDayDiff(bill.created_at)
+        : 0;
+    const requiresOverride = isClosed || daysSince > 2;
+    const label = isClosed
+      ? 'Closed • Override'
+      : daysSince > 2
+      ? `Day ${daysSince + 1} • Override`
+      : `Day ${Math.min(3, daysSince + 1)}/3`;
+    return { editable: true, requiresOverride, isClosed, daysSince, label };
   };
 
   // Compute date filter arguments based on dateMode
@@ -105,20 +130,15 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
       return { date: todayStr };
     }
     if (dateMode === 'YESTERDAY') {
-      const y = new Date();
-      y.setDate(y.getDate() - 1);
-      const yStr = y.toISOString().split('T')[0];
-      return { date: yStr };
+      return { date: getYesterdayIST() };
     }
     if (dateMode === 'MONTH') {
-      const now = new Date();
-      const firstDay = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+      const firstDay = `${todayStr.slice(0, 7)}-01`;
       return { start_date: firstDay, end_date: todayStr };
     }
     if (dateMode === 'CUSTOM') {
       return { date: selectedDate };
     }
-    // ALL
     return {};
   };
 
@@ -236,8 +256,8 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
     }
   };
 
-  // Handle Safe Cancel Bill
-  const handleConfirmCancel = async () => {
+  // Handle Safe Cancel Bill (supports Owner password override on closed days)
+  const handleConfirmCancel = async (ownerPassword?: string) => {
     if (!billToCancel) return;
     if (!cancelReason.trim()) {
       setCancelError('Please select or specify a reason for cancellation.');
@@ -246,21 +266,32 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
 
     setCancelling(true);
     setCancelError(null);
+    setCancelOwnerErr(null);
     try {
       const res = await api.cancelBill(billToCancel.id, {
         reason: cancelReason.trim(),
         notes: cancelNotes.trim() || undefined,
+        ...(ownerPassword ? { owner_password: ownerPassword } : {}),
       });
 
-      showToast(`Bill #${billToCancel.bill_number} successfully cancelled and reversed.`);
+      showToast(res.message || `Bill #${billToCancel.bill_number} successfully cancelled and reversed.`);
       setBillToCancel(null);
+      setShowCancelOwnerPrompt(false);
       setCancelNotes('');
       if (selectedBillDetail && selectedBillDetail.sale?.id === billToCancel.id) {
         setSelectedBillDetail(null);
       }
       fetchDailyBills();
     } catch (err: any) {
-      setCancelError(err.message || 'Failed to cancel bill');
+      if (err?.requires_owner_password) {
+        setCancelOwnerDesc(
+          err.message || `Business day is CLOSED. Verify Owner password to cancel Bill #${billToCancel.bill_number}.`
+        );
+        setCancelOwnerErr(ownerPassword ? err.message : null);
+        setShowCancelOwnerPrompt(true);
+      } else {
+        setCancelError(err.message || 'Failed to cancel bill');
+      }
     } finally {
       setCancelling(false);
     }
@@ -301,39 +332,9 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
     };
   }, [bills]);
 
-  // Format date helper
-  const formatDate = (dateStr: string) => {
-    if (!dateStr) return '-';
-    try {
-      const parts = dateStr.split('T')[0].split('-');
-      if (parts.length === 3) {
-        const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
-        return d.toLocaleDateString('en-IN', {
-          day: 'numeric',
-          month: 'short',
-          year: 'numeric',
-        });
-      }
-      return dateStr;
-    } catch {
-      return dateStr;
-    }
-  };
-
-  const formatDateTime = (isoStr: string) => {
-    if (!isoStr) return '-';
-    try {
-      return new Date(isoStr).toLocaleString('en-IN', {
-        day: 'numeric',
-        month: 'short',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-    } catch {
-      return isoStr;
-    }
-  };
+  // Format date helper (IST)
+  const formatDate = (dateStr: string) => formatDateIST(dateStr);
+  const formatDateTime = (isoStr: string) => formatDateTimeIST(isoStr);
 
   return (
     <div className="space-y-5">
@@ -501,9 +502,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
             <button
               onClick={() => {
                 setDateMode('YESTERDAY');
-                const y = new Date();
-                y.setDate(y.getDate() - 1);
-                setSelectedDate(y.toISOString().split('T')[0]);
+                setSelectedDate(getYesterdayIST());
               }}
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap cursor-pointer ${
                 dateMode === 'YESTERDAY'
@@ -606,42 +605,41 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
       </div>
 
       {/* Post-Save Quick Action Banner (immediately shows Edit option after saving) */}
-      {lastSavedBill && lastSavedBill.status !== 'CANCELLED' && (
-        <div className="bg-[#FBF5EE] border border-[#E8DFC9] rounded-xl p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
-          <div className="flex items-start sm:items-center gap-2.5">
-            <CheckCircle2 className="w-5 h-5 text-[#3F6B50] shrink-0 mt-0.5 sm:mt-0" />
-            <div className="text-xs">
-              <span className="font-bold text-[#1C1917] block">
-                Bill #{lastSavedBill.bill_number} saved (₹{(Number(lastSavedBill.total_amount) || 0).toLocaleString('en-IN')} &bull; {lastSavedBill.payment_method})
-              </span>
-              <span className="text-[11px] text-[#6F6962]">
-                {isEligibleForDirectEdit(lastSavedBill)
-                  ? 'Need to adjust an item, quantity, rate, or payment method? You can edit this bill directly.'
-                  : 'This bill is dated for a previous day — you can view details or attach a correction note.'}
-              </span>
+      {lastSavedBill && lastSavedBill.status !== 'CANCELLED' && (() => {
+        const editStatus = getEditStatus(lastSavedBill);
+        return (
+          <div className="bg-[#FBF5EE] border border-[#E8DFC9] rounded-xl p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-start sm:items-center gap-2.5">
+              <CheckCircle2 className="w-5 h-5 text-[#3F6B50] shrink-0 mt-0.5 sm:mt-0" />
+              <div className="text-xs">
+                <span className="font-bold text-[#1C1917] block">
+                  Bill #{lastSavedBill.bill_number} saved (₹{(Number(lastSavedBill.total_amount) || 0).toLocaleString('en-IN')} &bull; {lastSavedBill.payment_method})
+                </span>
+                <span className="text-[11px] text-[#6F6962]">
+                  {editStatus.requiresOverride
+                    ? 'Closed business day or beyond 3-day window — editing requires Store Owner password.'
+                    : 'Within 3-day IST editing window — you can edit items, bill date, or payment method anytime.'}
+                </span>
+              </div>
             </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2 shrink-0">
-            {isEligibleForDirectEdit(lastSavedBill) ? (
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={() => handleStartEditBill(lastSavedBill)}
                 disabled={loadingEditId === lastSavedBill.id}
                 className="px-3.5 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 shadow-xs transition cursor-pointer disabled:opacity-50"
               >
-                <Pencil className="w-3.5 h-3.5" />
+                {editStatus.requiresOverride ? <Lock className="w-3.5 h-3.5" /> : <Pencil className="w-3.5 h-3.5" />}
                 <span>{loadingEditId === lastSavedBill.id ? 'Loading...' : 'Edit Saved Bill'}</span>
               </button>
-            ) : (
               <button
                 type="button"
                 onClick={() => handleOpenCorrectionNote(lastSavedBill)}
                 className="px-3.5 py-2 bg-white hover:bg-[#F3EFE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-bold inline-flex items-center gap-1.5 transition cursor-pointer"
               >
                 <MessageSquarePlus className="w-3.5 h-3.5 text-[#A67C52]" />
-                <span>Add Correction Note</span>
+                <span>Add Note</span>
               </button>
-            )}
             <button
               type="button"
               onClick={() => handleViewBill(lastSavedBill.id)}
@@ -660,7 +658,8 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
             </button>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* 4. Daily Bills Table */}
       <div className="bg-white border border-[#E3DED5] rounded-2xl overflow-hidden shadow-[0_2px_10px_rgba(23,21,19,0.03)]">
@@ -735,9 +734,10 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                     >
                       {/* Date */}
                       <td className="py-3.5 px-3 font-medium text-[#1C1917] whitespace-nowrap">
-                        <div className="flex items-center gap-1.5">
-                          <span>{formatDate(bill.created_at)}</span>
-                        </div>
+                        <div>{formatDate(bill.bill_date || toISTDateString(bill.created_at))}</div>
+                        {Number(bill.day_closed) === 1 && (
+                          <span className="text-[10px] text-[#3F6B50] font-semibold">Day Closed</span>
+                        )}
                       </td>
 
                       {/* Bill Number */}
@@ -859,29 +859,41 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       {/* Actions */}
                       <td className="py-3.5 px-3 text-right whitespace-nowrap">
                         <div className="flex items-center justify-end gap-1.5">
-                          {/* Edit (Same-day non-cancelled & day open) OR Correction Note (Previous-date / closed) */}
-                          {isEligibleForDirectEdit(bill) ? (
-                            <button
-                              onClick={() => handleStartEditBill(bill)}
-                              disabled={loadingEditId === bill.id}
-                              title="Edit today's manual bill"
-                              className="px-2.5 py-1.5 bg-[#FBF5EE] hover:bg-[#F3E7D7] text-[#8C653E] border border-[#E8DFC9] rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
-                            >
-                              <Pencil className="w-3.5 h-3.5" />
-                              <span>{loadingEditId === bill.id ? 'Loading...' : 'Edit'}</span>
-                            </button>
-                          ) : (
-                            !isCancelled && (
-                              <button
-                                onClick={() => handleOpenCorrectionNote(bill)}
-                                title="Previous-date bills cannot be edited directly — add a correction note"
-                                className="px-2.5 py-1.5 bg-[#FAF8F4] hover:bg-[#F0EDE6] text-[#6F6962] hover:text-[#1C1917] border border-[#D4CDC2] rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 transition cursor-pointer"
-                              >
-                                <MessageSquarePlus className="w-3.5 h-3.5 text-[#A67C52]" />
-                                <span>Note</span>
-                              </button>
-                            )
-                          )}
+                          {(() => {
+                            const editStatus = getEditStatus(bill);
+                            return !isCancelled && editStatus.editable ? (
+                              <>
+                                <button
+                                  onClick={() => handleStartEditBill(bill)}
+                                  disabled={loadingEditId === bill.id}
+                                  title={
+                                    editStatus.requiresOverride
+                                      ? `Edit bill (${editStatus.label} — Owner password verification required)`
+                                      : `Edit bill (${editStatus.label})`
+                                  }
+                                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-50 border ${
+                                    editStatus.requiresOverride
+                                      ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-200'
+                                      : 'bg-[#FBF5EE] hover:bg-[#F3E7D7] text-[#8C653E] border-[#E8DFC9]'
+                                  }`}
+                                >
+                                  {editStatus.requiresOverride ? (
+                                    <Lock className="w-3 h-3" />
+                                  ) : (
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  )}
+                                  <span>{loadingEditId === bill.id ? 'Loading...' : 'Edit'}</span>
+                                </button>
+                                <button
+                                  onClick={() => handleOpenCorrectionNote(bill)}
+                                  title="Attach audit correction note"
+                                  className="p-1.5 text-[#6F6962] hover:text-[#1C1917] hover:bg-[#FAF8F4] border border-transparent hover:border-[#D4CDC2] rounded-lg transition cursor-pointer"
+                                >
+                                  <MessageSquarePlus className="w-3.5 h-3.5 text-[#A67C52]" />
+                                </button>
+                              </>
+                            ) : null;
+                          })()}
 
                           {/* View Bill Details */}
                           <button
@@ -959,7 +971,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                         )}
                       </div>
                       <span className="text-xs text-[#6F6962] font-medium">
-                        {formatDate(bill.created_at)}
+                        {formatDate(bill.bill_date || toISTDateString(bill.created_at))}
                       </span>
                     </div>
 
@@ -1053,26 +1065,32 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
 
                     {/* Touch-Friendly Action Buttons (min 44px touch targets) */}
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1">
-                      {isEligibleForDirectEdit(bill) ? (
-                        <button
-                          onClick={() => handleStartEditBill(bill)}
-                          disabled={loadingEditId === bill.id}
-                          className="min-h-[44px] px-3 py-2 bg-[#FBF5EE] hover:bg-[#F3E7D7] border border-[#E8DFC9] text-[#8C653E] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
-                        >
-                          <Pencil className="w-4 h-4" />
-                          <span>{loadingEditId === bill.id ? 'Loading...' : 'Edit Bill'}</span>
-                        </button>
-                      ) : (
-                        !isCancelled && (
-                          <button
-                            onClick={() => handleOpenCorrectionNote(bill)}
-                            className="min-h-[44px] px-3 py-2 bg-[#FAF8F4] hover:bg-[#F0EDE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
-                          >
-                            <MessageSquarePlus className="w-4 h-4 text-[#A67C52]" />
-                            <span>Correction Note</span>
-                          </button>
-                        )
-                      )}
+                      {(() => {
+                        const editStatus = getEditStatus(bill);
+                        return !isCancelled && editStatus.editable ? (
+                          <>
+                            <button
+                              onClick={() => handleStartEditBill(bill)}
+                              disabled={loadingEditId === bill.id}
+                              className={`min-h-[44px] px-3 py-2 border rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${
+                                editStatus.requiresOverride
+                                  ? 'bg-amber-50 hover:bg-amber-100 border-amber-200 text-amber-900'
+                                  : 'bg-[#FBF5EE] hover:bg-[#F3E7D7] border-[#E8DFC9] text-[#8C653E]'
+                              }`}
+                            >
+                              {editStatus.requiresOverride ? <Lock className="w-3.5 h-3.5" /> : <Pencil className="w-4 h-4" />}
+                              <span>{loadingEditId === bill.id ? 'Loading...' : 'Edit Bill'}</span>
+                            </button>
+                            <button
+                              onClick={() => handleOpenCorrectionNote(bill)}
+                              className="min-h-[44px] px-3 py-2 bg-[#FAF8F4] hover:bg-[#F0EDE6] border border-[#D4CDC2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                            >
+                              <MessageSquarePlus className="w-4 h-4 text-[#A67C52]" />
+                              <span>Add Note</span>
+                            </button>
+                          </>
+                        ) : null;
+                      })()}
 
                       <button
                         onClick={() => handleViewBill(bill.id)}
@@ -1123,9 +1141,11 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
         }}
         onBillSaved={(savedBill, mode) => {
           setEditingBillDetail(null);
+          const savedDate = savedBill.bill_date || toISTDateString(savedBill.created_at);
           const normalizedSaved = {
             ...savedBill,
-            created_at: savedBill.created_at || (savedBill.bill_date ? `${savedBill.bill_date}T12:00:00.000Z` : new Date().toISOString()),
+            bill_date: savedDate,
+            created_at: savedBill.created_at || new Date().toISOString(),
             day_closed: savedBill.day_closed ?? 0,
             status: savedBill.status || 'COMPLETED',
           };
@@ -1136,7 +1156,6 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
             fetchDailyBills();
           } else {
             showToast(`Daily Bill #${savedBill.bill_number} recorded successfully!`);
-            const savedDate = String(normalizedSaved.created_at || '').slice(0, 10);
             let filterChanged = false;
             if (savedDate === todayStr && dateMode !== 'TODAY' && dateMode !== 'ALL' && dateMode !== 'MONTH') {
               setDateMode('TODAY');
@@ -1184,7 +1203,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                     )}
                   </div>
                   <p className="text-xs text-[#6F6962] mt-0.5">
-                    Recorded Date: {formatDate(selectedBillDetail.sale?.created_at)}
+                    Business Date: {formatDate(selectedBillDetail.sale?.bill_date || toISTDateString(selectedBillDetail.sale?.created_at))} &bull; Created: {formatDateTime(selectedBillDetail.sale?.created_at)}
                   </p>
                 </div>
               </div>
@@ -1198,6 +1217,16 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
 
             {/* Body */}
             <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-5">
+              {/* Modified After Closing Banner */}
+              {selectedBillDetail.sale?.day_modified_after_close && (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span>
+                    <strong>Modified After Closing:</strong> This business day was closed and subsequently reconciled following an authorized edit.
+                  </span>
+                </div>
+              )}
+
               {/* Cancellation Banner if Cancelled */}
               {selectedBillDetail.sale?.status === 'CANCELLED' && (
                 <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 space-y-1">
@@ -1322,16 +1351,21 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                 </div>
               )}
 
-              {/* Previous-Date / Day-Closed Restriction Info */}
-              {selectedBillDetail.sale?.status !== 'CANCELLED' &&
-                !isEligibleForDirectEdit(selectedBillDetail.sale) && (
+              {/* Edit Window / Override Policy Notice */}
+              {selectedBillDetail.sale?.status !== 'CANCELLED' && (() => {
+                const editStatus = getEditStatus(selectedBillDetail.sale);
+                return (
                   <div className="p-3.5 bg-[#FAF8F4] border border-[#E8DFC9] rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <div className="space-y-0.5">
                       <span className="font-bold text-[#1C1917] block">
-                        Direct Editing Locked (Previous Date or Closed Day)
+                        {editStatus.requiresOverride
+                          ? 'Owner Password Override Required for Editing'
+                          : `Direct Editing Active (${editStatus.label})`}
                       </span>
                       <p className="text-[11px] text-[#6F6962]">
-                        Bills from previous dates or closed business days cannot be modified directly. Add an audit correction note instead.
+                        {editStatus.requiresOverride
+                          ? 'Because this bill is past the 3-day IST creation window or on a closed business day, direct edits require Owner password verification.'
+                          : 'You can directly edit items, bill date, payment mode, or customer details within 3 IST calendar days of creation.'}
                       </p>
                     </div>
                     <button
@@ -1343,7 +1377,8 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       <span>Add Correction Note</span>
                     </button>
                   </div>
-                )}
+                );
+              })()}
 
               {/* Edit History & Correction Notes */}
               <div className="space-y-2.5 pt-2 border-t border-[#E3DED5]">
@@ -1399,6 +1434,13 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                             </div>
                           )}
 
+                          {d.override_authorized_by && (
+                            <div className="text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-1 rounded-md inline-flex items-center gap-1">
+                              <Lock className="w-3 h-3" />
+                              <span>Owner Override Authorized ({d.override_authorized_by})</span>
+                            </div>
+                          )}
+
                           {isNote ? (
                             <div className="p-2.5 bg-white border border-[#E3DED5] rounded-lg text-xs text-[#1C1917]">
                               {d.note || d.message}
@@ -1414,6 +1456,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                                   <div className="font-mono font-semibold text-[#6F6962]">
                                     Total: ₹{(Number(d.before.total_amount) || 0).toLocaleString('en-IN')} &bull;{' '}
                                     {d.before.payment_method}
+                                    {d.before.bill_date ? ` • ${d.before.bill_date}` : ''}
                                   </div>
                                   {Array.isArray(d.before.items) && (
                                     <div className="text-[#6F6962]">
@@ -1430,6 +1473,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                                   <div className="font-mono font-bold text-[#1C1917]">
                                     Total: ₹{(Number(d.after.total_amount) || 0).toLocaleString('en-IN')} &bull;{' '}
                                     {d.after.payment_method}
+                                    {d.after.bill_date ? ` • ${d.after.bill_date}` : ''}
                                   </div>
                                   {Array.isArray(d.after.items) && (
                                     <div className="text-[#1C1917]">
@@ -1461,18 +1505,21 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
               </button>
 
               <div className="flex flex-wrap items-center gap-2">
-                {isEligibleForDirectEdit(selectedBillDetail.sale) ? (
-                  <button
-                    type="button"
-                    onClick={() => handleStartEditBill(selectedBillDetail.sale)}
-                    disabled={loadingEditId === selectedBillDetail.sale?.id}
-                    className="px-4 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-2xs transition cursor-pointer disabled:opacity-50"
-                  >
-                    <Pencil className="w-3.5 h-3.5" />
-                    <span>{loadingEditId === selectedBillDetail.sale?.id ? 'Loading...' : 'Edit Bill'}</span>
-                  </button>
-                ) : (
-                  selectedBillDetail.sale?.status !== 'CANCELLED' && (
+                {selectedBillDetail.sale?.status !== 'CANCELLED' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleStartEditBill(selectedBillDetail.sale)}
+                      disabled={loadingEditId === selectedBillDetail.sale?.id}
+                      className="px-4 py-2 bg-[#A67C52] hover:bg-[#8C653E] text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-2xs transition cursor-pointer disabled:opacity-50"
+                    >
+                      {getEditStatus(selectedBillDetail.sale).requiresOverride ? (
+                        <Lock className="w-3.5 h-3.5" />
+                      ) : (
+                        <Pencil className="w-3.5 h-3.5" />
+                      )}
+                      <span>{loadingEditId === selectedBillDetail.sale?.id ? 'Loading...' : 'Edit Bill'}</span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => handleOpenCorrectionNote(selectedBillDetail.sale)}
@@ -1481,7 +1528,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
                       <MessageSquarePlus className="w-3.5 h-3.5" />
                       <span>Correction Note</span>
                     </button>
-                  )
+                  </>
                 )}
 
                 <button
@@ -1674,7 +1721,7 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
               </button>
               <button
                 type="button"
-                onClick={handleConfirmCancel}
+                onClick={() => handleConfirmCancel()}
                 disabled={cancelling}
                 className="px-5 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition shadow-xs"
               >
@@ -1685,6 +1732,21 @@ export const DailyBillsView: React.FC<DailyBillsViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Closed-Day Cancel Owner Override Prompt */}
+      <OwnerOverridePrompt
+        isOpen={showCancelOwnerPrompt}
+        title={`Authorize Closed-Day Void: Bill #${billToCancel?.bill_number || ''}`}
+        description={cancelOwnerDesc}
+        requireReason={false}
+        errorMessage={cancelOwnerErr}
+        submitting={cancelling}
+        onCancel={() => {
+          setShowCancelOwnerPrompt(false);
+          setCancelOwnerErr(null);
+        }}
+        onConfirm={(pwd) => handleConfirmCancel(pwd)}
+      />
 
       {/* 8. Receipt Modal */}
       {receiptBill && (

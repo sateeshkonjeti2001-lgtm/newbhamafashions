@@ -25,11 +25,16 @@ import {
   CheckSquare,
   Square,
   Package,
+  Pencil,
+  Lock,
+  History,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { UserRole } from '../types.ts';
+import { toISTDateString, formatDateIST, formatTimeIST, formatDateTimeIST } from '../utils/date.ts';
 import { ReceiptModal } from './ReceiptModal.tsx';
 import { ManualBillModal } from './ManualBillModal.tsx';
+import { OwnerOverridePrompt } from './OwnerOverridePrompt.tsx';
 
 interface BillHistoryViewProps {
   role: UserRole;
@@ -67,20 +72,30 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     }
   }, [initialChannelFilter]);
 
-  // Manual Bill Entry Modal
+  // Manual Bill Entry / Edit Modal
   const [showManualBillModal, setShowManualBillModal] = useState(false);
+  const [editingManualBill, setEditingManualBill] = useState<{ sale: any; items: any[] } | null>(null);
 
   // Selected Bill Details Modal
   const [selectedBillId, setSelectedBillId] = useState<string | null>(null);
-  const [billDetail, setBillDetail] = useState<{ sale: any; items: any[]; returns: any[]; customerDue?: any } | null>(null);
+  const [billDetail, setBillDetail] = useState<{
+    sale: any;
+    items: any[];
+    returns: any[];
+    customerDue?: any;
+    editHistory?: any[];
+  } | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
 
-  // Bill Cancel Modal (Owner only)
+  // Bill Cancel Modal (Owner only) + Closed-Day Override
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [cancelReason, setCancelReason] = useState('Customer changed mind / requested refund');
   const [cancelNotes, setCancelNotes] = useState('');
   const [cancelSubmitting, setCancelSubmitting] = useState(false);
+  const [showCancelOwnerPrompt, setShowCancelOwnerPrompt] = useState(false);
+  const [cancelOwnerDesc, setCancelOwnerDesc] = useState('');
+  const [cancelOwnerErr, setCancelOwnerErr] = useState<string | null>(null);
 
   // Item Return Modal
   const [showReturnModal, setShowReturnModal] = useState(false);
@@ -240,8 +255,8 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     }));
   };
 
-  // Execute Full Bill Cancel / Void (Owner Only)
-  const handleConfirmCancel = async () => {
+  // Execute Full Bill Cancel / Void (Owner Only; supports Owner password override on closed days)
+  const handleConfirmCancel = async (ownerPassword?: string) => {
     if (!billDetail?.sale) return;
     if (!cancelReason.trim()) {
       showNotice('error', 'Cancellation reason is mandatory.');
@@ -249,18 +264,28 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     }
 
     setCancelSubmitting(true);
+    setCancelOwnerErr(null);
     try {
       const res = await api.cancelBill(billDetail.sale.id, {
         reason: cancelReason.trim(),
         notes: cancelNotes.trim() || undefined,
+        ...(ownerPassword ? { owner_password: ownerPassword } : {}),
       });
       showNotice('success', res.message || `Bill ${billDetail.sale.bill_number} successfully cancelled.`);
       setShowCancelModal(false);
-      // Refresh details & list
+      setShowCancelOwnerPrompt(false);
       await handleOpenDetail(billDetail.sale.id);
       fetchBills();
     } catch (err: any) {
-      showNotice('error', err.message || 'Failed to cancel bill');
+      if (err?.requires_owner_password) {
+        setCancelOwnerDesc(
+          err.message || `Business day is CLOSED. Verify Owner password to cancel Bill #${billDetail.sale.bill_number}.`
+        );
+        setCancelOwnerErr(ownerPassword ? err.message : null);
+        setShowCancelOwnerPrompt(true);
+      } else {
+        showNotice('error', err.message || 'Failed to cancel bill');
+      }
     } finally {
       setCancelSubmitting(false);
     }
@@ -373,7 +398,10 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
 
         <div className="flex flex-wrap items-center gap-2.5">
           <button
-            onClick={() => setShowManualBillModal(true)}
+            onClick={() => {
+              setEditingManualBill(null);
+              setShowManualBillModal(true);
+            }}
             className="px-4 py-2 text-xs font-semibold rounded-xl bg-[#A67C52] hover:bg-[#8C653E] text-white flex items-center gap-1.5 shadow-sm transition"
             title="Record handwritten customer bills for day sales"
           >
@@ -538,17 +566,10 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                         </td>
                       <td className="py-3 px-4 text-[#6F6962] whitespace-nowrap">
                         <div>
-                          {new Date(bill.created_at).toLocaleDateString('en-IN', {
-                            day: '2-digit',
-                            month: 'short',
-                            year: 'numeric',
-                          })}
+                          {formatDateIST(bill.bill_date || toISTDateString(bill.created_at))}
                         </div>
                         <div className="text-[10px] text-[#9A938B]">
-                          {new Date(bill.created_at).toLocaleTimeString('en-IN', {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
+                          {formatTimeIST(bill.created_at)} IST
                         </div>
                       </td>
                       <td className="py-3 px-4">
@@ -748,15 +769,25 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                     </div>
                   )}
 
+                  {/* MODIFIED AFTER CLOSING BANNER */}
+                  {billDetail.sale.day_modified_after_close && (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>
+                        <strong>Modified After Closing:</strong> This business day closing was reconciled following an authorized bill adjustment.
+                      </span>
+                    </div>
+                  )}
+
                   {/* Summary Details Grid */}
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-[#FAF8F4] p-3.5 rounded-xl border border-[#E3DED5]">
                     <div>
-                      <span className="text-[10px] text-[#6F6962] font-medium block">Date &amp; Time</span>
-                      <span className="font-semibold text-xs">
-                        {new Date(billDetail.sale.created_at).toLocaleString('en-IN', {
-                          dateStyle: 'short',
-                          timeStyle: 'short',
-                        })}
+                      <span className="text-[10px] text-[#6F6962] font-medium block">Business Date (IST)</span>
+                      <span className="font-semibold text-xs block">
+                        {formatDateIST(billDetail.sale.bill_date || toISTDateString(billDetail.sale.created_at))}
+                      </span>
+                      <span className="text-[10px] text-[#9A938B]">
+                        Created: {formatDateTimeIST(billDetail.sale.created_at)}
                       </span>
                     </div>
                     <div>
@@ -946,6 +977,38 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                       </div>
                     </div>
                   )}
+
+                  {/* Manual Bill Edit History */}
+                  {billDetail.editHistory && billDetail.editHistory.length > 0 && (
+                    <div className="space-y-2">
+                      <h4 className="font-bold text-xs uppercase text-[#6F6962] tracking-wider flex items-center gap-1.5">
+                        <History className="w-3.5 h-3.5 text-[#A67C52]" />
+                        <span>Bill Audit &amp; Edit History ({billDetail.editHistory.length})</span>
+                      </h4>
+                      <div className="space-y-2">
+                        {billDetail.editHistory.map((h: any) => (
+                          <div key={h.id} className="p-3 bg-[#FAF8F4] border border-[#E3DED5] rounded-xl text-[11px] space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-bold text-[#1C1917]">
+                                {h.action.replace(/_/g, ' ')} &bull; {h.user_name}
+                              </span>
+                              <span className="text-[#6F6962]">{formatDateTimeIST(h.created_at)}</span>
+                            </div>
+                            {h.details?.reason && (
+                              <div className="text-[#4A443D]">
+                                <strong>Reason:</strong> {h.details.reason}
+                              </div>
+                            )}
+                            {h.details?.override_authorized_by && (
+                              <div className="text-amber-800 font-semibold">
+                                Owner Override: {h.details.override_authorized_by}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </>
               ) : null}
             </div>
@@ -953,8 +1016,8 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
             {/* Modal Actions Footer */}
             {billDetail?.sale && (
               <div className="p-4 bg-[#FAF8F4] border-t border-[#E3DED5] flex flex-wrap items-center justify-between gap-3">
-                {/* Action 1: [Reprint Receipt] */}
-                <div className="flex items-center gap-2">
+                {/* Action 1: [Reprint Receipt] & [Edit Manual Bill] */}
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="button"
                     onClick={() => {
@@ -966,6 +1029,27 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                     <Printer className="w-4 h-4 text-[#A67C52]" />
                     <span>Reprint Receipt</span>
                   </button>
+
+                  {billDetail.sale.channel === 'MANUAL' && billDetail.sale.status !== 'CANCELLED' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingManualBill({
+                          sale: billDetail.sale,
+                          items: billDetail.items || [],
+                        });
+                        setShowManualBillModal(true);
+                      }}
+                      className="px-4 py-2.5 rounded-xl bg-[#A67C52] hover:bg-[#8C653E] text-white text-xs font-bold flex items-center gap-1.5 shadow-2xs transition"
+                    >
+                      {billDetail.sale.requires_owner_password ? (
+                        <Lock className="w-3.5 h-3.5" />
+                      ) : (
+                        <Pencil className="w-3.5 h-3.5" />
+                      )}
+                      <span>Edit Manual Bill</span>
+                    </button>
+                  )}
                 </div>
 
                 {/* Contextual Actions 2 & 3: [Return Item(s)] and [Cancel Entire Bill] */}
@@ -1131,7 +1215,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
               </button>
               <button
                 type="button"
-                onClick={handleConfirmCancel}
+                onClick={() => handleConfirmCancel()}
                 disabled={cancelSubmitting}
                 className="px-4 py-2 bg-[#A34F4F] hover:bg-[#863D3D] text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-50"
               >
@@ -1490,14 +1574,41 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         />
       )}
 
-      {/* Manual Bill Entry Modal */}
+      {/* Manual Bill Entry / Edit Modal */}
       <ManualBillModal
         isOpen={showManualBillModal}
-        onClose={() => setShowManualBillModal(false)}
-        onBillSaved={(saved) => {
-          showNotice('success', `Manual bill #${saved.bill_number} recorded successfully!`);
+        editBill={editingManualBill}
+        onClose={() => {
+          setShowManualBillModal(false);
+          setEditingManualBill(null);
+        }}
+        onBillSaved={(saved, mode) => {
+          showNotice(
+            'success',
+            mode === 'edit'
+              ? `Manual bill #${saved.bill_number} updated successfully!`
+              : `Manual bill #${saved.bill_number} recorded successfully!`
+          );
+          if (selectedBillId === saved.id) {
+            handleOpenDetail(saved.id);
+          }
           fetchBills();
         }}
+      />
+
+      {/* Closed-Day Cancel Owner Override Prompt */}
+      <OwnerOverridePrompt
+        isOpen={showCancelOwnerPrompt}
+        title={`Authorize Closed-Day Void: Bill #${billDetail?.sale?.bill_number || ''}`}
+        description={cancelOwnerDesc}
+        requireReason={false}
+        errorMessage={cancelOwnerErr}
+        submitting={cancelSubmitting}
+        onCancel={() => {
+          setShowCancelOwnerPrompt(false);
+          setCancelOwnerErr(null);
+        }}
+        onConfirm={(pwd) => handleConfirmCancel(pwd)}
       />
     </div>
   );

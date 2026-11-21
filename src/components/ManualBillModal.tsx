@@ -16,9 +16,12 @@ import {
   ArrowRight,
   ShieldCheck,
   Cloud,
+  Lock,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { saveManualBillToFirestore } from '../services/firebase.ts';
+import { getTodayIST, toISTDateString, getISTCalendarDayDiff, isValidDateStr } from '../utils/date.ts';
+import { OwnerOverridePrompt } from './OwnerOverridePrompt.tsx';
 
 export interface ManualBillItem {
   id: string;
@@ -42,7 +45,18 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
   editBill = null,
 }) => {
   const isEditMode = Boolean(editBill?.sale?.id);
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayIST();
+  const originalBillDate = isEditMode && editBill?.sale
+    ? (editBill.sale.bill_date || toISTDateString(editBill.sale.created_at) || todayStr)
+    : todayStr;
+  const daysSinceCreated = isEditMode && editBill?.sale?.created_at
+    ? getISTCalendarDayDiff(editBill.sale.created_at)
+    : 0;
+  const isOutsideNormalWindow = isEditMode && daysSinceCreated > 2;
+  const isOriginalDayClosed = isEditMode && (
+    Number(editBill?.sale?.day_closed) === 1 || editBill?.sale?.closing_status === 'CLOSED'
+  );
+  const needsOwnerOverride = isOutsideNormalWindow || isOriginalDayClosed;
 
   // Bill Details
   const [billDate, setBillDate] = useState<string>(todayStr);
@@ -72,16 +86,24 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
   const [firestoreStatus, setFirestoreStatus] = useState<string | null>(null);
   const [confirmingEdit, setConfirmingEdit] = useState<boolean>(false);
 
+  // Owner Override Prompt State
+  const [showOwnerPrompt, setShowOwnerPrompt] = useState<boolean>(false);
+  const [ownerPromptDesc, setOwnerPromptDesc] = useState<string>('');
+  const [ownerPromptError, setOwnerPromptError] = useState<string | null>(null);
+
   // Reset or prefill form when modal opens
   useEffect(() => {
     if (!isOpen) {
       setConfirmingEdit(false);
+      setShowOwnerPrompt(false);
+      setOwnerPromptError(null);
       return;
     }
 
+    const currentToday = getTodayIST();
     if (editBill?.sale) {
       const s = editBill.sale;
-      const existingDate = String(s.created_at || s.bill_date || todayStr).slice(0, 10);
+      const existingDate = s.bill_date || toISTDateString(s.created_at) || currentToday;
       setBillDate(existingDate);
       setBillNumber(s.bill_number || '');
       setBillNumberWarning(null);
@@ -125,8 +147,10 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
       setFormError(null);
       setFirestoreStatus(null);
       setConfirmingEdit(false);
+      setShowOwnerPrompt(false);
+      setOwnerPromptError(null);
     } else {
-      setBillDate(new Date().toISOString().split('T')[0]);
+      setBillDate(currentToday);
       setBillNumber('');
       setBillNumberWarning(null);
       setItems([{ id: Date.now().toString(), itemName: '', quantity: 1, rate: 0 }]);
@@ -140,6 +164,8 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
       setFormError(null);
       setFirestoreStatus(null);
       setConfirmingEdit(false);
+      setShowOwnerPrompt(false);
+      setOwnerPromptError(null);
     }
   }, [isOpen, editBill]);
 
@@ -225,8 +251,13 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
       return false;
     }
 
-    if (isEditMode && billDate !== todayStr) {
-      setFormError(`Same-day restriction: Bill date must remain today (${todayStr}) when editing.`);
+    if (!isValidDateStr(billDate)) {
+      setFormError('Please select a valid business bill date (YYYY-MM-DD).');
+      return false;
+    }
+
+    if (billDate > todayStr) {
+      setFormError(`Bill date cannot be in the future beyond today (${todayStr} IST).`);
       return false;
     }
 
@@ -284,7 +315,7 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
     return true;
   };
 
-  // Submit Handler (Create directly; Edit opens confirmation step first)
+  // Submit Handler (Create directly unless closed day prompts; Edit opens confirmation step first)
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validateForm()) return;
@@ -294,17 +325,36 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
       return;
     }
 
+    if (isEditMode && needsOwnerOverride && !showOwnerPrompt) {
+      const reasons: string[] = [];
+      if (isOutsideNormalWindow) {
+        reasons.push(`bill is ${daysSinceCreated + 1} IST days old (past the 3-day editing window)`);
+      }
+      if (isOriginalDayClosed) {
+        reasons.push(`business day ${originalBillDate} is already CLOSED`);
+      }
+      setOwnerPromptDesc(
+        `Owner password verification is required because ${reasons.join(' and ')}. Authorizes editing Bill #${billNumber.trim()} only.`
+      );
+      setOwnerPromptError(null);
+      setShowOwnerPrompt(true);
+      return;
+    }
+
     await performSave();
   };
 
-  const performSave = async () => {
+  const performSave = async (ownerPassword?: string, overrideReason?: string) => {
     const cashVal = Number(cashAmount) || 0;
     const upiVal = Number(upiAmount) || 0;
+    const resolvedReason = (overrideReason !== undefined ? overrideReason : editReason).trim();
+
     setSubmitting(true);
     setFormError(null);
+    setOwnerPromptError(null);
 
     try {
-      const payload = {
+      const payload: any = {
         bill_number: billNumber.trim(),
         bill_date: billDate,
         items: items.map((it) => ({
@@ -320,18 +370,20 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
         customer_name: customerName.trim() || undefined,
         customer_phone: customerPhone.trim() || undefined,
         notes: notes.trim() || undefined,
-        ...(isEditMode && editReason.trim() ? { edit_reason: editReason.trim() } : {}),
+        ...(isEditMode && resolvedReason ? { edit_reason: resolvedReason } : {}),
+        ...(ownerPassword ? { owner_password: ownerPassword } : {}),
       };
 
       if (isEditMode && editBill?.sale?.id) {
         const res = await api.updateManualBill(editBill.sale.id, payload);
         setConfirmingEdit(false);
+        setShowOwnerPrompt(false);
         onBillSaved(res.sale, 'edit');
         onClose();
         return;
       }
 
-      // Step A: Save to local ERP database
+      // Step A: Save to local/D1 ERP database
       const res = await api.createManualBill(payload);
 
       // Step B: Save to Firebase Firestore database in collection `manual_bills` (best-effort)
@@ -365,12 +417,23 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
         console.warn('Firestore write warning:', fErr);
       }
 
+      setShowOwnerPrompt(false);
       onBillSaved(res.sale, 'create');
       onClose();
     } catch (err: any) {
       console.error('Error saving manual bill:', err);
-      setConfirmingEdit(false);
-      setFormError(err.message || 'Failed to save manual bill');
+      if (err?.requires_owner_password) {
+        if (overrideReason) setEditReason(overrideReason);
+        setOwnerPromptDesc(
+          err.message ||
+            'Owner password verification is required because this bill affects a closed business day or is older than 3 IST calendar days.'
+        );
+        setOwnerPromptError(ownerPassword ? err.message : null);
+        setShowOwnerPrompt(true);
+      } else {
+        setConfirmingEdit(false);
+        setFormError(err.message || 'Failed to save manual bill');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -386,17 +449,33 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
               <FileText className="w-4 h-4" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="text-base font-bold text-[#1C1917] tracking-tight">
                   {isEditMode ? `Edit Manual Bill #${billNumber}` : 'Manual Bill Entry'}
                 </h2>
-                <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 font-semibold">
-                  {isEditMode ? 'Same-Day Direct Edit' : 'Handwritten Bill Record'}
+                <span
+                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${
+                    !isEditMode
+                      ? 'bg-amber-50 text-amber-800 border-amber-200'
+                      : needsOwnerOverride
+                      ? 'bg-rose-50 text-rose-800 border-rose-200'
+                      : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                  }`}
+                >
+                  {!isEditMode
+                    ? 'Handwritten Bill Record'
+                    : needsOwnerOverride
+                    ? isOriginalDayClosed
+                      ? 'Closed Day • Owner Auth'
+                      : `Day ${daysSinceCreated + 1} • Owner Auth`
+                    : `3-Day Edit Window (Day ${Math.min(3, daysSinceCreated + 1)}/3)`}
                 </span>
               </div>
               <p className="text-xs text-[#6F6962] mt-0.5">
                 {isEditMode
-                  ? 'Update today’s handwritten bill items, totals, or payment method without creating a duplicate bill'
+                  ? needsOwnerOverride
+                    ? 'Direct edit past 3 IST calendar days or on a closed business day requires Owner password verification.'
+                    : 'Update items, bill date, payment mode, or customer details without creating a duplicate bill.'
                   : 'Record customer handwritten bills for day sales without deducting POS inventory stock'}
               </p>
             </div>
@@ -420,6 +499,23 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
             </div>
           )}
 
+          {/* Owner Override Notice Banner in Edit Mode */}
+          {isEditMode && needsOwnerOverride && (
+            <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2.5">
+              <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <span className="font-bold block">Owner Password Override Applies</span>
+                <p className="text-[11px] leading-relaxed text-amber-800">
+                  {isOutsideNormalWindow &&
+                    `Created ${daysSinceCreated} IST day(s) ago (normal 3-day window expired). `}
+                  {isOriginalDayClosed &&
+                    `Original business day (${originalBillDate}) is CLOSED. `}
+                  Changing the bill date does not reset the creation window. You will be prompted for the Store Owner password and mandatory audit reason when saving.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Section 1: Bill Details */}
           <div className="space-y-3">
             <h3 className="text-xs font-bold text-[#1C1917] uppercase tracking-wider">
@@ -428,14 +524,13 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-semibold text-[#1C1917] mb-1">
-                  Bill Date <span className="text-red-500">*</span>
+                  Bill Date (IST Business Date) <span className="text-red-500">*</span>
                 </label>
                 <div className="relative">
                   <Calendar className="w-4 h-4 text-[#A67C52] absolute left-3 top-1/2 -translate-y-1/2" />
                   <input
                     type="date"
                     value={billDate}
-                    min={isEditMode ? todayStr : undefined}
                     max={todayStr}
                     onChange={(e) => setBillDate(e.target.value)}
                     required
@@ -444,8 +539,10 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                 </div>
                 <span className="text-[11px] text-[#6F6962] mt-1 block">
                   {isEditMode
-                    ? `Same-day edit applies only to today's date (${todayStr})`
-                    : 'Select the actual date written on the physical handwritten bill'}
+                    ? billDate !== originalBillDate
+                      ? `Moving bill date ${originalBillDate} → ${billDate}. Daily sales & closings for both dates will reconcile automatically.`
+                      : 'Can be moved to today or a past business date (original creation timestamp stays fixed).'
+                    : 'Select the actual IST business date written on the physical handwritten bill'}
                 </span>
               </div>
 
@@ -831,13 +928,13 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
             {isEditMode && (
               <div>
                 <label className="block text-xs font-semibold text-[#1C1917] mb-1">
-                  Reason for Editing (Optional — saved to Edit History)
+                  Reason for Editing {needsOwnerOverride ? <span className="text-red-500">*</span> : '(Optional — saved to Edit History)'}
                 </label>
                 <input
                   type="text"
                   value={editReason}
                   onChange={(e) => setEditReason(e.target.value)}
-                  placeholder="e.g. Corrected quantity, rate, or payment mode"
+                  placeholder="e.g. Corrected quantity, rate, date, or payment mode"
                   className="w-full px-3 py-2 bg-[#FAF8F4] border border-[#D4CDC2] rounded-xl text-xs text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
                 />
               </div>
@@ -851,7 +948,13 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                 <AlertCircle className="w-4 h-4 text-[#A67C52]" />
                 <span>Confirm Bill Changes for #{billNumber}</span>
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs bg-white border border-[#E3DED5] rounded-lg p-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs bg-white border border-[#E3DED5] rounded-lg p-3">
+                <div>
+                  <span className="text-[10px] text-[#9A938B] block uppercase font-semibold">Bill Date</span>
+                  <span className="font-mono font-semibold text-[#1C1917]">
+                    {originalBillDate === billDate ? billDate : `${originalBillDate} → ${billDate}`}
+                  </span>
+                </div>
                 <div>
                   <span className="text-[10px] text-[#9A938B] block uppercase font-semibold">Previous Total</span>
                   <span className="font-mono font-semibold text-[#6F6962] line-through">
@@ -864,7 +967,7 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                     ₹{calculatedTotal.toLocaleString('en-IN')}
                   </span>
                 </div>
-                <div className="col-span-2 sm:col-span-1">
+                <div>
                   <span className="text-[10px] text-[#9A938B] block uppercase font-semibold">Payment Method</span>
                   <span className="font-semibold text-[#1C1917]">
                     {editBill?.sale?.payment_method} → {paymentMethod}
@@ -872,7 +975,7 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                 </div>
               </div>
               <p className="text-[11px] text-[#6F6962]">
-                Saving will update this existing bill, recalculate Cash/UPI/Customer Dues totals atomically, and append an entry to Edit History.
+                Saving will update this existing bill atomically, reconcile Cash/UPI/Customer Dues/Day Closings for affected dates, and append an entry to Edit History.
               </p>
             </div>
           )}
@@ -902,12 +1005,12 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={performSave}
+                  onClick={handleSubmit}
                   disabled={submitting}
                   className="flex-1 sm:flex-none px-5 py-2.5 bg-[#3F6B50] hover:bg-[#31553E] disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition cursor-pointer"
                 >
                   <CheckCircle className="w-4 h-4" />
-                  <span>{submitting ? 'Saving Changes...' : 'Confirm & Save Changes'}</span>
+                  <span>{submitting ? 'Saving Changes...' : needsOwnerOverride ? 'Verify Owner & Save' : 'Confirm & Save Changes'}</span>
                 </button>
               </>
             ) : (
@@ -940,6 +1043,22 @@ export const ManualBillModal: React.FC<ManualBillModalProps> = ({
           </div>
         </div>
       </div>
+
+      <OwnerOverridePrompt
+        isOpen={showOwnerPrompt}
+        title={isEditMode ? `Authorize Edit: Bill #${billNumber}` : `Authorize Closed-Day Entry (${billDate})`}
+        description={ownerPromptDesc}
+        requireReason={isEditMode}
+        reasonLabel="Mandatory Edit Audit Reason *"
+        initialReason={editReason}
+        errorMessage={ownerPromptError}
+        submitting={submitting}
+        onCancel={() => {
+          setShowOwnerPrompt(false);
+          setOwnerPromptError(null);
+        }}
+        onConfirm={(pwd, reason) => performSave(pwd, reason)}
+      />
     </div>
   );
 };

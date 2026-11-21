@@ -102,6 +102,10 @@ export const SCHEMA_TABLES_SQL: string[] = [
     notes TEXT,
     created_by TEXT,
     created_at TEXT NOT NULL,
+    is_reversed INTEGER NOT NULL DEFAULT 0,
+    reversed_reason TEXT,
+    reversed_at TEXT,
+    reversed_by TEXT,
     FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
   );`,
   `CREATE TABLE IF NOT EXISTS purchase_items (
@@ -185,6 +189,7 @@ export const SCHEMA_TABLES_SQL: string[] = [
     cancelled_by TEXT,
     cancelled_by_name TEXT,
     cancelled_reason TEXT,
+    bill_date TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (customer_id) REFERENCES customers(id)
   );`,
@@ -232,6 +237,10 @@ export const SCHEMA_TABLES_SQL: string[] = [
     received_by TEXT,
     financial_tx_id TEXT,
     created_at TEXT NOT NULL,
+    is_reversed INTEGER NOT NULL DEFAULT 0,
+    reversed_reason TEXT,
+    reversed_at TEXT,
+    reversed_by TEXT,
     FOREIGN KEY (customer_due_id) REFERENCES customer_dues(id),
     FOREIGN KEY (customer_id) REFERENCES customers(id)
   );`,
@@ -331,6 +340,10 @@ export const SCHEMA_TABLES_SQL: string[] = [
     paid_by TEXT,
     financial_tx_id TEXT,
     created_at TEXT NOT NULL,
+    is_reversed INTEGER NOT NULL DEFAULT 0,
+    reversed_reason TEXT,
+    reversed_at TEXT,
+    reversed_by TEXT,
     FOREIGN KEY (staff_id) REFERENCES staff(id)
   );`,
   `CREATE TABLE IF NOT EXISTS daily_closings (
@@ -350,7 +363,15 @@ export const SCHEMA_TABLES_SQL: string[] = [
     closing_notes TEXT,
     status TEXT NOT NULL CHECK(status IN ('OPEN', 'CLOSED')),
     closed_by_user_id TEXT,
-    closed_at TEXT
+    closed_at TEXT,
+    actual_upi_counted REAL,
+    cash_left_in_drawer REAL,
+    cash_taken_home REAL,
+    discrepancy_reason TEXT,
+    modified_after_close INTEGER NOT NULL DEFAULT 0,
+    last_modified_at TEXT,
+    last_modified_by TEXT,
+    last_modification_summary TEXT
   );`,
   `CREATE TABLE IF NOT EXISTS loans (
     id TEXT PRIMARY KEY,
@@ -529,6 +550,29 @@ export const SCHEMA_MIGRATIONS_SQL: string[] = [
   'ALTER TABLE sales ADD COLUMN cancelled_by_name TEXT;',
   'ALTER TABLE sales ADD COLUMN cancelled_reason TEXT;',
   'ALTER TABLE sales ADD COLUMN card_paid REAL DEFAULT 0;',
+  'ALTER TABLE sales ADD COLUMN bill_date TEXT;',
+  "UPDATE sales SET bill_date = DATE(created_at, '+330 minutes') WHERE bill_date IS NULL;",
+  'CREATE INDEX IF NOT EXISTS idx_sales_bill_date ON sales(bill_date);',
+  'ALTER TABLE daily_closings ADD COLUMN actual_upi_counted REAL;',
+  'ALTER TABLE daily_closings ADD COLUMN cash_left_in_drawer REAL;',
+  'ALTER TABLE daily_closings ADD COLUMN cash_taken_home REAL;',
+  'ALTER TABLE daily_closings ADD COLUMN discrepancy_reason TEXT;',
+  'ALTER TABLE daily_closings ADD COLUMN modified_after_close INTEGER NOT NULL DEFAULT 0;',
+  'ALTER TABLE daily_closings ADD COLUMN last_modified_at TEXT;',
+  'ALTER TABLE daily_closings ADD COLUMN last_modified_by TEXT;',
+  'ALTER TABLE daily_closings ADD COLUMN last_modification_summary TEXT;',
+  'ALTER TABLE customer_due_payments ADD COLUMN is_reversed INTEGER NOT NULL DEFAULT 0;',
+  'ALTER TABLE customer_due_payments ADD COLUMN reversed_reason TEXT;',
+  'ALTER TABLE customer_due_payments ADD COLUMN reversed_at TEXT;',
+  'ALTER TABLE customer_due_payments ADD COLUMN reversed_by TEXT;',
+  'ALTER TABLE salary_payments ADD COLUMN is_reversed INTEGER NOT NULL DEFAULT 0;',
+  'ALTER TABLE salary_payments ADD COLUMN reversed_reason TEXT;',
+  'ALTER TABLE salary_payments ADD COLUMN reversed_at TEXT;',
+  'ALTER TABLE salary_payments ADD COLUMN reversed_by TEXT;',
+  'ALTER TABLE purchases ADD COLUMN is_reversed INTEGER NOT NULL DEFAULT 0;',
+  'ALTER TABLE purchases ADD COLUMN reversed_reason TEXT;',
+  'ALTER TABLE purchases ADD COLUMN reversed_at TEXT;',
+  'ALTER TABLE purchases ADD COLUMN reversed_by TEXT;',
 ];
 
 export const CORE_ERP_TABLES: string[] = [

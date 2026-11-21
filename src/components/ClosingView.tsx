@@ -11,16 +11,19 @@ import {
   ArrowRight,
   ShieldCheck,
   History,
+  RefreshCw,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { DailyClosing, UserRole } from '../types.ts';
+import { getTodayIST, formatDateTimeIST } from '../utils/date.ts';
+import { OwnerOverridePrompt } from './OwnerOverridePrompt.tsx';
 
 interface ClosingViewProps {
   role: UserRole;
 }
 
 export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
+  const [selectedDate, setSelectedDate] = useState(getTodayIST());
   const [summary, setSummary] = useState<any>(null);
   const [history, setHistory] = useState<DailyClosing[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,12 +37,20 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
   const [closingNotes, setClosingNotes] = useState('');
 
   const [closingError, setClosingError] = useState<string | null>(null);
+  const [closingSuccess, setClosingSuccess] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // Closed-Day Owner Override / Reconcile State
+  const [unlockClosedEdit, setUnlockClosedEdit] = useState(false);
+  const [showOverridePrompt, setShowOverridePrompt] = useState(false);
+  const [overrideAction, setOverrideAction] = useState<'update' | 'reconcile'>('reconcile');
+  const [overrideError, setOverrideError] = useState<string | null>(null);
 
   const isOwner = role === 'OWNER';
 
   const loadData = async () => {
     setLoading(true);
+    setUnlockClosedEdit(false);
     try {
       const [sumRes, histRes] = await Promise.all([
         api.getDayClosingSummary(selectedDate),
@@ -49,14 +60,23 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
       setHistory(histRes.closings || []);
 
       if (sumRes.closingRecord) {
-        setActualCash(sumRes.closingRecord.actual_cash_counted);
-        setActualUpi(sumRes.closingRecord.actual_upi_counted);
-        setCashLeftInDrawer(sumRes.closingRecord.cash_left_in_drawer);
-        setCashTakenHome(sumRes.closingRecord.cash_taken_home);
+        const countedCash = Number(sumRes.closingRecord.actual_counted_cash ?? sumRes.systemExpectedCash ?? 0);
+        const drawerFloat = Number(sumRes.closingRecord.cash_left_in_drawer ?? 0);
+        setActualCash(countedCash);
+        setActualUpi(
+          sumRes.closingRecord.actual_upi_counted !== null && sumRes.closingRecord.actual_upi_counted !== undefined
+            ? Number(sumRes.closingRecord.actual_upi_counted)
+            : sumRes.systemExpectedUpi
+        );
+        setCashLeftInDrawer(drawerFloat);
+        setCashTakenHome(
+          sumRes.closingRecord.cash_taken_home !== null && sumRes.closingRecord.cash_taken_home !== undefined
+            ? Number(sumRes.closingRecord.cash_taken_home)
+            : Math.max(0, countedCash - drawerFloat)
+        );
         setDiscrepancyReason(sumRes.closingRecord.discrepancy_reason || '');
         setClosingNotes(sumRes.closingRecord.closing_notes || '');
       } else {
-        // Pre-fill actual cash and upi with expected for convenience
         setActualCash(sumRes.systemExpectedCash);
         setActualUpi(sumRes.systemExpectedUpi);
         setCashLeftInDrawer(0);
@@ -66,6 +86,7 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
       }
     } catch (err: any) {
       console.error('Error loading closing data:', err);
+      setClosingError(err.message || 'Failed to load day closing summary');
     } finally {
       setLoading(false);
     }
@@ -90,12 +111,21 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
       return;
     }
 
+    if (summary.isClosed) {
+      setOverrideAction('update');
+      setOverrideError(null);
+      setShowOverridePrompt(true);
+      return;
+    }
+
     setSubmitting(true);
     setClosingError(null);
+    setClosingSuccess(null);
 
     try {
       await api.closeDay({
         date: selectedDate,
+        opening_cash: summary.openingCash,
         actual_cash_counted: actualCashNum,
         actual_upi_counted: actualUpiNum,
         cash_left_in_drawer: Number(cashLeftInDrawer) || 0,
@@ -104,16 +134,58 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
         closing_notes: closingNotes.trim() || null,
       });
 
-      alert(`Business Day ${selectedDate} closed successfully!`);
+      setClosingSuccess(`Business Day ${selectedDate} closed and locked successfully.`);
       loadData();
     } catch (err: any) {
-      setClosingError(err.message || 'Failed to close day');
+      if (err?.requires_owner_password) {
+        setOverrideAction('update');
+        setOverrideError(null);
+        setShowOverridePrompt(true);
+      } else {
+        setClosingError(err.message || 'Failed to close day');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleOwnerOverrideConfirm = async (ownerPassword: string, reason: string) => {
+    if (!summary) return;
+    setSubmitting(true);
+    setOverrideError(null);
+    setClosingError(null);
+    setClosingSuccess(null);
+
+    try {
+      const actualCashNum = Number(actualCash) || 0;
+      const actualUpiNum = Number(actualUpi) || 0;
+      await api.reconcileClosedDay(selectedDate, {
+        owner_password: ownerPassword,
+        reason,
+        ...(overrideAction === 'update'
+          ? {
+              actual_counted_cash: actualCashNum,
+              actual_upi_counted: actualUpiNum,
+              cash_left_in_drawer: Number(cashLeftInDrawer) || 0,
+              cash_taken_home: Number(cashTakenHome) || 0,
+              discrepancy_reason: discrepancyReason.trim() || null,
+              closing_notes: closingNotes.trim() || null,
+            }
+          : {}),
+      });
+      setShowOverridePrompt(false);
+      setUnlockClosedEdit(false);
+      setClosingSuccess(`Closed business day ${selectedDate} reconciled and updated.`);
+      loadData();
+    } catch (err: any) {
+      setOverrideError(err.message || 'Failed to reconcile closed day');
     } finally {
       setSubmitting(false);
     }
   };
 
   const isClosed = summary?.isClosed;
+  const formLocked = Boolean(isClosed && !unlockClosedEdit);
   const discrepancy =
     summary && actualCash !== '' ? Number(actualCash) - summary.systemExpectedCash : 0;
 
@@ -146,9 +218,16 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Left 2 Cols: Calculation & Form */}
           <div className="lg:col-span-2 space-y-5">
+            {closingSuccess && (
+              <div className="p-3.5 bg-[#EBF7EE] border border-[#BDE5C8] rounded-xl text-xs text-[#1E6B37] font-semibold flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{closingSuccess}</span>
+              </div>
+            )}
+
             {/* Status Banner */}
             <div
-              className={`p-4 rounded-2xl border flex items-center justify-between ${
+              className={`p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
                 isClosed
                   ? 'bg-[#F4F9F5] border-[#CCE3D2] text-[#3F6B50]'
                   : 'bg-[#FAF8F4] border-[#D4CDC2] text-[#1C1917]'
@@ -161,17 +240,66 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                   <Lock className="w-6 h-6 text-[#A67C52] shrink-0" />
                 )}
                 <div>
-                  <div className="font-bold text-sm">
-                    {isClosed ? `Day Book Closed for ${selectedDate}` : `Day Book Open for ${selectedDate}`}
+                  <div className="font-bold text-sm flex items-center gap-2 flex-wrap">
+                    <span>
+                      {isClosed ? `Day Book Closed for ${selectedDate}` : `Day Book Open for ${selectedDate}`}
+                    </span>
+                    {Number(summary.closingRecord?.modified_after_close) === 1 && (
+                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300 font-bold">
+                        Modified After Closing
+                      </span>
+                    )}
                   </div>
                   <div className="text-xs opacity-80 mt-0.5">
                     {isClosed
-                      ? 'Reconciliation finalized. Manual transactions for this date are locked.'
+                      ? 'Reconciliation finalized. Owner password is required to modify or reconcile entries on this closed date.'
                       : 'Review numbers, count physical cash drawer, and submit closing reconciliation.'}
                   </div>
                 </div>
               </div>
+
+              {isClosed && isOwner && (
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOverrideAction('reconcile');
+                      setOverrideError(null);
+                      setShowOverridePrompt(true);
+                    }}
+                    className="px-3 py-1.5 bg-white hover:bg-[#FAF8F4] border border-[#CCE3D2] text-[#1C1917] rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-[#A67C52]" />
+                    <span>Reconcile System Totals</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setUnlockClosedEdit((prev) => !prev)}
+                    className="px-3 py-1.5 bg-[#171513] hover:bg-[#25211D] text-white rounded-xl text-xs font-semibold transition"
+                  >
+                    {unlockClosedEdit ? 'Lock Form' : 'Owner Update'}
+                  </button>
+                </div>
+              )}
             </div>
+
+            {Number(summary.closingRecord?.modified_after_close) === 1 && (
+              <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-xs text-amber-900 space-y-1">
+                <div className="font-bold flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-600" />
+                  <span>Post-Close Modification Recorded</span>
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  {summary.closingRecord?.last_modification_summary || 'A transaction on this closed day was modified with Owner authorization.'}
+                </p>
+                {summary.closingRecord?.last_modified_at && (
+                  <p className="text-[10px] text-amber-800 font-medium">
+                    Last updated by {summary.closingRecord?.last_modified_by || 'Owner'} on{' '}
+                    {formatDateTimeIST(summary.closingRecord.last_modified_at)}
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* System Breakdown Card */}
             <div className="bg-white border border-[#E3DED5] rounded-2xl p-6 space-y-5 shadow-[0_2px_12px_rgba(23,21,19,0.03)]">
@@ -259,10 +387,10 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                       type="number"
                       required
                       min="0"
-                      disabled={isClosed}
+                      disabled={formLocked}
                       value={actualCash}
                       onChange={(e) => setActualCash(e.target.value === '' ? '' : Number(e.target.value))}
-                      className="w-full px-3 py-2.5 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-bold text-base focus:outline-none focus:border-[#A67C52]"
+                      className="w-full px-3 py-2.5 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-bold text-base focus:outline-none focus:border-[#A67C52] disabled:bg-[#FAF8F4]"
                     />
                     <div className="mt-1 flex items-center justify-between text-[11px]">
                       <span className="text-[#6F6962]">System Expected: ₹{summary.systemExpectedCash}</span>
@@ -291,10 +419,10 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                     <input
                       type="number"
                       min="0"
-                      disabled={isClosed}
+                      disabled={formLocked}
                       value={actualUpi}
                       onChange={(e) => setActualUpi(e.target.value === '' ? '' : Number(e.target.value))}
-                      className="w-full px-3 py-2.5 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-bold text-base focus:outline-none focus:border-[#A67C52]"
+                      className="w-full px-3 py-2.5 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-bold text-base focus:outline-none focus:border-[#A67C52] disabled:bg-[#FAF8F4]"
                     />
                     <div className="mt-1 text-[11px] text-[#6F6962]">
                       System Recorded UPI: ₹{summary.systemExpectedUpi}
@@ -310,11 +438,11 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                     <input
                       type="text"
                       required
-                      disabled={isClosed}
+                      disabled={formLocked}
                       value={discrepancyReason}
                       onChange={(e) => setDiscrepancyReason(e.target.value)}
                       placeholder="Reason for physical cash difference"
-                      className="w-full px-3 py-2 bg-white border border-[#F0CCCC] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A34F4F]"
+                      className="w-full px-3 py-2 bg-white border border-[#F0CCCC] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A34F4F] disabled:bg-[#FAF8F4]"
                     />
                   </div>
                 )}
@@ -327,11 +455,11 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                     <input
                       type="number"
                       min="0"
-                      disabled={isClosed}
+                      disabled={formLocked}
                       value={cashLeftInDrawer}
                       onChange={(e) => setCashLeftInDrawer(e.target.value === '' ? '' : Number(e.target.value))}
                       placeholder="Opening float for next morning"
-                      className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold focus:outline-none focus:border-[#A67C52]"
+                      className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold focus:outline-none focus:border-[#A67C52] disabled:bg-[#FAF8F4]"
                     />
                   </div>
 
@@ -342,11 +470,11 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                     <input
                       type="number"
                       min="0"
-                      disabled={isClosed}
+                      disabled={formLocked}
                       value={cashTakenHome}
                       onChange={(e) => setCashTakenHome(e.target.value === '' ? '' : Number(e.target.value))}
                       placeholder="Taken for safe keeping"
-                      className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold focus:outline-none focus:border-[#A67C52]"
+                      className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] font-semibold focus:outline-none focus:border-[#A67C52] disabled:bg-[#FAF8F4]"
                     />
                   </div>
                 </div>
@@ -357,15 +485,15 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                   </label>
                   <textarea
                     rows={2}
-                    disabled={isClosed}
+                    disabled={formLocked}
                     value={closingNotes}
                     onChange={(e) => setClosingNotes(e.target.value)}
                     placeholder="Any comments regarding customer walk-ins, festival footfall, or shop handover..."
-                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] placeholder:text-[#9A938B] focus:outline-none focus:border-[#A67C52]"
+                    className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] placeholder:text-[#9A938B] focus:outline-none focus:border-[#A67C52] disabled:bg-[#FAF8F4]"
                   />
                 </div>
 
-                {!isClosed && (
+                {(!isClosed || unlockClosedEdit) && (
                   <div className="pt-2">
                     <button
                       type="submit"
@@ -373,7 +501,13 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                       className="w-full py-3 bg-[#171513] hover:bg-[#25211D] text-[#F5F2EC] font-bold rounded-xl text-sm transition shadow-sm flex items-center justify-center gap-2 disabled:opacity-50"
                     >
                       <Lock className="w-4 h-4 text-[#A67C52]" />
-                      <span>{submitting ? 'Closing Day Book...' : 'Submit Daily Closing & Lock Day'}</span>
+                      <span>
+                        {submitting
+                          ? 'Saving...'
+                          : isClosed
+                          ? 'Verify Owner Password & Save Closed-Day Update'
+                          : 'Submit Daily Closing & Lock Day'}
+                      </span>
                     </button>
                   </div>
                 )}
@@ -395,40 +529,67 @@ export const ClosingView: React.FC<ClosingViewProps> = ({ role }) => {
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {history.map((h) => (
-                    <div
-                      key={h.id}
-                      onClick={() => setSelectedDate(h.date)}
-                      className={`p-3.5 rounded-xl border cursor-pointer transition text-xs ${
-                        h.date === selectedDate
-                          ? 'bg-[#FAF8F4] border-[#171513] shadow-xs'
-                          : 'bg-white border-[#E3DED5] hover:border-[#D4CDC2]'
-                      }`}
-                    >
-                      <div className="flex justify-between items-center font-bold text-[#1C1917] mb-1">
-                        <span>{h.date}</span>
-                        <span
-                          className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
-                            h.cash_discrepancy === 0
-                              ? 'text-[#3F6B50] bg-[#F4F9F5] border border-[#CCE3D2]'
-                              : 'text-[#A34F4F] bg-[#FDF5F5] border border-[#F0CCCC]'
-                          }`}
-                        >
-                          {h.cash_discrepancy === 0 ? 'Balanced' : `Diff ₹${h.cash_discrepancy}`}
-                        </span>
+                  {history.map((h) => {
+                    const totalSales = Number(h.cash_sales || 0) + Number(h.upi_sales || 0);
+                    const diffCash = Number(h.difference_cash || 0);
+                    const countedCash = Number(h.actual_counted_cash || 0);
+                    return (
+                      <div
+                        key={h.id}
+                        onClick={() => setSelectedDate(h.closing_date)}
+                        className={`p-3.5 rounded-xl border cursor-pointer transition text-xs ${
+                          h.closing_date === selectedDate
+                            ? 'bg-[#FAF8F4] border-[#171513] shadow-xs'
+                            : 'bg-white border-[#E3DED5] hover:border-[#D4CDC2]'
+                        }`}
+                      >
+                        <div className="flex justify-between items-center font-bold text-[#1C1917] mb-1 gap-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <span>{h.closing_date}</span>
+                            {Number(h.modified_after_close) === 1 && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 font-bold">
+                                Modified
+                              </span>
+                            )}
+                          </div>
+                          <span
+                            className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                              diffCash === 0
+                                ? 'text-[#3F6B50] bg-[#F4F9F5] border border-[#CCE3D2]'
+                                : 'text-[#A34F4F] bg-[#FDF5F5] border border-[#F0CCCC]'
+                            }`}
+                          >
+                            {diffCash === 0 ? 'Balanced' : `Diff ₹${diffCash}`}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-[#6F6962] text-[11px]">
+                          <span>Sales: ₹{totalSales.toLocaleString('en-IN')}</span>
+                          <span>Cash Count: ₹{countedCash.toLocaleString('en-IN')}</span>
+                        </div>
                       </div>
-                      <div className="flex justify-between text-[#6F6962] text-[11px]">
-                        <span>Sales: ₹{h.total_sales.toLocaleString('en-IN')}</span>
-                        <span>Cash Count: ₹{h.actual_cash_counted.toLocaleString('en-IN')}</span>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
           </div>
         </div>
       ) : null}
+
+      <OwnerOverridePrompt
+        isOpen={showOverridePrompt}
+        title={overrideAction === 'update' ? `Update Closed Day (${selectedDate})` : `Reconcile Closed Day (${selectedDate})`}
+        description={`Business day ${selectedDate} is already CLOSED. Owner password verification and an audit reason are required to update or reconcile the closing snapshot. Original opening cash and closed timestamp will be preserved.`}
+        requireReason={true}
+        reasonLabel="Mandatory Reconciliation Reason *"
+        errorMessage={overrideError}
+        submitting={submitting}
+        onCancel={() => {
+          setShowOverridePrompt(false);
+          setOverrideError(null);
+        }}
+        onConfirm={handleOwnerOverrideConfirm}
+      />
     </div>
   );
 };

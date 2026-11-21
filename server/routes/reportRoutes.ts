@@ -1,6 +1,7 @@
 import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryAll } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
+import { sqlEffectiveSaleDate, sqlISTDate } from '../dateUtil.ts';
 
 const router = new Router();
 router.use(authMiddleware);
@@ -8,8 +9,8 @@ router.use(authMiddleware);
 // Helper to format ISO date to readable label e.g. '15 Oct'
 function formatShortDate(dateStr: string): string {
   try {
-    const d = new Date(dateStr);
-    return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+    const d = new Date(`${dateStr}T00:00:00+05:30`);
+    return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short' });
   } catch {
     return dateStr;
   }
@@ -48,26 +49,26 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
         s.balance_due,
         s.payment_method,
         s.created_at,
-        DATE(s.created_at) as sale_date,
-        strftime('%Y-%m', s.created_at) as sale_month,
-        strftime('%Y-W%W', s.created_at) as sale_week
+        ${sqlEffectiveSaleDate('s.')} as sale_date,
+        SUBSTR(${sqlEffectiveSaleDate('s.')}, 1, 7) as sale_month,
+        strftime('%Y-W%W', ${sqlEffectiveSaleDate('s.')}) as sale_week
       FROM sales s
       WHERE (s.status IS NULL OR s.status = 'COMPLETED')
     `;
 
     const params: any[] = [];
     if (startDate && endDate) {
-      salesQuery += ` AND DATE(s.created_at) >= ? AND DATE(s.created_at) <= ? `;
+      salesQuery += ` AND ${sqlEffectiveSaleDate('s.')} >= ? AND ${sqlEffectiveSaleDate('s.')} <= ? `;
       params.push(startDate, endDate);
     } else if (startDate) {
-      salesQuery += ` AND DATE(s.created_at) >= ? `;
+      salesQuery += ` AND ${sqlEffectiveSaleDate('s.')} >= ? `;
       params.push(startDate);
     } else if (endDate) {
-      salesQuery += ` AND DATE(s.created_at) <= ? `;
+      salesQuery += ` AND ${sqlEffectiveSaleDate('s.')} <= ? `;
       params.push(endDate);
     }
 
-    salesQuery += ` ORDER BY s.created_at ASC `;
+    salesQuery += ` ORDER BY ${sqlEffectiveSaleDate('s.')} ASC, s.created_at ASC `;
 
     const sales = await dbQueryAll<any>(salesQuery, params);
 
@@ -75,13 +76,13 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
     let returnsQuery = `
       SELECT 
         id, sale_id, refund_amount, refund_method, created_at,
-        DATE(created_at) as return_date
+        ${sqlISTDate('created_at')} as return_date
       FROM sale_returns
       WHERE 1=1
     `;
     const returnParams: any[] = [];
     if (startDate && endDate) {
-      returnsQuery += ` AND DATE(created_at) >= ? AND DATE(created_at) <= ? `;
+      returnsQuery += ` AND ${sqlISTDate('created_at')} >= ? AND ${sqlISTDate('created_at')} <= ? `;
       returnParams.push(startDate, endDate);
     }
     const returns = await dbQueryAll<any>(returnsQuery, returnParams);
@@ -247,7 +248,7 @@ router.get('/sales-trends', async (req: AuthenticatedRequest, res: Response) => 
     `;
     const topProdParams: any[] = [];
     if (startDate && endDate) {
-      topProductsQuery += ` AND DATE(s.created_at) >= ? AND DATE(s.created_at) <= ? `;
+      topProductsQuery += ` AND ${sqlEffectiveSaleDate('s.')} >= ? AND ${sqlEffectiveSaleDate('s.')} <= ? `;
       topProdParams.push(startDate, endDate);
     }
     topProductsQuery += `

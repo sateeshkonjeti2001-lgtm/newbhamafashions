@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { api, removeStoredToken } from './services/api.ts';
 import { User } from './types.ts';
+import { getTodayIST } from './utils/date.ts';
 import { Navbar } from './components/Navbar.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
@@ -65,7 +66,7 @@ export default function App() {
 
           // Fetch day closed status
           try {
-            const todayStr = new Date().toISOString().split('T')[0];
+            const todayStr = getTodayIST();
             const closingRes = await api.getDayClosingSummary(todayStr);
             setDayClosed(Boolean(closingRes.isClosed));
           } catch (e) {
@@ -227,11 +228,11 @@ export default function App() {
               <InventoryView role={currentUser.role} />
             )}
 
-            {activeTab === 'purchases' && <PurchasesView />}
+            {activeTab === 'purchases' && <PurchasesView role={currentUser.role} />}
 
-            {activeTab === 'money' && <MoneyView />}
+            {activeTab === 'money' && <MoneyView role={currentUser.role} />}
 
-            {activeTab === 'dues' && <CustomerDuesView />}
+            {activeTab === 'dues' && <CustomerDuesView role={currentUser.role} />}
 
             {activeTab === 'staff' && <StaffView role={currentUser.role} />}
 

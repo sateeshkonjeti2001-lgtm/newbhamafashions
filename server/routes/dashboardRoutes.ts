@@ -1,13 +1,14 @@
 import { WebRouter as Router, WebResponse as Response } from '../webRouter.ts';
 import { dbQueryOne, dbQueryAll } from '../db.ts';
 import { authMiddleware, AuthenticatedRequest } from '../auth.ts';
+import { getTodayIST, sqlEffectiveSaleDate, sqlISTDate } from '../dateUtil.ts';
 
 const router = new Router();
 
 router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const isOwner = req.user?.role === 'OWNER';
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayIST();
     const targetDate = (req.query.date as string) || todayStr;
     const isToday = targetDate === todayStr;
 
@@ -40,7 +41,7 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
         COALESCE(SUM(CASE WHEN channel != 'MANUAL' OR channel IS NULL THEN 1 ELSE 0 END), 0) as pos_bills_count,
         COALESCE(SUM(CASE WHEN channel != 'MANUAL' OR channel IS NULL THEN total_amount ELSE 0 END), 0) as pos_bills_total
       FROM sales 
-      WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
+      WHERE ${sqlEffectiveSaleDate()} = ? AND (status IS NULL OR status = 'COMPLETED')
     `, [targetDate])) || {
       total_bills: 0,
       gross_sales: 0,
@@ -64,7 +65,7 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
         COALESCE(SUM(CASE WHEN refund_method = 'CASH' THEN refund_amount ELSE 0 END), 0) as cash_refunds,
         COALESCE(SUM(CASE WHEN refund_method = 'UPI' THEN refund_amount ELSE 0 END), 0) as upi_refunds
       FROM sale_returns
-      WHERE DATE(created_at) = ?
+      WHERE ${sqlISTDate('created_at')} = ?
     `, [targetDate])) || { return_count: 0, total_refunds: 0, cash_refunds: 0, upi_refunds: 0 };
 
     const netSales = Math.max(0, salesSummary.gross_sales - returnsSummary.total_refunds);
@@ -153,7 +154,7 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
         COUNT(*) as pending_count,
         COALESCE(SUM(balance_due), 0) as total_supplier_dues
       FROM purchases 
-      WHERE balance_due > 0
+      WHERE balance_due > 0 AND COALESCE(is_reversed, 0) = 0
     `)) || { pending_count: 0, total_supplier_dues: 0 };
 
     // 9. Day Closing Status
@@ -168,6 +169,10 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
         dc.status,
         dc.closed_at,
         dc.closing_notes,
+        dc.modified_after_close,
+        dc.last_modified_at,
+        dc.last_modified_by,
+        dc.last_modification_summary,
         u.full_name as closed_by_name
       FROM daily_closings dc
       LEFT JOIN users u ON dc.closed_by_user_id = u.id
@@ -222,7 +227,7 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
         channel, 
         created_at
       FROM sales
-      WHERE DATE(created_at) = ? AND (status IS NULL OR status = 'COMPLETED')
+      WHERE ${sqlEffectiveSaleDate()} = ? AND (status IS NULL OR status = 'COMPLETED')
       ORDER BY created_at DESC
       LIMIT 6
     `, [targetDate]);
@@ -230,7 +235,7 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
     // 12. Available dates
     const availableDates = await dbQueryAll<{ sale_date: string; count: number; total: number }>(`
       SELECT 
-        DATE(created_at) as sale_date, 
+        ${sqlEffectiveSaleDate()} as sale_date, 
         COUNT(*) as count,
         COALESCE(SUM(total_amount), 0) as total
       FROM sales 
@@ -307,6 +312,8 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
         closed_at: dailyClosing?.closed_at ?? null,
         closed_by_name: dailyClosing?.closed_by_name ?? null,
         notes: dailyClosing?.closing_notes ?? null,
+        modified_after_close: Number(dailyClosing?.modified_after_close || 0) === 1,
+        last_modification_summary: dailyClosing?.last_modification_summary ?? null,
       },
       manualBills: {
         count: salesSummary.manual_bills_count,

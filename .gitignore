@@ -14,3 +14,4 @@ data/*.sqlite
 data/*.sqlite.*
 data/*.sql
 data/backups/
+d1-backups/

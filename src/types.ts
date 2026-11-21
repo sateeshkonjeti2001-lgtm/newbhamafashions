@@ -95,6 +95,7 @@ export interface CartItem {
 export interface Sale {
   id: string;
   bill_number: string;
+  bill_date?: string;
   customer_id?: string;
   customer_name?: string;
   customer_phone?: string;
@@ -109,14 +110,25 @@ export interface Sale {
   amount_paid: number;
   balance_due: number;
   payment_status: 'PAID' | 'PARTIAL' | 'UNPAID';
-  payment_method: 'CASH' | 'UPI' | 'SPLIT' | 'CREDIT';
+  payment_method: 'CASH' | 'UPI' | 'SPLIT' | 'CREDIT' | 'CARD';
   cash_paid?: number;
   upi_paid?: number;
+  card_paid?: number;
   channel: string;
+  status?: 'COMPLETED' | 'CANCELLED';
+  cancelled_at?: string;
+  cancelled_by?: string;
+  cancelled_by_name?: string;
+  cancelled_reason?: string;
   notes?: string;
   cashier_id?: string;
   cashier_name?: string;
   day_closed: number;
+  closing_status?: 'OPEN' | 'CLOSED' | null;
+  day_modified_after_close?: boolean;
+  days_since_created?: number;
+  normal_edit_window_active?: boolean;
+  requires_owner_password?: boolean;
   created_at: string;
   items?: any[];
 }
@@ -142,6 +154,7 @@ export interface CustomerDue {
   original_due: number;
   amount_paid: number;
   balance_due: number;
+  due_date?: string;
   status: 'PENDING' | 'CLEARED';
   notes?: string;
   created_at: string;
@@ -174,6 +187,10 @@ export interface Purchase {
   payment_status: 'PAID' | 'PARTIAL' | 'UNPAID';
   payment_method?: string;
   notes?: string;
+  is_reversed?: number;
+  reversed_reason?: string;
+  reversed_at?: string;
+  reversed_by?: string;
   created_by_name?: string;
   created_at: string;
   items?: any[];
@@ -191,6 +208,8 @@ export interface StockLedgerEntry {
   reference_type: string;
   reference_id?: string;
   reason?: string;
+  is_reversed?: number;
+  reversible?: boolean;
   created_by_name?: string;
   created_at: string;
 }
@@ -256,10 +275,18 @@ export interface DailyClosing {
   upi_sales: number;
   upi_received_other: number;
   upi_payments: number;
+  actual_upi_counted?: number | null;
+  cash_left_in_drawer?: number | null;
+  cash_taken_home?: number | null;
+  discrepancy_reason?: string | null;
   closing_notes?: string;
   status: 'OPEN' | 'CLOSED';
   closed_by_name?: string;
   closed_at?: string;
+  modified_after_close?: number;
+  last_modified_at?: string | null;
+  last_modified_by?: string | null;
+  last_modification_summary?: string | null;
 }
 
 export interface Asset {

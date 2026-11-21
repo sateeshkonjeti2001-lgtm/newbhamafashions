@@ -5,21 +5,21 @@ import {
   Calendar,
   DollarSign,
   CheckCircle2,
-  XCircle,
-  Clock,
   AlertCircle,
   X,
-  Coins,
   Shield,
   PhoneCall,
   Edit3,
   UserPlus,
   Store,
   Check,
-  Users,
+  RotateCcw,
+  Trash2,
 } from 'lucide-react';
 import { api } from '../services/api.ts';
 import { StaffMember, AttendanceRecord, UserRole, User } from '../types.ts';
+import { getTodayIST, formatDateIST } from '../utils/date.ts';
+import { OwnerOverridePrompt } from './OwnerOverridePrompt.tsx';
 
 interface StaffViewProps {
   role: UserRole;
@@ -30,8 +30,9 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
   const [staffList, setStaffList] = useState<StaffMember[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [payments, setPayments] = useState<any[]>([]);
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
+  const [selectedDate, setSelectedDate] = useState(getTodayIST());
   const [loading, setLoading] = useState(true);
+  const [pageBanner, setPageBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // New Staff Modal
   const [showStaffModal, setShowStaffModal] = useState(false);
@@ -39,8 +40,19 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
   const [phone, setPhone] = useState('');
   const [roleTitle, setRoleTitle] = useState('Sales Assistant');
   const [salary, setSalary] = useState<number | ''>('');
-  const [joiningDate, setJoiningDate] = useState(new Date().toISOString().split('T')[0]);
+  const [joiningDate, setJoiningDate] = useState(getTodayIST());
   const [address, setAddress] = useState('');
+
+  // Attendance Edit/Delete Reason Modal
+  const [attModal, setAttModal] = useState<{
+    mode: 'EDIT' | 'DELETE';
+    staffId: string;
+    staffName: string;
+    attendanceId?: string;
+    status?: string;
+  } | null>(null);
+  const [attReason, setAttReason] = useState('');
+  const [attModalError, setAttModalError] = useState<string | null>(null);
 
   // Salary Payment Modal
   const [showPayModal, setShowPayModal] = useState(false);
@@ -49,6 +61,11 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
   const [payAmount, setPayAmount] = useState<number | ''>('');
   const [payMethod, setPayMethod] = useState<'CASH' | 'UPI' | 'BANK'>('CASH');
   const [payNotes, setPayNotes] = useState('');
+
+  // Reverse Salary Payment Modal
+  const [reverseSalaryTarget, setReverseSalaryTarget] = useState<any | null>(null);
+  const [reverseSalaryReason, setReverseSalaryReason] = useState('');
+  const [reverseSalaryError, setReverseSalaryError] = useState<string | null>(null);
 
   // Owners & Contacts Management State
   const [systemUsers, setSystemUsers] = useState<User[]>([]);
@@ -76,6 +93,16 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
   const [editRole, setEditRole] = useState<'OWNER' | 'CASHIER'>('OWNER');
   const [editPassword, setEditPassword] = useState('');
   const [editActive, setEditActive] = useState(true);
+
+  // Owner Override Prompt
+  const [overridePrompt, setOverridePrompt] = useState<{
+    title: string;
+    description: string;
+    confirmLabel?: string;
+    onConfirm: (ownerPassword: string) => Promise<void>;
+  } | null>(null);
+  const [overrideError, setOverrideError] = useState<string | null>(null);
+  const [overrideSubmitting, setOverrideSubmitting] = useState(false);
 
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -120,16 +147,116 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
     loadData();
   }, [selectedDate]);
 
-  const handleMarkAttendance = async (staffId: string, status: string) => {
-    try {
-      await api.markAttendance({
-        staff_id: staffId,
-        date: selectedDate,
+  const showSuccess = (text: string) => {
+    setPageBanner({ type: 'success', text });
+    setTimeout(() => setPageBanner((prev) => (prev?.text === text ? null : prev)), 5000);
+  };
+
+  const submitAttendance = async (staffId: string, status: string, reason?: string, ownerPassword?: string) => {
+    await api.markAttendance({
+      staff_id: staffId,
+      date: selectedDate,
+      status,
+      ...(reason ? { reason } : {}),
+      ...(ownerPassword ? { owner_password: ownerPassword } : {}),
+    });
+    setAttModal(null);
+    setOverridePrompt(null);
+    showSuccess(`Attendance saved for ${selectedDate}.`);
+    await loadData();
+  };
+
+  const handleMarkAttendance = async (staffMember: StaffMember, status: string, existingRecord?: AttendanceRecord) => {
+    setPageBanner(null);
+    if (existingRecord && selectedDate !== getTodayIST()) {
+      setAttModal({
+        mode: 'EDIT',
+        staffId: staffMember.id,
+        staffName: staffMember.name,
         status,
       });
-      loadData();
+      setAttReason('');
+      setAttModalError(null);
+      return;
+    }
+
+    try {
+      await submitAttendance(staffMember.id, status);
     } catch (err: any) {
-      alert(err.message);
+      if (err?.requires_owner_password) {
+        setOverrideError(null);
+        setOverridePrompt({
+          title: 'Owner Authorization Required (Closed Day)',
+          description: err.message || `Business day ${selectedDate} is CLOSED. Enter Store Owner password to mark attendance.`,
+          confirmLabel: 'Verify & Save Attendance',
+          onConfirm: async (pwd) => {
+            await submitAttendance(staffMember.id, status, 'Closed-day attendance update', pwd);
+          },
+        });
+      } else if (String(err.message || '').toLowerCase().includes('reason')) {
+        setAttModal({
+          mode: 'EDIT',
+          staffId: staffMember.id,
+          staffName: staffMember.name,
+          status,
+        });
+        setAttReason('');
+        setAttModalError(err.message);
+      } else {
+        setPageBanner({ type: 'error', text: err.message || 'Failed to mark attendance' });
+      }
+    }
+  };
+
+  const submitDeleteAttendance = async (attendanceId: string, reasonText: string, ownerPassword?: string) => {
+    await api.deleteAttendance(attendanceId, {
+      reason: reasonText,
+      ...(ownerPassword ? { owner_password: ownerPassword } : {}),
+    });
+    setAttModal(null);
+    setOverridePrompt(null);
+    showSuccess('Attendance record removed.');
+    await loadData();
+  };
+
+  const handleConfirmAttModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!attModal) return;
+    if (!attReason.trim()) {
+      setAttModalError('Mandatory reason is required.');
+      return;
+    }
+
+    setSubmitting(true);
+    setAttModalError(null);
+    try {
+      if (attModal.mode === 'EDIT' && attModal.status) {
+        await submitAttendance(attModal.staffId, attModal.status, attReason.trim());
+      } else if (attModal.mode === 'DELETE' && attModal.attendanceId) {
+        await submitDeleteAttendance(attModal.attendanceId, attReason.trim());
+      }
+    } catch (err: any) {
+      if (err?.requires_owner_password) {
+        const snapshot = { ...attModal };
+        const savedReason = attReason.trim();
+        setOverrideError(null);
+        setOverridePrompt({
+          title: 'Owner Authorization Required (Closed Day)',
+          description: err.message || `Business day ${selectedDate} is CLOSED. Verify Store Owner password to confirm.`,
+          confirmLabel: snapshot.mode === 'DELETE' ? 'Verify & Remove Attendance' : 'Verify & Update Attendance',
+          onConfirm: async (pwd) => {
+            if (snapshot.mode === 'EDIT' && snapshot.status) {
+              await submitAttendance(snapshot.staffId, snapshot.status, savedReason, pwd);
+            } else if (snapshot.mode === 'DELETE' && snapshot.attendanceId) {
+              await submitDeleteAttendance(snapshot.attendanceId, savedReason, pwd);
+            }
+          },
+        });
+      } else {
+        setAttModalError(err.message || 'Failed to update attendance');
+      }
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -158,12 +285,31 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
       setPhone('');
       setSalary('');
       setAddress('');
-      loadData();
+      showSuccess(`Staff member "${name.trim()}" enrolled.`);
+      await loadData();
     } catch (err: any) {
       setFormError(err.message || 'Failed to create staff');
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const submitSalaryPayment = async (ownerPassword?: string) => {
+    await api.payStaffSalary({
+      staff_id: payStaffId,
+      payment_type: payType,
+      amount: Number(payAmount),
+      payment_method: payMethod,
+      notes: payNotes.trim() || null,
+      ...(ownerPassword ? { owner_password: ownerPassword } : {}),
+    });
+
+    setShowPayModal(false);
+    setPayAmount('');
+    setPayNotes('');
+    setOverridePrompt(null);
+    showSuccess(`${payType === 'ADVANCE' ? 'Advance' : 'Salary'} disbursement of ₹${Number(payAmount).toLocaleString('en-IN')} recorded.`);
+    await loadData();
   };
 
   const handleRecordSalary = async (e: React.FormEvent) => {
@@ -177,22 +323,85 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
     setFormError(null);
 
     try {
-      await api.payStaffSalary({
-        staff_id: payStaffId,
-        payment_type: payType,
-        amount: Number(payAmount),
-        payment_method: payMethod,
-        notes: payNotes.trim() || null,
-      });
-
-      setShowPayModal(false);
-      setPayAmount('');
-      setPayNotes('');
-      loadData();
+      await submitSalaryPayment();
     } catch (err: any) {
-      setFormError(err.message || 'Payment recording failed');
+      if (err?.requires_owner_password) {
+        setOverrideError(null);
+        setOverridePrompt({
+          title: 'Owner Authorization Required (Closed Day)',
+          description: err.message || 'Today is CLOSED. Verify Store Owner password to record this salary/advance payment.',
+          confirmLabel: 'Verify & Record Payment',
+          onConfirm: async (pwd) => {
+            await submitSalaryPayment(pwd);
+          },
+        });
+      } else {
+        setFormError(err.message || 'Payment recording failed');
+      }
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const submitReverseSalary = async (payment: any, reasonText: string, ownerPassword?: string) => {
+    const res = await api.reverseSalaryPayment(payment.id, {
+      reason: reasonText,
+      ...(ownerPassword ? { owner_password: ownerPassword } : {}),
+    });
+    setReverseSalaryTarget(null);
+    setReverseSalaryReason('');
+    setOverridePrompt(null);
+    const closedNote =
+      res.modified_closed_dates && res.modified_closed_dates.length > 0
+        ? ` Reconciled closed day (${res.modified_closed_dates.join(', ')}).`
+        : '';
+    showSuccess(`Reversed ${payment.payment_type} payment of ₹${Number(payment.amount || 0).toLocaleString('en-IN')}.${closedNote}`);
+    await loadData();
+  };
+
+  const handleConfirmReverseSalary = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reverseSalaryTarget) return;
+    if (!reverseSalaryReason.trim()) {
+      setReverseSalaryError('Mandatory reason is required to reverse a salary payment.');
+      return;
+    }
+
+    setSubmitting(true);
+    setReverseSalaryError(null);
+    try {
+      await submitReverseSalary(reverseSalaryTarget, reverseSalaryReason.trim());
+    } catch (err: any) {
+      if (err?.requires_owner_password) {
+        const target = reverseSalaryTarget;
+        const rsn = reverseSalaryReason.trim();
+        setOverrideError(null);
+        setOverridePrompt({
+          title: 'Owner Authorization Required (Closed Day)',
+          description: err.message || 'This salary payment belongs to a CLOSED business day. Verify Store Owner password to reverse it.',
+          confirmLabel: 'Verify & Reverse Payment',
+          onConfirm: async (pwd) => {
+            await submitReverseSalary(target, rsn, pwd);
+          },
+        });
+      } else {
+        setReverseSalaryError(err.message || 'Failed to reverse salary payment');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleOverrideConfirm = async (ownerPassword: string) => {
+    if (!overridePrompt) return;
+    setOverrideSubmitting(true);
+    setOverrideError(null);
+    try {
+      await overridePrompt.onConfirm(ownerPassword);
+    } catch (err: any) {
+      setOverrideError(err.message || 'Authorization failed');
+    } finally {
+      setOverrideSubmitting(false);
     }
   };
 
@@ -354,6 +563,28 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
         </div>
       </div>
 
+      {pageBanner && (
+        <div
+          className={`p-3 rounded-xl border text-xs flex items-center justify-between gap-3 ${
+            pageBanner.type === 'success'
+              ? 'bg-[#F4F9F5] border-[#CCE3D2] text-[#3F6B50]'
+              : 'bg-[#FDF5F5] border-[#F0CCCC] text-[#A34F4F]'
+          }`}
+        >
+          <div className="flex items-center gap-2 font-medium">
+            {pageBanner.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 shrink-0" />
+            )}
+            <span>{pageBanner.text}</span>
+          </div>
+          <button onClick={() => setPageBanner(null)} className="opacity-70 hover:opacity-100">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Tab: ATTENDANCE */}
       {activeTab === 'ATTENDANCE' && (
         <div className="space-y-4">
@@ -425,9 +656,9 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
                             )}
                           </td>
                           <td className="px-4 py-3.5 text-right">
-                            <div className="inline-flex gap-1">
+                            <div className="inline-flex items-center gap-1 flex-wrap justify-end">
                               <button
-                                onClick={() => handleMarkAttendance(s.id, 'PRESENT')}
+                                onClick={() => handleMarkAttendance(s, 'PRESENT', record)}
                                 className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold transition ${
                                   status === 'PRESENT'
                                     ? 'bg-[#3F6B50] text-white shadow-xs'
@@ -437,7 +668,7 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
                                 Present
                               </button>
                               <button
-                                onClick={() => handleMarkAttendance(s.id, 'HALF_DAY')}
+                                onClick={() => handleMarkAttendance(s, 'HALF_DAY', record)}
                                 className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold transition ${
                                   status === 'HALF_DAY'
                                     ? 'bg-[#A67C52] text-white shadow-xs'
@@ -447,7 +678,7 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
                                 Half-Day
                               </button>
                               <button
-                                onClick={() => handleMarkAttendance(s.id, 'LEAVE')}
+                                onClick={() => handleMarkAttendance(s, 'LEAVE', record)}
                                 className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold transition ${
                                   status === 'LEAVE'
                                     ? 'bg-[#171513] text-[#F5F2EC] shadow-xs'
@@ -457,7 +688,7 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
                                 Leave
                               </button>
                               <button
-                                onClick={() => handleMarkAttendance(s.id, 'ABSENT')}
+                                onClick={() => handleMarkAttendance(s, 'ABSENT', record)}
                                 className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold transition ${
                                   status === 'ABSENT'
                                     ? 'bg-[#A34F4F] text-white shadow-xs'
@@ -466,6 +697,25 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
                               >
                                 Absent
                               </button>
+                              {isOwner && record && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setAttModal({
+                                      mode: 'DELETE',
+                                      staffId: s.id,
+                                      staffName: s.name,
+                                      attendanceId: record.id,
+                                    });
+                                    setAttReason('');
+                                    setAttModalError(null);
+                                  }}
+                                  title="Clear / Remove Attendance Record"
+                                  className="p-1.5 rounded-lg border border-[#F0CCCC] text-[#A34F4F] hover:bg-[#FDF5F5] transition ml-1"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -545,40 +795,67 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
               <table className="w-full text-left text-xs text-[#1C1917]">
                 <thead className="bg-[#FAF8F4] text-[#6F6962] uppercase font-bold text-[10px] tracking-wider border-b border-[#E3DED5]">
                   <tr>
-                    <th className="px-4 py-3.5">Date</th>
+                    <th className="px-4 py-3.5">Date (IST)</th>
                     <th className="px-4 py-3.5">Staff Name</th>
                     <th className="px-4 py-3.5">Type</th>
                     <th className="px-4 py-3.5">Payment Mode</th>
                     <th className="px-4 py-3.5 text-right">Amount Paid</th>
                     <th className="px-4 py-3.5">Notes</th>
+                    <th className="px-4 py-3.5 text-right">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#E3DED5]">
                   {payments.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="px-4 py-10 text-center text-[#9A938B]">
+                      <td colSpan={7} className="px-4 py-10 text-center text-[#9A938B]">
                         No salary or advance disbursements recorded yet.
                       </td>
                     </tr>
                   ) : (
-                    payments.map((p) => (
-                      <tr key={p.id} className="hover:bg-[#FAF8F4] transition">
-                        <td className="px-4 py-3.5 text-[#6F6962] font-mono text-[11px]">
-                          {new Date(p.created_at).toLocaleDateString('en-IN')}
+                    payments.map((p) => {
+                      const isReversed = Boolean(p.is_reversed);
+                      return (
+                      <tr key={p.id} className={`transition ${isReversed ? 'bg-[#FAF8F4]/70 opacity-70' : 'hover:bg-[#FAF8F4]'}`}>
+                        <td className="px-4 py-3.5 text-[#6F6962] font-mono text-[11px] whitespace-nowrap">
+                          {formatDateIST(p.created_at)}
                         </td>
                         <td className="px-4 py-3.5 font-bold text-[#1C1917]">{p.staff_name}</td>
                         <td className="px-4 py-3.5">
-                          <span className="text-[10px] px-2.5 py-0.5 rounded-full font-bold bg-[#FAF8F4] text-[#1C1917] border border-[#E3DED5]">
-                            {p.payment_type}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] px-2.5 py-0.5 rounded-full font-bold bg-[#FAF8F4] text-[#1C1917] border border-[#E3DED5]">
+                              {p.payment_type}
+                            </span>
+                            {isReversed && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-md font-bold bg-[#FDF5F5] text-[#A34F4F] border border-[#F0CCCC]">
+                                Reversed
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="px-4 py-3.5 text-[#6F6962] font-medium">{p.payment_method}</td>
-                        <td className="px-4 py-3.5 text-right font-bold text-[#1C1917] text-sm">
+                        <td className={`px-4 py-3.5 text-right font-bold text-sm ${isReversed ? 'line-through text-[#9A938B]' : 'text-[#1C1917]'}`}>
                           ₹{p.amount.toLocaleString('en-IN')}
                         </td>
                         <td className="px-4 py-3.5 text-[#6F6962]">{p.notes || '-'}</td>
+                        <td className="px-4 py-3.5 text-right whitespace-nowrap">
+                          {!isReversed && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReverseSalaryTarget(p);
+                                setReverseSalaryReason('');
+                                setReverseSalaryError(null);
+                              }}
+                              className="px-2.5 py-1 bg-white hover:bg-[#FDF5F5] text-[#A34F4F] border border-[#F0CCCC] rounded-lg text-[10px] font-semibold inline-flex items-center gap-1"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              <span>Reverse</span>
+                            </button>
+                          )}
+                        </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
@@ -1282,6 +1559,143 @@ export const StaffView: React.FC<StaffViewProps> = ({ role }) => {
           </div>
         </div>
       )}
+
+      {/* Attendance Edit/Delete Reason Modal */}
+      {attModal && (
+        <div className="fixed inset-0 z-50 bg-[#171513]/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-[#E3DED5] rounded-2xl p-6 max-w-md w-full space-y-4 shadow-[0_8px_30px_rgba(23,21,19,0.12)]">
+            <div className="flex items-center justify-between border-b border-[#E3DED5] pb-3">
+              <div>
+                <h3 className={`font-bold text-sm ${attModal.mode === 'DELETE' ? 'text-[#A34F4F]' : 'text-[#1C1917]'}`}>
+                  {attModal.mode === 'DELETE' ? 'Remove Attendance Record' : 'Update Past Attendance'}
+                </h3>
+                <p className="text-[11px] text-[#6F6962]">
+                  {attModal.staffName} &bull; {selectedDate}
+                  {attModal.status ? ` → ${attModal.status}` : ''}
+                </p>
+              </div>
+              <button onClick={() => setAttModal(null)} className="text-[#9A938B] hover:text-[#1C1917]">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {attModalError && (
+              <div className="p-2.5 bg-[#FDF5F5] border border-[#F0CCCC] rounded-lg text-xs text-[#A34F4F]">
+                {attModalError}
+              </div>
+            )}
+
+            <form onSubmit={handleConfirmAttModal} className="space-y-3 text-xs">
+              <div>
+                <label className="block font-semibold text-[#1C1917] mb-1">Mandatory Audit Reason *</label>
+                <textarea
+                  rows={2}
+                  required
+                  value={attReason}
+                  onChange={(e) => setAttReason(e.target.value)}
+                  placeholder="Enter reason for modifying or removing attendance..."
+                  className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2.5 pt-2 border-t border-[#E3DED5]">
+                <button
+                  type="button"
+                  onClick={() => setAttModal(null)}
+                  className="px-4 py-2 border border-[#D4CDC2] text-[#6F6962] hover:text-[#1C1917] rounded-xl font-medium transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className={`px-4 py-2 text-white rounded-xl font-semibold shadow-sm disabled:opacity-50 transition ${
+                    attModal.mode === 'DELETE' ? 'bg-[#A34F4F] hover:bg-[#8E4141]' : 'bg-[#171513] hover:bg-[#25211D]'
+                  }`}
+                >
+                  {submitting ? 'Saving...' : attModal.mode === 'DELETE' ? 'Confirm Removal' : 'Save Attendance Change'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Reverse Salary Payment Modal */}
+      {reverseSalaryTarget && (
+        <div className="fixed inset-0 z-50 bg-[#171513]/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-[#E3DED5] rounded-2xl p-6 max-w-md w-full space-y-4 shadow-[0_8px_30px_rgba(23,21,19,0.12)]">
+            <div className="flex items-center justify-between border-b border-[#E3DED5] pb-3">
+              <div>
+                <h3 className="font-bold text-sm text-[#A34F4F]">Reverse Salary / Advance Payment</h3>
+                <p className="text-[11px] text-[#6F6962]">
+                  {reverseSalaryTarget.staff_name} &bull; ₹{Number(reverseSalaryTarget.amount || 0).toLocaleString('en-IN')} ({reverseSalaryTarget.payment_method})
+                </p>
+              </div>
+              <button onClick={() => setReverseSalaryTarget(null)} className="text-[#9A938B] hover:text-[#1C1917]">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {reverseSalaryError && (
+              <div className="p-2.5 bg-[#FDF5F5] border border-[#F0CCCC] rounded-lg text-xs text-[#A34F4F]">
+                {reverseSalaryError}
+              </div>
+            )}
+
+            <form onSubmit={handleConfirmReverseSalary} className="space-y-3 text-xs">
+              <p className="text-[#6F6962]">
+                Safely marks this payment as Reversed, restores account balances, and reconciles closed-day snapshots if needed.
+              </p>
+
+              <div>
+                <label className="block font-semibold text-[#1C1917] mb-1">Mandatory Reversal Reason *</label>
+                <textarea
+                  rows={2}
+                  required
+                  value={reverseSalaryReason}
+                  onChange={(e) => setReverseSalaryReason(e.target.value)}
+                  placeholder="Enter reason for reversing this salary payment..."
+                  className="w-full px-3 py-2 bg-white border border-[#D4CDC2] rounded-xl text-[#1C1917] focus:outline-none focus:border-[#A67C52]"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2.5 pt-2 border-t border-[#E3DED5]">
+                <button
+                  type="button"
+                  onClick={() => setReverseSalaryTarget(null)}
+                  className="px-4 py-2 border border-[#D4CDC2] text-[#6F6962] hover:text-[#1C1917] rounded-xl font-medium transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="px-4 py-2 bg-[#A34F4F] hover:bg-[#8E4141] text-white rounded-xl font-semibold shadow-sm disabled:opacity-50 transition"
+                >
+                  {submitting ? 'Reversing...' : 'Confirm Reversal'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Owner Override Verification Prompt */}
+      <OwnerOverridePrompt
+        isOpen={Boolean(overridePrompt)}
+        title={overridePrompt?.title}
+        description={overridePrompt?.description || ''}
+        requireReason={false}
+        confirmLabel={overridePrompt?.confirmLabel}
+        errorMessage={overrideError}
+        submitting={overrideSubmitting}
+        onCancel={() => {
+          setOverridePrompt(null);
+          setOverrideError(null);
+        }}
+        onConfirm={handleOverrideConfirm}
+      />
     </div>
   );
 };

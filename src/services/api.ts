@@ -48,9 +48,11 @@ async function request<T>(endpoint: string, options: RequestInit = {}, retries =
 
   if (!res.ok) {
     let errorMsg = `Server error (${res.status})`;
+    let errorData: any = null;
     if (isJson) {
       try {
         const errorJson = await res.json();
+        errorData = errorJson;
         errorMsg = errorJson.error || errorMsg;
       } catch {
         errorMsg = res.statusText || errorMsg;
@@ -70,6 +72,9 @@ async function request<T>(endpoint: string, options: RequestInit = {}, retries =
 
     const err: any = new Error(errorMsg);
     err.status = res.status;
+    err.code = errorData?.code;
+    err.requires_owner_password = Boolean(errorData?.requires_owner_password);
+    err.data = errorData;
     throw err;
   }
 
@@ -203,6 +208,11 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  reverseStockAdjustment: (id: string, data: { reason: string }) =>
+    request<{ success: boolean; reversal_id: string }>(`/inventory/ledger/${id}/reverse`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   // POS
   posSearch: (query: string) => request<{ products: any[] }>(`/pos/search?query=${encodeURIComponent(query)}`),
@@ -229,14 +239,16 @@ export const api = {
   },
   getBillDetail: (id: string) =>
     request<{ sale: any; items: any[]; returns: any[]; customerDue?: any; editHistory?: any[] }>(`/pos/bills/${id}`),
-  cancelBill: (id: string, data: { reason: string; notes?: string }) => request<{ success: boolean; message: string; sale: any }>(`/pos/bills/${id}/cancel`, {
-    method: 'POST',
-    body: JSON.stringify(data),
-  }),
-  returnBillItems: (id: string, data: { items: { sale_item_id: string; quantity: number }[]; refund_method: string; reason: string; notes?: string }) => request<{ success: boolean; return_record: any }>(`/pos/bills/${id}/return`, {
-    method: 'POST',
-    body: JSON.stringify(data),
-  }),
+  cancelBill: (id: string, data: { reason: string; notes?: string; owner_password?: string }) =>
+    request<{ success: boolean; message: string; sale: any; modified_closed_dates?: string[] }>(`/pos/bills/${id}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  returnBillItems: (id: string, data: { items: { sale_item_id: string; quantity: number }[]; refund_method: string; reason: string; notes?: string; owner_password?: string }) =>
+    request<{ success: boolean; return_record: any }>(`/pos/bills/${id}/return`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   createManualBill: (data: any) => request<{ success: boolean; message: string; sale: any }>('/pos/manual-bill', {
     method: 'POST',
     body: JSON.stringify(data),
@@ -274,10 +286,19 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
-  paySupplierDue: (id: string, data: any) => request<{ success: boolean; balance_due: number }>(`/purchases/${id}/pay`, {
+  paySupplierDue: (id: string, data: any) => request<{ success: boolean; balance_due: number; modified_closed_dates?: string[] }>(`/purchases/${id}/pay`, {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  updatePurchase: (id: string, data: any) => request<{ success: boolean; modified_closed_dates?: string[] }>(`/purchases/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  }),
+  reversePurchase: (id: string, data: { reason: string; owner_password?: string }) =>
+    request<{ success: boolean; modified_closed_dates?: string[] }>(`/purchases/${id}/reverse`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   // Money & Accounts
   getAccounts: () => request<{ accounts: { cash: number; upi: number; bank: number | null } }>('/money/accounts'),
@@ -293,10 +314,15 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
-  updateTransaction: (id: string, data: any) => request<{ success: boolean }>(`/money/transactions/${id}`, {
+  updateTransaction: (id: string, data: any) => request<{ success: boolean; modified_closed_dates?: string[] }>(`/money/transactions/${id}`, {
     method: 'PUT',
     body: JSON.stringify(data),
   }),
+  reverseTransaction: (id: string, data: { reason: string; owner_password?: string }) =>
+    request<{ success: boolean; modified_closed_dates?: string[] }>(`/money/transactions/${id}/reverse`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   correctTransaction: (id: string, data: any) => request<{ success: boolean; difference: number }>(`/money/transactions/${id}/correct`, {
     method: 'POST',
     body: JSON.stringify(data),
@@ -330,6 +356,16 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  updateCustomerDue: (id: string, data: { original_due?: number; due_date?: string | null; notes?: string; reason: string; owner_password?: string }) =>
+    request<{ success: boolean; balance_due: number; status: string }>(`/dues/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  reverseDuePayment: (paymentId: string, data: { reason: string; owner_password?: string }) =>
+    request<{ success: boolean; modified_closed_dates?: string[] }>(`/dues/payments/${paymentId}/reverse`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getCustomerLedger: (id: string) => request<{
     customer: any;
     dues: any[];
@@ -355,10 +391,20 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  deleteAttendance: (id: string, data: { reason: string; owner_password?: string }) =>
+    request<{ success: boolean }>(`/staff/attendance/${id}`, {
+      method: 'DELETE',
+      body: JSON.stringify(data),
+    }),
   payStaffSalary: (data: any) => request<{ success: boolean; id: string }>('/staff/salary-payment', {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  reverseSalaryPayment: (id: string, data: { reason: string; owner_password?: string }) =>
+    request<{ success: boolean; modified_closed_dates?: string[] }>(`/staff/salary-payments/${id}/reverse`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getSalaryPayments: (staffId?: string) => {
     const query = staffId ? `?staff_id=${staffId}` : '';
     return request<{ payments: any[] }>(`/staff/salary-payments${query}`);
@@ -399,13 +445,36 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         closing_date: data.date,
-        opening_cash: data.opening_cash || 0,
+        opening_cash: data.opening_cash,
         actual_counted_cash: data.actual_cash_counted,
+        actual_upi_counted: data.actual_upi_counted,
+        cash_left_in_drawer: data.cash_left_in_drawer,
+        cash_taken_home: data.cash_taken_home,
+        discrepancy_reason: data.discrepancy_reason,
         closing_notes: data.closing_notes,
+        owner_password: data.owner_password,
+        reason: data.reason,
         finalize: true,
       }),
     });
   },
+  reconcileClosedDay: (
+    date: string,
+    data: {
+      owner_password: string;
+      reason: string;
+      actual_counted_cash?: number;
+      actual_upi_counted?: number | null;
+      cash_left_in_drawer?: number | null;
+      cash_taken_home?: number | null;
+      discrepancy_reason?: string | null;
+      closing_notes?: string | null;
+    }
+  ) =>
+    request<{ success: boolean; message: string }>(`/closing/${encodeURIComponent(date)}/reconcile`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getDailyClosingHistory: () => request<{ closings: any[] }>('/closing/history'),
   getDailyClosings: () => request<{ closings: any[] }>('/closing/history'),
 
@@ -483,7 +552,7 @@ export const api = {
         a.remove();
         window.URL.revokeObjectURL(downloadUrl);
       })
-      .catch((err) => alert(err.message));
+      .catch((err) => console.error('Excel export failed:', err.message));
   },
 
   // Database Backup & Restore API
